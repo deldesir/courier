@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -707,7 +708,19 @@ func (b *backend) SaveAttachment(ctx context.Context, ch courier.Channel, conten
 
 	storageURL, err := b.rt.S3.PutObject(ctx, b.rt.Config.S3AttachmentsBucket, path, contentType, data, s3types.ObjectCannedACLPublicRead)
 	if err != nil {
-		return "", fmt.Errorf("error saving attachment to storage (bytes=%d): %w", len(data), err)
+		// FALLBACK: Local Filesystem Storage (User Request)
+		// If S3 fails (e.g. dummy creds), write to RapidPro media directory
+		localRootDir := "/opt/iiab/rapidpro/media"
+		fullPath := filepath.Join(localRootDir, path)
+
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			return "", fmt.Errorf("error creating local directory: %w (s3_error=%v)", err, err)
+		}
+		if err := os.WriteFile(fullPath, data, 0644); err != nil {
+			return "", fmt.Errorf("error writing local file: %w (s3_error=%v)", err, err)
+		}
+		// Return relative URL for Django to handle
+		return fmt.Sprintf("/media/%s", path), nil
 	}
 
 	return storageURL, nil
