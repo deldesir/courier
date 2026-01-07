@@ -119,9 +119,10 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 	// Extract Sender
 	// Extract Sender & Chat
 	// Extract Sender & Chat
-	senderStr := fmt.Sprintf("%v", event.Info.Sender)
-	senderAltStr := fmt.Sprintf("%v", event.Info.SenderAlt)
-	chatStr := fmt.Sprintf("%v", event.Info.Chat)
+	// Extract Sender & Chat
+	senderStr, _ := event.Info.Sender.(string)
+	senderAltStr, _ := event.Info.SenderAlt.(string)
+	chatStr, _ := event.Info.Chat.(string)
 
 	log.Printf("Wuzapi DEBUG: Sender='%s' SenderAlt='%s' Chat='%s' EventType=%s IsFromMe=%v IsGroup=%v", senderStr, senderAltStr, chatStr, event.Info.Status, event.Info.IsFromMe, event.Info.IsGroup)
 
@@ -541,9 +542,9 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *couri
 		}
 
 		payload := map[string]string{
-			"Phone":    phone,
-			payloadKey: attURL,
-			"Caption":  msg.Text(),
+			"Phone":   phone,
+			"Body":    attURL,
+			"Caption": msg.Text(),
 		}
 		jsonBody, _ := json.Marshal(payload)
 
