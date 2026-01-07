@@ -65,7 +65,14 @@ type Config struct {
 // NewDefaultConfig returns a new default configuration object
 func NewDefaultConfig() *Config {
 	hostname, _ := os.Hostname()
-	return &Config{
+
+	// Detect Android/Termux environment
+	isAndroid := false
+	if _, err := os.Stat("/data/data/com.termux"); err == nil {
+		isAndroid = true
+	}
+
+	conf := &Config{
 		DB:       "postgres://temba:temba@postgres/temba?sslmode=disable",
 		Valkey:   "valkey://valkey:6379/15",
 		SpoolDir: "/var/spool/courier",
@@ -99,6 +106,22 @@ func NewDefaultConfig() *Config {
 		LogLevel:           slog.LevelWarn,
 		Version:            "Dev",
 	}
+
+	// Apply Smart Defaults for Android
+	if isAndroid {
+		// Use Unix domain socket for Postgres (assuming /tmp is the socket dir)
+		conf.DB = "postgres://temba:temba@/temba?host=/tmp&sslmode=disable"
+		// Use Unix socket for Valkey (compatible with django-valkey format)
+		conf.Valkey = "valkey://localhost/15?socket_path=/tmp/valkey.sock"
+		// Use writable spool dir in home
+		home := os.Getenv("HOME")
+		if home == "" {
+			home = "/data/data/com.termux/files/home"
+		}
+		conf.SpoolDir = fmt.Sprintf("%s/spool/courier", home)
+	}
+
+	return conf
 }
 
 func LoadConfig() *Config {
