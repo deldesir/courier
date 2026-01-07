@@ -113,7 +113,7 @@ func NewDefaultConfig() *Config {
 		// Note: We provide 'localhost' to satisfy the 'url' validator, but host=/tmp forces socket usage.
 		conf.DB = "postgres://temba:temba@localhost/temba?host=/tmp&sslmode=disable"
 		// Use Unix socket for Valkey (compatible with django-valkey format)
-		conf.Valkey = "valkey://localhost/15?socket_path=/tmp/valkey.sock"
+		conf.Valkey = "valkey://localhost:6379/15?socket_path=/tmp/valkey.sock"
 		// Use writable spool dir in home
 		home := os.Getenv("HOME")
 		if home == "" {
