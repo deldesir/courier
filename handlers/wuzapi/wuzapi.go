@@ -518,16 +518,12 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *couri
 		// Map mime type to Wuzapi endpoint types
 		// /chat/send/{image|video|audio|document}
 		endpointType := "document"
-		payloadKey := "Document"
 		if strings.HasPrefix(attType, "image") {
 			endpointType = "image"
-			payloadKey = "Image"
 		} else if strings.HasPrefix(attType, "video") {
 			endpointType = "video"
-			payloadKey = "Video"
 		} else if strings.HasPrefix(attType, "audio") {
 			endpointType = "audio"
-			payloadKey = "Audio"
 		}
 
 		// Wuzapi expects:
