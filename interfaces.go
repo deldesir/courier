@@ -95,8 +95,8 @@ type StatusUpdate interface {
 	SetURNUpdate(old, new urns.URN) error
 	URNUpdate() (old, new urns.URN)
 
-	ExternalID() string
-	SetExternalID(string)
+	ExternalIdentifier() string
+	SetExternalIdentifier(string)
 
 	Status() models.MsgStatus
 	SetStatus(models.MsgStatus)
@@ -111,7 +111,6 @@ type ChannelEvent interface {
 	URN() urns.URN
 	EventType() models.ChannelEventType
 	Extra() map[string]string
-	CreatedOn() time.Time
 	OccurredOn() time.Time
 
 	WithContactName(name string) ChannelEvent

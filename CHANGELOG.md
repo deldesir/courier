@@ -1,3 +1,29 @@
+v26.1.5 (2026-01-20)
+-------------------------
+ * Resolve by external_identifier for status updates
+
+v26.1.4 (2026-01-13)
+-------------------------
+ * Remove ChannelEvent.created_on field
+
+v26.1.3 (2026-01-13)
+-------------------------
+ * Support updating the external_identifier field for outgoing messages and support for deleting by that field
+
+v26.1.2 (2026-01-12)
+-------------------------
+ * Start writing external identifier field for incoming messages
+
+v26.1.1 (2026-01-08)
+-------------------------
+ * Update phonenumbers dependency
+ * Add warning for incoming messages unique constraint violation
+
+v26.1.0 (2026-01-07)
+-------------------------
+ * Ignore 'null' external IDs on hormuud channels
+ * Test against valkey 8 and postgresql 17
+
 v26.0.1 (2026-01-05)
 -------------------------
  * Update dependencies

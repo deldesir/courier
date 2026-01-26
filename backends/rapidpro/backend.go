@@ -395,10 +395,10 @@ func (b *backend) RemoveURNfromContact(ctx context.Context, c courier.Channel, c
 	return urn, nil
 }
 
-// DeleteMsgByExternalID resolves a message external id and quees a task to mailroom to delete it
+// DeleteMsgByExternalID resolves a message external id and queues a task to mailroom to delete it
 func (b *backend) DeleteMsgByExternalID(ctx context.Context, channel courier.Channel, externalID string) error {
 	ch := channel.(*models.Channel)
-	row := b.rt.DB.QueryRowContext(ctx, `SELECT uuid, contact_id FROM msgs_msg WHERE channel_id = $1 AND external_id = $2 AND direction = 'I'`, ch.ID(), externalID)
+	row := b.rt.DB.QueryRowContext(ctx, `SELECT uuid, contact_id FROM msgs_msg WHERE channel_id = $1 AND external_identifier = $2 AND direction = 'I'`, ch.ID(), externalID)
 
 	var msgUUID models.MsgUUID
 	var contactID models.ContactID
@@ -573,10 +573,10 @@ func (b *backend) NewStatusUpdateByExternalID(channel courier.Channel, externalI
 
 // WriteStatusUpdate writes the passed in MsgStatus to our store
 func (b *backend) WriteStatusUpdate(ctx context.Context, status courier.StatusUpdate) error {
-	log := slog.With("msg_uuid", status.MsgUUID(), "msg_external_id", status.ExternalID(), "status", status.Status())
+	log := slog.With("msg_uuid", status.MsgUUID(), "msg_external_id", status.ExternalIdentifier(), "status", status.Status())
 	su := status.(*models.StatusUpdate)
 
-	if status.MsgUUID() == "" && status.ExternalID() == "" {
+	if status.MsgUUID() == "" && status.ExternalIdentifier() == "" {
 		return errors.New("message status with no UUID or external id")
 	}
 
@@ -591,11 +591,11 @@ func (b *backend) WriteStatusUpdate(ctx context.Context, status courier.StatusUp
 
 	if status.MsgUUID() != "" {
 		// this is a message we've just sent and were given an external id for
-		if status.ExternalID() != "" {
+		if status.ExternalIdentifier() != "" {
 			rc := b.rt.VK.Get()
 			defer rc.Close()
 
-			err := b.sentExternalIDs.Set(ctx, rc, fmt.Sprintf("%d|%s", su.ChannelID_, su.ExternalID_), string(status.MsgUUID()))
+			err := b.sentExternalIDs.Set(ctx, rc, fmt.Sprintf("%d|%s", su.ChannelID_, su.ExternalIdentifier_), string(status.MsgUUID()))
 			if err != nil {
 				log.Error("error recording external id", "error", err)
 			}
