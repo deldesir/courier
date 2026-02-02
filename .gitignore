@@ -34,5 +34,5 @@ _testmain.go
 .DS_Store
 dist/
 .envrc
-courier
+/courier
 _storage
