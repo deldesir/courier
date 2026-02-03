@@ -72,7 +72,6 @@ import (
 	_ "github.com/nyaruka/courier/handlers/yo"
 	_ "github.com/nyaruka/courier/handlers/zenvia"
   _ "github.com/nyaruka/courier/handlers/wuzapi"
-  _ "github.com/nyaruka/courier/handlers/openclaw"
 	"github.com/nyaruka/courier/runtime"
 
 	// load available backends
