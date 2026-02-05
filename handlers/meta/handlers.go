@@ -269,6 +269,11 @@ func (h *handler) processWhatsAppPayload(ctx context.Context, channel courier.Ch
 					continue
 				}
 
+				if msg.GroupID != "" {
+					data = append(data, courier.NewInfoData("ignoring group message"))
+					continue
+				}
+
 				// create our date from the timestamp
 				ts, err := strconv.ParseInt(msg.Timestamp, 10, 64)
 				if err != nil {
@@ -690,7 +695,8 @@ func (h *handler) sendFacebookInstagramMsg(ctx context.Context, msg courier.MsgO
 
 		// include any quick replies on the last piece we send
 		if part.IsLast {
-			for _, qr := range msg.QuickReplies() {
+			qrs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "text")
+			for _, qr := range qrs {
 				payload.Message.QuickReplies = append(payload.Message.QuickReplies, messenger.QuickReply{Title: qr.Text, Payload: qr.Text, ContentType: "text"})
 			}
 		} else {

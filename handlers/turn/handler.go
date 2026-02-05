@@ -88,6 +88,7 @@ type eventsPayload struct {
 	Messages []struct {
 		From      string `json:"from"      validate:"required"`
 		ID        string `json:"id"        validate:"required"`
+		GroupID   string `json:"group_id,omitempty"`
 		Timestamp string `json:"timestamp" validate:"required"`
 		Type      string `json:"type"      validate:"required"`
 		Text      struct {
@@ -179,6 +180,11 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 	// first deal with any received messages
 	for _, msg := range payload.Messages {
 		if seenMsgIDs[msg.ID] {
+			continue
+		}
+
+		if msg.GroupID != "" {
+			data = append(data, courier.NewInfoData("ignoring group message"))
 			continue
 		}
 
@@ -373,6 +379,7 @@ type mtInteractivePayload struct {
 			Text string `json:"text"`
 		} `json:"footer,omitempty"`
 		Action struct {
+			Name     string      `json:"name,omitempty"`
 			Button   string      `json:"button,omitempty"`
 			Sections []mtSection `json:"sections,omitempty"`
 			Buttons  []mtButton  `json:"buttons,omitempty"`
@@ -464,14 +471,17 @@ func buildPayloads(ctx context.Context, msg courier.MsgOut, h *handler, clog *co
 
 	parts := handlers.SplitMsgByChannel(msg.Channel(), msg.Text(), maxMsgLength)
 
-	qrs := msg.QuickReplies()
+	qrs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "text")
 	qrsAsList := false
 	for i, qr := range qrs {
 		if i > 2 || qr.Extra != "" {
 			qrsAsList = true
 		}
 	}
-	isInteractiveMsg := len(qrs) > 0
+
+	locationQRs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "location")
+
+	isInteractiveMsg := len(msg.QuickReplies()) > 0
 
 	textAsCaption := false
 
@@ -578,8 +588,13 @@ func buildPayloads(ctx context.Context, msg courier.MsgOut, h *handler, clog *co
 						Type: "interactive",
 					}
 
-					// we show buttons
-					if !qrsAsList {
+					if len(locationQRs) > 0 {
+						payload.Interactive.Type = "location_request_message"
+						payload.Interactive.Body.Text = part
+						payload.Interactive.Action.Name = "send_location"
+						payloads = append(payloads, payload)
+
+					} else if !qrsAsList { // we show buttons
 						payload.Interactive.Type = "button"
 						payload.Interactive.Body.Text = part
 						btns := make([]mtButton, len(qrs))
@@ -675,8 +690,13 @@ func buildPayloads(ctx context.Context, msg courier.MsgOut, h *handler, clog *co
 							Type: "interactive",
 						}
 
-						// we show buttons
-						if !qrsAsList {
+						if len(locationQRs) > 0 {
+							payload.Interactive.Type = "location_request_message"
+							payload.Interactive.Body.Text = part
+							payload.Interactive.Action.Name = "send_location"
+							payloads = append(payloads, payload)
+
+						} else if !qrsAsList { // we show buttons
 							payload.Interactive.Type = "button"
 							payload.Interactive.Body.Text = part
 							btns := make([]mtButton, len(qrs))

@@ -41,6 +41,7 @@ type Change struct {
 		} `json:"contacts"`
 		Messages []struct {
 			ID        string `json:"id"`
+			GroupID   string `json:"group_id,omitempty"`
 			From      string `json:"from"`
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
@@ -199,6 +200,7 @@ type Interactive struct {
 		Text string `json:"text"`
 	} `json:"footer,omitempty"`
 	Action *struct {
+		Name     string    `json:"name,omitempty"`
 		Button   string    `json:"button,omitempty"`
 		Sections []Section `json:"sections,omitempty"`
 		Buttons  []Button  `json:"buttons,omitempty"`

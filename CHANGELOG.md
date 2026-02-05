@@ -1,3 +1,20 @@
+v26.1.9 (2026-02-04)
+-------------------------
+ * Make telegram location handling same as whatsapp
+
+v26.1.8 (2026-02-04)
+-------------------------
+ * Fix to always set text for request location keyboard button
+
+v26.1.7 (2026-02-04)
+-------------------------
+ * Support sending location requests for WhatsApp and Telegram channels
+
+v26.1.6 (2026-02-04)
+-------------------------
+ * Add type to quick replies
+ * Ignore group message for whatsapp channels
+
 v26.1.5 (2026-01-20)
 -------------------------
  * Resolve by external_identifier for status updates
