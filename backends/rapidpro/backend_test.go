@@ -333,7 +333,7 @@ func (ts *BackendTestSuite) TestContactURN() {
 	ts.Equal(contact2.URNID_, contact3.URNID_)
 }
 
-func (ts *BackendTestSuite) TestContactURNPriority() {
+func (ts *BackendTestSuite) TestContactURNMetadata() {
 	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
 	fbChannel := ts.getChannel("FBA", "dbc126ed-66bc-4e28-b67b-81dc3327c96a")
 	knURN := urns.URN("tel:+12065551111")
@@ -352,8 +352,8 @@ func (ts *BackendTestSuite) TestContactURNPriority() {
 	ts.NoError(err)
 	ts.NoError(tx.Commit())
 
-	// ok, now looking up our contact should reset our URNs and their affinity..
-	// FacebookURN should be first all all URNs should now use Facebook channel
+	// looking up contact by fbURN should update channel_id on the URN but NOT reorder priorities
+	// (priority reordering is delegated to mailroom)
 	fbContact, err := contactForURN(ctx, ts.b, fbChannel.OrgID_, fbChannel, fbURN, nil, "", true, clog)
 	ts.NoError(err)
 
@@ -367,10 +367,11 @@ func (ts *BackendTestSuite) TestContactURNPriority() {
 	ts.NoError(err)
 	ts.NoError(tx.Commit())
 
-	ts.Equal("tel:+12065552222", urns[0].Identity)
-	ts.Equal(fbChannel.ID(), urns[0].ChannelID)
+	// priorities are unchanged (knURN was created first so it's still top priority)
+	ts.Equal("tel:+12065551111", urns[0].Identity)
 
-	ts.Equal("tel:+12065551111", urns[1].Identity)
+	ts.Equal("tel:+12065552222", urns[1].Identity)
+	// but channel_id on the looked-up URN should be updated to the fb channel
 	ts.Equal(fbChannel.ID(), urns[1].ChannelID)
 }
 
@@ -585,70 +586,6 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 	ts.Equal(m.ErrorCount, 3)
 	ts.Equal(null.String("E"), m.FailedReason)
 
-	// update URN when the new doesn't exist
-	tx, _ := ts.b.rt.DB.BeginTxx(ctx, nil)
-	oldURN := urns.URN("whatsapp:55988776655")
-	err = models.InsertContactURN(ctx, tx, models.NewContactURN(channel.OrgID_, channel.ID_, models.NilContactID, oldURN, nil))
-	ts.NoError(err)
-
-	ts.NoError(tx.Commit())
-
-	newURN := urns.URN("whatsapp:5588776655")
-	status = ts.b.NewStatusUpdate(channel, "0199df0f-9f82-7689-b02d-f34105991321", models.MsgStatusSent, clog6)
-	status.SetURNUpdate(oldURN, newURN)
-
-	ts.NoError(ts.b.WriteStatusUpdate(ctx, status))
-
-	tx, _ = ts.b.rt.DB.BeginTxx(ctx, nil)
-	contactURN, err := models.GetContactURNByIdentity(ctx, tx, channel.OrgID_, newURN)
-
-	ts.NoError(err)
-	ts.Equal(contactURN.Identity, newURN.Identity().String())
-	ts.NoError(tx.Commit())
-
-	// new URN already exits but don't have an associated contact
-	oldURN = urns.URN("whatsapp:55999887766")
-	newURN = urns.URN("whatsapp:5599887766")
-	tx, _ = ts.b.rt.DB.BeginTxx(ctx, nil)
-	contact, _ := contactForURN(ctx, ts.b, channel.OrgID_, channel, oldURN, nil, "", true, clog6)
-	_ = models.InsertContactURN(ctx, tx, models.NewContactURN(channel.OrgID_, channel.ID_, models.NilContactID, newURN, nil))
-
-	ts.NoError(tx.Commit())
-
-	status = ts.b.NewStatusUpdate(channel, "019a25d9-4d3a-710c-8af6-897e0cb66a8e", models.MsgStatusSent, clog6)
-	status.SetURNUpdate(oldURN, newURN)
-
-	ts.NoError(ts.b.WriteStatusUpdate(ctx, status))
-
-	tx, _ = ts.b.rt.DB.BeginTxx(ctx, nil)
-	newContactURN, _ := models.GetContactURNByIdentity(ctx, tx, channel.OrgID_, newURN)
-	oldContactURN, _ := models.GetContactURNByIdentity(ctx, tx, channel.OrgID_, oldURN)
-
-	ts.Equal(newContactURN.ContactID, contact.ID_)
-	ts.Equal(oldContactURN.ContactID, models.NilContactID)
-	ts.NoError(tx.Commit())
-
-	// new URN already exits and have an associated contact
-	oldURN = urns.URN("whatsapp:55988776655")
-	newURN = urns.URN("whatsapp:5588776655")
-	tx, _ = ts.b.rt.DB.BeginTxx(ctx, nil)
-	_, _ = contactForURN(ctx, ts.b, channel.OrgID_, channel, oldURN, nil, "", true, clog6)
-	otherContact, _ := contactForURN(ctx, ts.b, channel.OrgID_, channel, newURN, nil, "", true, clog6)
-
-	ts.NoError(tx.Commit())
-
-	status = ts.b.NewStatusUpdate(channel, "019a25d9-4d3a-710c-8af6-897e0cb66a8e", models.MsgStatusSent, clog6)
-	status.SetURNUpdate(oldURN, newURN)
-
-	ts.NoError(ts.b.WriteStatusUpdate(ctx, status))
-
-	tx, _ = ts.b.rt.DB.BeginTxx(ctx, nil)
-	oldContactURN, _ = models.GetContactURNByIdentity(ctx, tx, channel.OrgID_, oldURN)
-	newContactURN, _ = models.GetContactURNByIdentity(ctx, tx, channel.OrgID_, newURN)
-
-	ts.Equal(oldContactURN.ContactID, models.NilContactID)
-	ts.Equal(newContactURN.ContactID, otherContact.ID_)
-	ts.NoError(tx.Commit())
 }
 
 func (ts *BackendTestSuite) TestSentExternalIDCaching() {

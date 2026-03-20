@@ -1,3 +1,41 @@
+v26.1.16 (2026-03-11)
+-------------------------
+ * Make whatsapp legacy handler a noop
+
+v26.1.15 (2026-03-10)
+-------------------------
+ * Defer to mailroom to set URN affinity
+
+v26.1.14 (2026-03-04)
+-------------------------
+ * Merge pull request #975 from nyaruka/allow-AT-config-send-url
+ * Allow using configured URL for AT channels
+ * Dev reorg
+
+v26.1.13 (2026-02-19)
+-------------------------
+ * Merge pull request #974 from nyaruka/adjust-JS-status-handler
+ * Fix JS encoding to use UTF16 encoder
+ * Apply suggestions from code review
+ * Adjust JS status handler to use message status values
+ * Update dependencies
+ * Add CLAUDE.md
+ * Tweak devcontainer configuration
+
+v26.1.12 (2026-02-18)
+-------------------------
+ * Add support for sending unicode text for JS channel as hex-content parameter
+
+v26.1.11 (2026-02-12)
+-------------------------
+ * Remove log for timestamp from meta FBA and IG
+
+v26.1.10 (2026-02-11)
+-------------------------
+ * Support location request quick replies for Viber and LINE
+ * Update phonenumbers
+ * Make processing incoming Whatsapp messages more dry
+
 v26.1.9 (2026-02-04)
 -------------------------
  * Make telegram location handling same as whatsapp
