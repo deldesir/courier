@@ -44,6 +44,10 @@ type WuzapiPayload struct {
 	ReceiptType string          `json:"receiptType"` // For ReadReceipt
 	Status      string          `json:"status"`      // For ReadReceipt
 	ID          string          `json:"id"`          // Message ID
+	// Media fields — WuzAPI downloads media server-side and sends these
+	Base64   string `json:"base64"`   // Base64-encoded file data
+	MimeType string `json:"mimeType"` // e.g. "application/pdf"
+	FileName string `json:"fileName"` // e.g. "msgid.jwpub"
 }
 
 // WuzapiEvent corresponds to the "event" key in the payload
@@ -255,19 +259,43 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 	}
 
 	if isMedia {
-		mediaData := &WuzapiMediaData{
-			Url:      mediaMsg.URL,
-			Mimetype: mediaMsg.Mimetype,
+		// Path 1: WuzAPI already downloaded & base64-encoded the file (preferred)
+		if payload.Base64 != "" && payload.MimeType != "" {
+			// Handle data URI prefix: "data:mime;base64,..." or plain base64
+			b64Data := payload.Base64
+			if idx := strings.Index(b64Data, ","); idx >= 0 {
+				b64Data = b64Data[idx+1:]
+			}
+			raw, decErr := base64.StdEncoding.DecodeString(b64Data)
+			if decErr == nil {
+				savedURL, saveErr := h.Backend().SaveAttachment(ctx, channel, event.Info.ID, raw, payload.MimeType)
+				if saveErr == nil {
+					mediaURL = savedURL
+					log.Printf("Wuzapi DEBUG: Saved base64 attachment: %s (%s)", payload.FileName, payload.MimeType)
+				} else {
+					clog.Error(courier.ErrorExternal("save_failed", fmt.Sprintf("failed to save base64 attachment: %s", saveErr)))
+				}
+			} else {
+				log.Printf("Wuzapi DEBUG: base64 decode failed: %s, falling back to URL download", decErr)
+			}
 		}
 
-		raw, mimeType, err := h.downloadMedia(ctx, channel, mediaData)
-		if err == nil {
-			savedURL, err := h.Backend().SaveAttachment(ctx, channel, event.Info.ID, raw, mimeType)
-			if err == nil {
-				mediaURL = savedURL
+		// Path 2: Fallback to URL-based download (for non-base64 payloads)
+		if mediaURL == "" && mediaMsg.URL != "" {
+			mediaData := &WuzapiMediaData{
+				Url:      mediaMsg.URL,
+				Mimetype: mediaMsg.Mimetype,
 			}
-		} else {
-			clog.Error(courier.ErrorExternal("download_failed", fmt.Sprintf("failed to download media: %s", err)))
+
+			raw, mimeType, err := h.downloadMedia(ctx, channel, mediaData)
+			if err == nil {
+				savedURL, err := h.Backend().SaveAttachment(ctx, channel, event.Info.ID, raw, mimeType)
+				if err == nil {
+					mediaURL = savedURL
+				}
+			} else {
+				clog.Error(courier.ErrorExternal("download_failed", fmt.Sprintf("failed to download media: %s", err)))
+			}
 		}
 	}
 
