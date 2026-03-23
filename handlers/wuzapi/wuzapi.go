@@ -241,7 +241,7 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 		if text == "" {
 			text = "Voice Message"
 		}
-	} else if event.Message.DocumentMessage.URL != "" {
+	} else if event.Message.DocumentMessage.URL != "" || (payload.Base64 != "" && payload.MimeType != "") {
 		mediaMsg = event.Message.DocumentMessage
 		isMedia = true
 		if text == "" {
@@ -268,7 +268,12 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 			}
 			raw, decErr := base64.StdEncoding.DecodeString(b64Data)
 			if decErr == nil {
-				savedURL, saveErr := h.Backend().SaveAttachment(ctx, channel, event.Info.ID, raw, payload.MimeType)
+				// Extract safe file extension from MIME type (e.g. "application/zip" -> "zip")
+				ext := payload.MimeType
+				if idx := strings.LastIndex(ext, "/"); idx >= 0 {
+					ext = ext[idx+1:]
+				}
+				savedURL, saveErr := h.Backend().SaveAttachment(ctx, channel, payload.MimeType, raw, ext)
 				if saveErr == nil {
 					mediaURL = savedURL
 					log.Printf("Wuzapi DEBUG: Saved base64 attachment: %s (%s)", payload.FileName, payload.MimeType)
@@ -289,7 +294,12 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 
 			raw, mimeType, err := h.downloadMedia(ctx, channel, mediaData)
 			if err == nil {
-				savedURL, err := h.Backend().SaveAttachment(ctx, channel, event.Info.ID, raw, mimeType)
+				// Extract safe file extension from MIME type (e.g. "application/zip" -> "zip")
+				ext := mimeType
+				if idx := strings.LastIndex(ext, "/"); idx >= 0 {
+					ext = ext[idx+1:]
+				}
+				savedURL, err := h.Backend().SaveAttachment(ctx, channel, mimeType, raw, ext)
 				if err == nil {
 					mediaURL = savedURL
 				}

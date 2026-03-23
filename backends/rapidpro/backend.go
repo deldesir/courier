@@ -652,9 +652,14 @@ func (b *backend) SaveAttachment(ctx context.Context, ch courier.Channel, conten
 		if err := os.WriteFile(fullPath, data, 0644); err != nil {
 			return "", fmt.Errorf("error writing local file: %w (s3_error=%v)", err, err)
 		}
-		// Return relative URL for Django to handle
-		return fmt.Sprintf("/media/%s", path), nil
+		// Return absolute URL so mailroom can fetch attachment via nginx (/rp/media/ → /opt/iiab/rapidpro/media/)
+		mediaBase := os.Getenv("COURIER_MEDIA_BASE_URL")
+		if mediaBase == "" {
+			mediaBase = "http://localhost/rp/media"
+		}
+		return fmt.Sprintf("%s/%s", mediaBase, path), nil
 	}
+
 
 	return storageURL, nil
 }

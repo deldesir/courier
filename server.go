@@ -281,8 +281,8 @@ func (s *server) channelHandleWrapper(handler ChannelHandler, handlerFunc Channe
 
 		// end recording of the request so that we have a response trace
 		if err := recorder.End(); err != nil {
+			// log only — don't overwrite the already-sent HTTP response (e.g. 200 OK)
 			slog.Error("error recording request", "error", err, "channel", channelUUID)
-			writeAndLogRequestError(ctx, handler, w, r, channel, err)
 		}
 
 		if channel != nil {
