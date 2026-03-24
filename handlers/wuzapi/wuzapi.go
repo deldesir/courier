@@ -319,7 +319,15 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 		WithContactName(event.Info.PushName)
 
 	if mediaURL != "" {
-		msg.WithAttachment(mediaURL)
+		// RapidPro expects attachments in mime_type:URL format
+		mimePrefix := payload.MimeType
+		if mimePrefix == "" {
+			mimePrefix = mediaMsg.Mimetype
+		}
+		if mimePrefix == "" {
+			mimePrefix = "application/octet-stream"
+		}
+		msg.WithAttachment(fmt.Sprintf("%s:%s", mimePrefix, mediaURL))
 	}
 
 	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
