@@ -47,7 +47,7 @@ type WuzapiPayload struct {
 	// Media fields — WuzAPI downloads media server-side and sends these
 	Base64   string `json:"base64"`   // Base64-encoded file data
 	MimeType string `json:"mimeType"` // e.g. "application/pdf"
-	FileName string `json:"fileName"` // e.g. "msgid.jwpub"
+	FileName string `json:"fileName"` // e.g. "msgid.zip"
 }
 
 // WuzapiEvent corresponds to the "event" key in the payload
@@ -246,6 +246,9 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 		isMedia = true
 		if text == "" {
 			text = mediaMsg.Caption
+		}
+		if text == "" && payload.FileName != "" {
+			text = payload.FileName
 		}
 		if text == "" {
 			text = "Document"
