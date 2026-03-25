@@ -93,10 +93,14 @@ type WuzapiMessage struct {
 }
 
 type WuzapiMediaMessage struct {
-	Caption  string `json:"caption"` // Image/Video/Doc
-	Mimetype string `json:"mimetype"`
-	URL      string `json:"url"`
-	// Additional fields for download fallback if needed
+	Caption       string `json:"caption"`        // Image/Video/Doc
+	Mimetype      string `json:"mimetype"`
+	URL           string `json:"url"`
+	DirectPath    string `json:"directPath"`
+	MediaKey      string `json:"mediaKey"`
+	FileEncSHA256 string `json:"fileEncSHA256"`
+	FileSHA256    string `json:"fileSHA256"`
+	FileLength    uint64 `json:"fileLength"`
 }
 
 // ... NewHandler, Initialize, handleWebhook, verifySignature remain same ...
@@ -291,8 +295,13 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 		// Path 2: Fallback to URL-based download (for non-base64 payloads)
 		if mediaURL == "" && mediaMsg.URL != "" {
 			mediaData := &WuzapiMediaData{
-				Url:      mediaMsg.URL,
-				Mimetype: mediaMsg.Mimetype,
+				Url:           mediaMsg.URL,
+				DirectPath:    mediaMsg.DirectPath,
+				MediaKey:      mediaMsg.MediaKey,
+				Mimetype:      mediaMsg.Mimetype,
+				FileEncSHA256: mediaMsg.FileEncSHA256,
+				FileSHA256:    mediaMsg.FileSHA256,
+				FileLength:    mediaMsg.FileLength,
 			}
 
 			raw, mimeType, err := h.downloadMedia(ctx, channel, mediaData)
@@ -453,15 +462,8 @@ func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel courier.Chann
 		endpoint = "downloadaudio"
 	}
 
-	// Attempt direct fetch first if URL looks standard
-	if strings.HasPrefix(data.Url, "http") {
-		resp, err := http.Get(data.Url)
-		if err == nil && resp.StatusCode == 200 {
-			d, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return d, resp.Header.Get("Content-Type"), nil
-		}
-	}
+	// WhatsApp CDN always serves encrypted media — never fetch directly.
+	// Only the Wuzapi /chat/download* API can decrypt it.
 
 	// Fallback to Wuzapi Custom API
 	reqData := map[string]interface{}{
