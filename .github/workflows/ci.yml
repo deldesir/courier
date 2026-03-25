@@ -5,7 +5,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     container:
-      image: golang:1.25-trixie
+      image: golang:1.26-trixie
 
     services:
       valkey:
@@ -22,7 +22,7 @@ jobs:
           - 5432:5432
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
       localstack:
-        image: localstack/localstack:latest
+        image: localstack/localstack:4.14
         env:
           SERVICES: s3,dynamodb,cloudwatch
         ports:
@@ -47,6 +47,8 @@ jobs:
     needs: [test]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    container:
+      image: golang:1.26-trixie
 
     steps:
       - name: Checkout code
