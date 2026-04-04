@@ -7,12 +7,25 @@ import (
 	"github.com/nyaruka/gocommon/aws/dynamo"
 )
 
+// DynamoWriter is the interface for DynamoDB writers (real or no-op).
+type DynamoWriter interface {
+	Queue(i dynamo.ItemMarshaler) (int, error)
+	Start()
+	Stop()
+}
+
 type Writers struct {
-	Main    *dynamo.Writer
-	History *dynamo.Writer
+	Main    DynamoWriter
+	History DynamoWriter
 }
 
 func newWriters(cfg *Config, cl *dynamodb.Client, spool *dynamo.Spool) *Writers {
+	if cfg.DynamoTablePrefix == "" {
+		return &Writers{
+			Main:    &NopWriter{},
+			History: &NopWriter{},
+		}
+	}
 	return &Writers{
 		Main:    dynamo.NewWriter(cl, cfg.DynamoTablePrefix+"Main", 250*time.Millisecond, 1000, spool),
 		History: dynamo.NewWriter(cl, cfg.DynamoTablePrefix+"History", 250*time.Millisecond, 1000, spool),

@@ -145,11 +145,15 @@ func (b *backend) Start() error {
 		log.Info("db ok")
 	}
 
-	// test DynamoDB
-	if err := dynamo.Test(ctx, b.rt.Dynamo, b.rt.Config.DynamoTablePrefix+"Main"); err != nil {
-		log.Error("dynamodb not reachable", "error", err)
+	// test DynamoDB (optional in nanoRP mode)
+	if b.rt.Dynamo != nil {
+		if err := dynamo.Test(ctx, b.rt.Dynamo, b.rt.Config.DynamoTablePrefix+"Main"); err != nil {
+			log.Error("dynamodb not reachable", "error", err)
+		} else {
+			log.Info("dynamodb ok")
+		}
 	} else {
-		log.Info("dynamodb ok")
+		log.Info("dynamodb disabled (nanoRP mode)")
 	}
 
 	// test Valkey
@@ -161,11 +165,15 @@ func (b *backend) Start() error {
 		log.Info("valkey ok")
 	}
 
-	// test S3 bucket access
-	if err := b.rt.S3.Test(ctx, b.rt.Config.S3AttachmentsBucket); err != nil {
-		log.Error("attachments bucket not accessible", "error", err)
+	// test S3 bucket access (optional in nanoRP mode)
+	if b.rt.S3 != nil {
+		if err := b.rt.S3.Test(ctx, b.rt.Config.S3AttachmentsBucket); err != nil {
+			log.Error("attachments bucket not accessible", "error", err)
+		} else {
+			log.Info("attachments bucket ok")
+		}
 	} else {
-		log.Info("attachments bucket ok")
+		log.Info("s3 disabled — using local filesystem (nanoRP mode)")
 	}
 
 	if err := b.rt.Start(); err != nil {
@@ -639,29 +647,38 @@ func (b *backend) SaveAttachment(ctx context.Context, ch courier.Channel, conten
 
 	path := filepath.Join("attachments", strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
 
-	storageURL, err := b.rt.S3.PutObject(ctx, b.rt.Config.S3AttachmentsBucket, path, contentType, data, s3types.ObjectCannedACLPublicRead)
-	if err != nil {
-		// FALLBACK: Local Filesystem Storage (User Request)
-		// If S3 fails (e.g. dummy creds), write to RapidPro media directory
-		localRootDir := "/opt/iiab/rapidpro/media"
-		fullPath := filepath.Join(localRootDir, path)
-
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-			return "", fmt.Errorf("error creating local directory: %w (s3_error=%v)", err, err)
-		}
-		if err := os.WriteFile(fullPath, data, 0644); err != nil {
-			return "", fmt.Errorf("error writing local file: %w (s3_error=%v)", err, err)
-		}
-		// Return absolute URL so mailroom can fetch attachment via nginx (/rp/media/ → /opt/iiab/rapidpro/media/)
-		mediaBase := os.Getenv("COURIER_MEDIA_BASE_URL")
-		if mediaBase == "" {
-			mediaBase = "http://localhost/rp/media"
-		}
-		return fmt.Sprintf("%s/%s", mediaBase, path), nil
+	// nanoRP mode: use local filesystem directly when S3 is disabled
+	if b.rt.S3 == nil {
+		return b.saveAttachmentLocal(path, data)
 	}
 
+	storageURL, err := b.rt.S3.PutObject(ctx, b.rt.Config.S3AttachmentsBucket, path, contentType, data, s3types.ObjectCannedACLPublicRead)
+	if err != nil {
+		// FALLBACK: Local Filesystem Storage
+		// If S3 fails (e.g. dummy creds), write to RapidPro media directory
+		return b.saveAttachmentLocal(path, data)
+	}
 
 	return storageURL, nil
+}
+
+// saveAttachmentLocal writes an attachment to the local filesystem
+func (b *backend) saveAttachmentLocal(path string, data []byte) (string, error) {
+	localRootDir := "/opt/iiab/rapidpro/media"
+	fullPath := filepath.Join(localRootDir, path)
+
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return "", fmt.Errorf("error creating local directory: %w", err)
+	}
+	if err := os.WriteFile(fullPath, data, 0644); err != nil {
+		return "", fmt.Errorf("error writing local file: %w", err)
+	}
+	// Return URL so mailroom can fetch via nginx (/rp/media/ → /opt/iiab/rapidpro/media/)
+	mediaBase := os.Getenv("COURIER_MEDIA_BASE_URL")
+	if mediaBase == "" {
+		mediaBase = "http://localhost/rp/media"
+	}
+	return fmt.Sprintf("%s/%s", mediaBase, path), nil
 }
 
 // ResolveMedia resolves the passed in attachment URL to a media object
