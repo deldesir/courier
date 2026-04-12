@@ -561,14 +561,21 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *couri
 	// Check for Attachments
 	attachments := msg.Attachments()
 
-	if len(attachments) > 0 {
-		// Handle Media Send
-		// Just take the first one for now as Wuzapi usually sends one media per message
-		attType, attURL := handlers.SplitAttachment(attachments[0])
+	var attURL string
+	var endpointType string
 
-		// Map mime type to Wuzapi endpoint types
-		// /chat/send/{image|video|audio|document}
-		endpointType := "document"
+	if len(attachments) > 0 {
+		var attType string
+		attType, attURL = handlers.SplitAttachment(attachments[0])
+		
+		// Sanitize URL
+		if strings.HasPrefix(attURL, "https:///rp/") {
+			attURL = strings.Replace(attURL, "https:///rp/", "http://localhost/rp/", 1)
+		} else if strings.HasPrefix(attURL, "http:///rp/") {
+			attURL = strings.Replace(attURL, "http:///rp/", "http://localhost/rp/", 1)
+		}
+
+		endpointType = "document"
 		if strings.HasPrefix(attType, "image") {
 			endpointType = "image"
 		} else if strings.HasPrefix(attType, "video") {
@@ -576,37 +583,103 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *couri
 		} else if strings.HasPrefix(attType, "audio") {
 			endpointType = "audio"
 		}
-
-		// Wuzapi expects:
-		// { "phone": "...", "Image": "http://...", "Caption": "..." }
-
-		// Sanitize URL: RapidPro sometimes sends "https:///rp/..." which fails DNS lookup.
-		// We rewrite checks for "https:///rp" to "http://localhost/rp" so Wuzapi can fetch it locally via Nginx.
-		if strings.HasPrefix(attURL, "https:///rp/") {
-			attURL = strings.Replace(attURL, "https:///rp/", "http://localhost/rp/", 1)
-		} else if strings.HasPrefix(attURL, "http:///rp/") {
-			attURL = strings.Replace(attURL, "http:///rp/", "http://localhost/rp/", 1)
-		}
-
-		payload := map[string]string{
-			"Phone":   phone,
-			"Body":    attURL,
-			"Caption": msg.Text(),
-		}
-		jsonBody, _ := json.Marshal(payload)
-
-		url := fmt.Sprintf("%s/chat/send/%s", wuzapiURL, endpointType)
-		return h.doRequest(url, token, jsonBody, res, log)
+	} else {
+		endpointType = "text"
 	}
 
-	// Text Only
-	payload := map[string]string{
-		"Phone": phone,
-		"Body":  msg.Text(),
+	// Check for Quick Replies (Interactive Messages)
+	qrs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "text")
+	qrsAsList := false
+	for i, qr := range qrs {
+		if i > 2 || qr.Extra != "" {
+			qrsAsList = true
+		}
 	}
-	jsonBody, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/chat/send/text", wuzapiURL)
 
+	var jsonBody []byte
+
+	if len(qrs) > 0 {
+		if qrsAsList {
+			endpointType = "list"
+			type listItem struct {
+				Title string `json:"title"`
+				Desc  string `json:"desc"`
+				RowId string `json:"rowId"`
+			}
+			type section struct {
+				Title string     `json:"title"`
+				Rows  []listItem `json:"rows"`
+			}
+
+			rows := make([]listItem, len(qrs))
+			for i, qr := range qrs {
+				rows[i] = listItem{
+					Title: qr.Text,
+					Desc:  qr.Extra,
+					RowId: fmt.Sprint(i),
+				}
+			}
+
+			payload := map[string]interface{}{
+				"Phone":      phone,
+				"Desc":       msg.Text(),
+				"ButtonText": "Select",
+				"Sections": []section{
+					{
+						Title: "Menu",
+						Rows:  rows,
+					},
+				},
+			}
+			jsonBody, _ = json.Marshal(payload)
+		} else {
+			endpointType = "buttons"
+			type buttonStruct struct {
+				Type  string `json:"type"`
+				Title string `json:"title"`
+				ID    string `json:"id"`
+			}
+
+			btns := make([]buttonStruct, len(qrs))
+			for i, qr := range qrs {
+				btns[i] = buttonStruct{
+					Type:  "reply",
+					Title: qr.Text,
+					ID:    fmt.Sprint(i),
+				}
+			}
+
+			payload := map[string]interface{}{
+				"Phone":   phone,
+				"Body":    msg.Text(),
+				"Buttons": btns,
+			}
+			
+			// If media, try to inject it as header image
+			if attURL != "" {
+				payload["Image"] = attURL
+			}
+			
+			jsonBody, _ = json.Marshal(payload)
+		}
+	} else {
+		if endpointType == "text" {
+			payload := map[string]string{
+				"Phone": phone,
+				"Body":  msg.Text(),
+			}
+			jsonBody, _ = json.Marshal(payload)
+		} else {
+			payload := map[string]string{
+				"Phone":   phone,
+				"Body":    attURL,
+				"Caption": msg.Text(),
+			}
+			jsonBody, _ = json.Marshal(payload)
+		}
+	}
+
+	url := fmt.Sprintf("%s/chat/send/%s", wuzapiURL, endpointType)
 	return h.doRequest(url, token, jsonBody, res, log)
 }
 
