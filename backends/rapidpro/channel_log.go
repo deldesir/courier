@@ -57,13 +57,8 @@ func (l *ChannelLog) MarshalDynamo() (*dynamo.Item, error) {
 // queues the passed in channel log to a writer
 func queueChannelLog(b *backend, clog *courier.ChannelLog) {
 	log := slog.With("log_uuid", clog.UUID, "log_type", clog.Type, "channel_uuid", clog.Channel().UUID())
-	dbChan := clog.Channel().(*models.Channel)
-	isError := clog.IsError()
 
-	// depending on the channel log policy, we might be able to discard this log
-	if dbChan.LogPolicy == models.LogPolicyNone || (dbChan.LogPolicy == models.LogPolicyErrors && !isError) {
-		return
-	}
+	// log policy has been removed, write all logs
 
 	capacity, err := b.rt.Writers.Main.Queue(&ChannelLog{clog})
 	if err != nil {

@@ -141,7 +141,6 @@ type Channel struct {
 	Country_     sql.NullString `db:"country"`
 	Config_      null.Map[any]  `db:"config"`
 	Role_        string         `db:"role"`
-	LogPolicy    LogPolicy      `db:"log_policy"`
 
 	OrgConfig_ null.Map[any] `db:"org_config"`
 	OrgIsAnon_ bool          `db:"org_is_anon"`
@@ -267,7 +266,6 @@ SELECT
 	c.country,
 	c.config,
 	c.role,
-	c.log_policy,
 	o.config AS org_config,
 	o.is_anon AS org_is_anon
   FROM channels_channel c
@@ -296,7 +294,6 @@ SELECT
 	c.country,
 	c.config,
 	c.role,
-	c.log_policy,
 	o.config AS org_config,
 	o.is_anon AS org_is_anon
   FROM channels_channel c
