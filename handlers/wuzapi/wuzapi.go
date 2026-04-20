@@ -731,7 +731,7 @@ func (h *WuzapiHandler) requestHTTPUnsafe(req *http.Request, clog *courier.Chann
 	trace, err := httpx.DoTrace(client, req, nil, nil, 0)
 	if trace != nil {
 		clog.HTTP(trace)
-		return trace.Response, trace.ResponseBody, nil
+		return trace.Response, trace.ResponseBody, err
 	}
 	return nil, nil, err
 }
