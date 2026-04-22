@@ -83,6 +83,22 @@ type WuzapiMessage struct {
 	StickerMessage  WuzapiMediaMessage `json:"stickerMessage"`
 	VoiceMessage    WuzapiMediaMessage `json:"voiceMessage"` // PTT
 
+	// Interactive reply messages (WhatsApp List/Button responses)
+	ListResponseMessage *struct {
+		Title             string `json:"title"`
+		SingleSelectReply *struct {
+			SelectedRowID string `json:"selectedRowID"`
+		} `json:"singleSelectReply"`
+	} `json:"listResponseMessage"`
+	ButtonsResponseMessage *struct {
+		SelectedButtonID  string `json:"selectedButtonID"`
+		SelectedDisplayText string `json:"selectedDisplayText"`
+	} `json:"buttonsResponseMessage"`
+	TemplateButtonReplyMessage *struct {
+		SelectedID          string `json:"selectedID"`
+		SelectedDisplayText string `json:"selectedDisplayText"`
+	} `json:"templateButtonReplyMessage"`
+
 	// Contextual Wrappers
 	EphemeralMessage *struct {
 		Message *WuzapiMessage `json:"message"`
@@ -208,6 +224,27 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 	}
 	if text == "" {
 		text = event.Message.Conversation
+	}
+
+	// Extract interactive reply text (WhatsApp List/Button responses)
+	// The Title field is what the user tapped — use it as the input text for flow routers
+	if text == "" && event.Message.ListResponseMessage != nil {
+		text = event.Message.ListResponseMessage.Title
+		log.Printf("Wuzapi DEBUG: List reply: title='%s'", text)
+	}
+	if text == "" && event.Message.ButtonsResponseMessage != nil {
+		text = event.Message.ButtonsResponseMessage.SelectedDisplayText
+		if text == "" {
+			text = event.Message.ButtonsResponseMessage.SelectedButtonID
+		}
+		log.Printf("Wuzapi DEBUG: Button reply: text='%s'", text)
+	}
+	if text == "" && event.Message.TemplateButtonReplyMessage != nil {
+		text = event.Message.TemplateButtonReplyMessage.SelectedDisplayText
+		if text == "" {
+			text = event.Message.TemplateButtonReplyMessage.SelectedID
+		}
+		log.Printf("Wuzapi DEBUG: Template button reply: text='%s'", text)
 	}
 
 	// Handle Media
