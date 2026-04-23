@@ -91,7 +91,7 @@ func NewDefaultConfig() *Config {
 		InstanceID:          hostname,
 
 		DynamoEndpoint:    "", // let library generate it
-		DynamoTablePrefix: "Temba",
+		DynamoTablePrefix: "",
 
 		S3Endpoint:          "https://s3.amazonaws.com",
 		S3AttachmentsBucket: "temba-attachments",
