@@ -1,3 +1,45 @@
+v26.1.25 (2026-04-16)
+-------------------------
+ * Merge pull request #999 from nyaruka/d3c-bsuid
+ * Save BSUID URN for D3C channels
+
+v26.1.24 (2026-04-08)
+-------------------------
+ * Update dependencies
+
+v26.1.23 (2026-04-07)
+-------------------------
+ * Include channel_id in contact_changed tasks
+
+v26.1.22 (2026-04-07)
+-------------------------
+ * Use NamedExecContext for incoming msg and channel event inserts
+ * Move incoming message insert into core/models
+ * Move ChannelEvent struct and insert into core/models
+
+v26.1.21 (2026-04-02)
+-------------------------
+ * Skip queuing contact_changed task when contact already has the URN
+ * Add BSUID URN support for outgoing WhatsApp messages
+
+v26.1.20 (2026-04-01)
+-------------------------
+ * Update to latest phonenumbers
+ * Support WhatsApp user_id as secondary URN using BSUID scheme
+
+v26.1.19 (2026-03-31)
+-------------------------
+ * Fix goreleaser
+
+v26.1.18 (2026-03-31)
+-------------------------
+ * Remove channel log policy feature so all channel logs are always persisted
+ * Add new_urn support to incoming messages for mailroom msg_received task
+ * Bump valkey from 8.0 to 8.1 in CI
+ * Bump github.com/antchfx/xpath from 1.3.5 to 1.3.6
+ * Bump github.com/buger/jsonparser from 1.1.1 to 1.1.2
+ * Update from Go 1.25 to 1.26
+
 v26.1.17 (2026-03-23)
 -------------------------
  * Remove support for Facebook referral URNs, no longer used

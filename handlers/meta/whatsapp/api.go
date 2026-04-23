@@ -48,16 +48,18 @@ type WAContact struct {
 	Profile struct {
 		Name string `json:"name"`
 	} `json:"profile"`
-	WaID string `json:"wa_id"`
+	WaID   string `json:"wa_id"`
+	UserID string `json:"user_id"`
 }
 
 type WAMessage struct {
-	ID        string `json:"id"`
-	GroupID   string `json:"group_id,omitempty"`
-	From      string `json:"from"`
-	Timestamp string `json:"timestamp"`
-	Type      string `json:"type"`
-	Context   *struct {
+	ID         string `json:"id"`
+	GroupID    string `json:"group_id,omitempty"`
+	From       string `json:"from"`
+	FromUserID string `json:"from_user_id"`
+	Timestamp  string `json:"timestamp"`
+	Type       string `json:"type"`
+	Context    *struct {
 		Forwarded           bool   `json:"forwarded"`
 		FrequentlyForwarded bool   `json:"frequently_forwarded"`
 		From                string `json:"from"`
@@ -329,6 +331,10 @@ type SendRequest struct {
 // see https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages#response-syntax
 // e.g. https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#successful-response
 type SendResponse struct {
+	Contacts []*struct {
+		WaID   string `json:"wa_id"`
+		UserID string `json:"user_id"`
+	} `json:"contacts"`
 	Messages []*struct {
 		ID string `json:"id"`
 	} `json:"messages"`
@@ -336,4 +342,12 @@ type SendResponse struct {
 		Message string `json:"message"`
 		Code    int    `json:"code"`
 	} `json:"error"`
+}
+
+// UserID returns the user_id from the first contact in the response if present.
+func (r *SendResponse) UserID() string {
+	if len(r.Contacts) > 0 && r.Contacts[0].UserID != "" {
+		return r.Contacts[0].UserID
+	}
+	return ""
 }

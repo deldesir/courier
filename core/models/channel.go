@@ -65,14 +65,6 @@ func (a ChannelAddress) String() string {
 	return string(a)
 }
 
-type LogPolicy string
-
-const (
-	LogPolicyNone   = "N"
-	LogPolicyErrors = "E"
-	LogPolicyAll    = "A"
-)
-
 const (
 	// ConfigAPIKey is a constant key for channel configs
 	ConfigAPIKey = "api_key"

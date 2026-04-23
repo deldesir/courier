@@ -1,6 +1,7 @@
 package models
 
 import (
+	"context"
 	"time"
 	"unicode/utf8"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
 	"github.com/nyaruka/null/v3"
+	"github.com/vinovest/sqlx"
 )
 
 // MsgUUID is the UUID of a message which has been received
@@ -29,6 +31,19 @@ const (
 	MsgStatusErrored   MsgStatus = "E"
 	MsgStatusFailed    MsgStatus = "F"
 )
+
+// NewURNAction is the action to perform with a new URN
+type NewURNAction string
+
+const (
+	NewURNAppend NewURNAction = "append"
+)
+
+// NewURNSpec specifies a new URN to add or replace on the contact
+type NewURNSpec struct {
+	Value  urns.URN     `json:"value"`
+	Action NewURNAction `json:"action"`
+}
 
 // MsgDirection is the direction of a message
 type MsgDirection string
@@ -89,6 +104,19 @@ func (m *MsgIn) Text() string           { return m.Text_ }
 func (m *MsgIn) Attachments() []string  { return []string(m.Attachments_) }
 func (m *MsgIn) ReceivedOn() *time.Time { return m.SentOn_ }
 
+const sqlInsertIncomingMsg = `
+INSERT INTO
+	msgs_msg(org_id, uuid, direction, text, attachments, msg_type, msg_count, error_count, high_priority, status, is_android,
+             visibility, external_identifier, channel_id, contact_id, contact_urn_id, created_on, modified_on, sent_on, log_uuids)
+    VALUES(:org_id, :uuid, 'I', :text, :attachments, 'T', 1, 0, FALSE, 'P', FALSE,
+             'V', :external_identifier, :channel_id, :contact_id, :contact_urn_id, :created_on, :modified_on, :sent_on, :log_uuids)`
+
+// InsertIncomingMsg inserts the passed in incoming message into the database
+func InsertIncomingMsg(ctx context.Context, db *sqlx.DB, m *MsgIn) error {
+	_, err := db.NamedExecContext(ctx, sqlInsertIncomingMsg, m)
+	return err
+}
+
 type MsgOrigin string
 
 const (
@@ -118,6 +146,17 @@ type ContactReference struct {
 	ID         ContactID   `json:"id"   validate:"required"`      // for creating session timeout fires in Postgres
 	UUID       ContactUUID `json:"uuid" validate:"uuid,required"` // for creating status updates in DynamoDB
 	LastSeenOn *time.Time  `json:"last_seen_on,omitempty"`
+	OtherURNs  []urns.URN  `json:"other_urns,omitempty"` // contact's URNs other than the one used for this message
+}
+
+// HasOtherURN returns true if the contact has the given URN in their OtherURNs list
+func (c *ContactReference) HasOtherURN(urn urns.URN) bool {
+	for _, u := range c.OtherURNs {
+		if u.Identity() == urn.Identity() {
+			return true
+		}
+	}
+	return false
 }
 
 // FlowReference is a reference to a flow on a queued outgoing message

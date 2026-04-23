@@ -58,8 +58,6 @@ func (l *ChannelLog) MarshalDynamo() (*dynamo.Item, error) {
 func queueChannelLog(b *backend, clog *courier.ChannelLog) {
 	log := slog.With("log_uuid", clog.UUID, "log_type", clog.Type, "channel_uuid", clog.Channel().UUID())
 
-	// log policy has been removed, write all logs
-
 	capacity, err := b.rt.Writers.Main.Queue(&ChannelLog{clog})
 	if err != nil {
 		log.Error("error queuing channel log to writer", "error", err)
