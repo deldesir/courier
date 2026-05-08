@@ -23,11 +23,11 @@ import (
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gomodule/redigo/redis"
-	"github.com/nyaruka/courier"
-	"github.com/nyaruka/courier/core/models"
-	"github.com/nyaruka/courier/runtime"
-	"github.com/nyaruka/courier/utils"
-	"github.com/nyaruka/courier/utils/queue"
+	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/gocommon/aws/cwatch"
 	"github.com/nyaruka/gocommon/aws/dynamo"
 	"github.com/nyaruka/gocommon/cache"
@@ -539,6 +539,7 @@ func (b *backend) WriteMsg(ctx context.Context, msg courier.MsgIn, clog *courier
 	// check if this message could be a duplicate and if so steal the original's UUID
 	if prevUUID := b.checkMsgAlreadyReceived(ctx, m); prevUUID != "" {
 		m.UUID_ = prevUUID
+		m.duplicate = true
 		return nil
 	}
 

@@ -2,6 +2,7 @@ package turn
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,11 +18,11 @@ import (
 
 	"github.com/buger/jsonparser"
 	"github.com/gomodule/redigo/redis"
-	"github.com/nyaruka/courier"
-	"github.com/nyaruka/courier/core/models"
-	"github.com/nyaruka/courier/handlers"
-	"github.com/nyaruka/courier/handlers/meta/whatsapp"
-	"github.com/nyaruka/courier/utils"
+	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/handlers/meta/whatsapp"
+	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
 	"github.com/nyaruka/gocommon/jsonx"
@@ -54,7 +55,7 @@ func newHandler() courier.ChannelHandler {
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s courier.Server) error {
+func (h *handler) Initialize(s *courier.Server) error {
 	h.SetServer(s)
 	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMultiReceive, handlers.JSONPayload(h, h.receiveEvents))
 
@@ -86,12 +87,13 @@ type eventsPayload struct {
 		WaID string `json:"wa_id"`
 	} `json:"contacts"`
 	Messages []struct {
-		From      string `json:"from"      validate:"required"`
-		ID        string `json:"id"        validate:"required"`
-		GroupID   string `json:"group_id,omitempty"`
-		Timestamp string `json:"timestamp" validate:"required"`
-		Type      string `json:"type"      validate:"required"`
-		Text      struct {
+		From            string `json:"from"      validate:"required"`
+		ID              string `json:"id"        validate:"required"`
+		GroupID         string `json:"group_id,omitempty"`
+		Timestamp       string `json:"timestamp" validate:"required"`
+		Type            string `json:"type"      validate:"required"`
+		RecipientUserID string `json:"recipient_user_id"`
+		Text            struct {
 			Body string `json:"body"`
 		} `json:"text"`
 		Audio *struct {
@@ -243,6 +245,15 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 
 		if mediaURL != "" {
 			event.WithAttachment(mediaURL)
+		}
+
+		if msg.RecipientUserID != "" {
+			userIDURN, urnErr := urns.New(urns.BSUID, msg.RecipientUserID)
+			if urnErr == nil {
+				event.WithNewURN(userIDURN, models.NewURNAppend)
+			} else {
+				courier.LogRequestError(r, channel, fmt.Errorf("invalid recipient_user_id for BSUID URN: %w", urnErr))
+			}
 		}
 
 		err = h.Backend().WriteMsg(ctx, event, clog)
@@ -655,7 +666,11 @@ func buildPayloads(ctx context.Context, msg courier.MsgOut, h *handler, clog *co
 				// get the variables used by this component in order of their names 1, 2 etc
 				compParams := make([]models.TemplatingVariable, 0, len(comp.Variables))
 
-				for _, varName := range slices.Sorted(maps.Keys(comp.Variables)) {
+				for _, varName := range slices.SortedFunc(maps.Keys(comp.Variables), func(a, b string) int {
+					ai, _ := strconv.Atoi(a)
+					bi, _ := strconv.Atoi(b)
+					return cmp.Compare(ai, bi)
+				}) {
 					compParams = append(compParams, msg.Templating().Variables[comp.Variables[varName]])
 				}
 

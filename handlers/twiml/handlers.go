@@ -12,6 +12,7 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -19,11 +20,11 @@ import (
 	"strings"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier"
-	"github.com/nyaruka/courier/core/models"
-	"github.com/nyaruka/courier/handlers"
-	"github.com/nyaruka/courier/utils"
-	"github.com/nyaruka/courier/utils/clogs"
+	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/courier/v26/utils/clogs"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
 	"github.com/nyaruka/gocommon/jsonx"
@@ -81,7 +82,7 @@ func init() {
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s courier.Server) error {
+func (h *handler) Initialize(s *courier.Server) error {
 	h.SetServer(s)
 	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, h.receiveMessage)
 	s.AddHandlerRoute(h, http.MethodPost, "status", courier.ChannelLogTypeMsgStatus, h.receiveStatus)
@@ -89,15 +90,16 @@ func (h *handler) Initialize(s courier.Server) error {
 }
 
 type moForm struct {
-	MessageSID  string `validate:"required"`
-	AccountSID  string `validate:"required"`
-	From        string `validate:"required"`
-	FromCountry string
-	To          string `validate:"required"`
-	ToCountry   string
-	Body        string
-	ButtonText  string
-	NumMedia    int
+	MessageSID     string `validate:"required"`
+	AccountSID     string `validate:"required"`
+	From           string `validate:"required"`
+	FromCountry    string
+	To             string `validate:"required"`
+	ExternalUserId string
+	ToCountry      string
+	Body           string
+	ButtonText     string
+	NumMedia       int
 }
 
 type statusForm struct {
@@ -147,6 +149,17 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 
 	// build our msg
 	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, form.MessageSID, clog)
+
+	if form.ExternalUserId != "" && channel.IsScheme(urns.WhatsApp) {
+		userIDURN, urnErr := h.parseURN(channel, form.ExternalUserId, i18n.Country(form.FromCountry))
+
+		if urnErr == nil {
+			msg.WithNewURN(userIDURN, models.NewURNAppend)
+		} else {
+			slog.Warn("ignoring invalid ExternalUserId for message", "ExternalUserId", form.ExternalUserId, "MessageSID", form.MessageSID, "Error", urnErr.Error())
+
+		}
+	}
 
 	// process any attached media
 	for i := 0; i < form.NumMedia; i++ {
@@ -451,6 +464,11 @@ func (h *handler) parseURN(channel courier.Channel, text string, country i18n.Co
 			fromTel = parts[1]
 		} else {
 			fromTel = parts[0]
+		}
+
+		if dot := strings.Index(fromTel, "."); dot >= 0 && dot < len(fromTel)-1 {
+			// if we have a BSUID, use that as the URN
+			return urns.New(urns.BSUID, fromTel)
 		}
 
 		// trim off left +, official whatsapp IDs dont have that

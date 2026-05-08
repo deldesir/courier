@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/nyaruka/courier/core/models"
+	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/gocommon/urns"
 )
 
@@ -16,8 +16,8 @@ type ChannelHandleFunc func(context.Context, Channel, http.ResponseWriter, *http
 
 // ChannelHandler is the interface all handlers must satisfy
 type ChannelHandler interface {
-	Initialize(Server) error
-	Server() Server
+	Initialize(*Server) error
+	Server() *Server
 	ChannelType() models.ChannelType
 	ChannelName() string
 	UseChannelRouteUUID() bool

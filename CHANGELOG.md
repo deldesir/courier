@@ -1,3 +1,17 @@
+v26.1.28 (2026-05-07)
+-------------------------
+ * Don't count duplicated messages for incoming message metrics
+
+v26.1.27 (2026-04-28)
+-------------------------
+ * Update dependencies
+ * Sort WhatsApp template component variables numerically
+
+v26.1.26 (2026-04-23)
+-------------------------
+ * Save BSUID URN for TRN channels on incoming messages
+ * Support receiving for BSUID on Twilio Whatsapp
+
 v26.1.25 (2026-04-16)
 -------------------------
  * Merge pull request #999 from nyaruka/d3c-bsuid

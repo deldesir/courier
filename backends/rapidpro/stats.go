@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
-	"github.com/nyaruka/courier"
-	"github.com/nyaruka/courier/core/models"
+	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/gocommon/aws/cwatch"
 )
 
@@ -99,8 +99,12 @@ func (c *StatsCollector) RecordIncoming(typ models.ChannelType, evts []courier.E
 	c.stats.IncomingRequests[typ]++
 
 	for _, e := range evts {
-		switch e.(type) {
+		switch ev := e.(type) {
 		case courier.MsgIn:
+			if m, ok := ev.(*MsgIn); ok && m.duplicate {
+				c.stats.IncomingIgnored[typ]++
+				continue
+			}
 			c.stats.IncomingMessages[typ]++
 		case courier.StatusUpdate:
 			c.stats.IncomingStatuses[typ]++

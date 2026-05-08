@@ -5,9 +5,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nyaruka/courier"
-	"github.com/nyaruka/courier/core/models"
-	"github.com/nyaruka/courier/handlers"
+	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/random"
 )
 
@@ -23,7 +23,7 @@ func newHandler() courier.ChannelHandler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("TST"), "Test")}
 }
 
-func (h *handler) Initialize(s courier.Server) error {
+func (h *handler) Initialize(s *courier.Server) error {
 	h.SetServer(s)
 	return nil
 }

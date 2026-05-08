@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier"
-	"github.com/nyaruka/courier/core/models"
-	"github.com/nyaruka/courier/runtime"
-	"github.com/nyaruka/courier/test"
-	"github.com/nyaruka/courier/utils/clogs"
+	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/utils/clogs"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
@@ -78,7 +78,7 @@ type IncomingTestCase struct {
 }
 
 // utility method to make a request to a handler URL
-func testHandlerRequest(tb testing.TB, s courier.Server, path string, headers map[string]string, data string, multipartFormFields map[string]string, expectedStatus int, expectedBodyContains string, requestPrepFunc RequestPrepFunc) string {
+func testHandlerRequest(tb testing.TB, s *courier.Server, path string, headers map[string]string, data string, multipartFormFields map[string]string, expectedStatus int, expectedBodyContains string, requestPrepFunc RequestPrepFunc) string {
 	var req *http.Request
 	var err error
 	url := fmt.Sprintf("https://%s%s", s.Config().Domain, path)
@@ -138,7 +138,7 @@ func testHandlerRequest(tb testing.TB, s courier.Server, path string, headers ma
 	return body
 }
 
-func newServer(backend courier.Backend) courier.Server {
+func newServer(backend courier.Backend) *courier.Server {
 	// for benchmarks, log to null
 	logger := slog.Default()
 	log.SetOutput(io.Discard)

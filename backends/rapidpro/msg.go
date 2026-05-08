@@ -15,9 +15,9 @@ import (
 
 	"github.com/gomodule/redigo/redis"
 	filetype "github.com/h2non/filetype"
-	"github.com/nyaruka/courier"
-	"github.com/nyaruka/courier/core/models"
-	"github.com/nyaruka/courier/utils/queue"
+	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/gocommon/dbutil"
 	"github.com/nyaruka/gocommon/urns"
 )
@@ -33,7 +33,8 @@ type MsgIn struct {
 	URNAuthTokens_ map[string]string  `json:"auth_tokens"`
 	NewURN_        *models.NewURNSpec `json:"new_urn,omitempty"`
 
-	channel *models.Channel
+	channel   *models.Channel
+	duplicate bool
 }
 
 func (m *MsgIn) Channel() courier.Channel { return m.channel }

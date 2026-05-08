@@ -1,13 +1,15 @@
 package whatsapp
 
 import (
+	"cmp"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 
-	"github.com/nyaruka/courier/core/models"
-	"github.com/nyaruka/courier/handlers"
-	"github.com/nyaruka/courier/utils"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/utils"
 )
 
 func GetTemplatePayload(templating *models.Templating) *Template {
@@ -21,7 +23,11 @@ func GetTemplatePayload(templating *models.Templating) *Template {
 		// get the variables used by this component in order of their names 1, 2 etc
 		compParams := make([]models.TemplatingVariable, 0, len(comp.Variables))
 
-		for _, varName := range slices.Sorted(maps.Keys(comp.Variables)) {
+		for _, varName := range slices.SortedFunc(maps.Keys(comp.Variables), func(a, b string) int {
+			ai, _ := strconv.Atoi(a)
+			bi, _ := strconv.Atoi(b)
+			return cmp.Compare(ai, bi)
+		}) {
 			compParams = append(compParams, templating.Variables[comp.Variables[varName]])
 		}
 
