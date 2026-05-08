@@ -1,7 +1,5 @@
 .DS_Store
-dist/
 .envrc
-/courier
 .devcontainer
 .claude/
 CLAUDE.md
@@ -9,7 +7,14 @@ coverage.text
 deploy
 fabfile.*
 
+# Build outputs — binaries belong in GitHub Releases, not in git
+/courier
+courier
+dist/
+*-linux-amd64
+*-linux-arm64
+*.upx
+
 /_test_spool
 /_spool
 _storage
-courier
