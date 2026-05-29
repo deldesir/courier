@@ -17,7 +17,6 @@ import (
 
 const (
 	configEncoding   = "encoding"
-	configVerifySSL  = "verify_ssl"
 	configDLRMask    = "dlr_mask"
 	configIgnoreSent = "ignore_sent"
 
@@ -129,7 +128,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	}
 	dlrMask := msg.Channel().StringConfigForKey(configDLRMask, defaultDLRMask)
 
-	callbackDomain := msg.Channel().CallbackDomain(h.Server().Config().Domain)
+	callbackDomain := msg.Channel().CallbackDomain(h.Runtime().Config.Domain)
 	dlrURL := fmt.Sprintf("https://%s/c/kn/%s/status?uuid=%s&status=%%d", callbackDomain, msg.Channel().UUID(), msg.UUID())
 
 	// build our request
@@ -182,22 +181,12 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		sendURL = fmt.Sprintf("%s?%s", sendURL, encodedForm)
 	}
 
-	// ignore SSL warnings if they ask
-	verifySSLStr := msg.Channel().ConfigForKey(configVerifySSL, true)
-	verifySSL, _ := verifySSLStr.(bool)
-
 	req, err := http.NewRequest(http.MethodGet, sendURL, nil)
 	if err != nil {
 		return err
 	}
 
-	var resp *http.Response
-	if verifySSL {
-		resp, _, err = h.RequestHTTP(req, clog)
-	} else {
-		resp, _, err = h.RequestHTTPInsecure(req, clog)
-	}
-
+	resp, _, err := h.RequestHTTP(req, clog)
 	if err != nil || resp.StatusCode/100 == 5 {
 		return courier.ErrConnectionFailed
 	} else if resp.StatusCode/100 != 2 {

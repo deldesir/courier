@@ -1,17 +1,16 @@
 package courier
 
 import (
-	"bytes"
 	"compress/flate"
 	"context"
 	"errors"
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,34 +34,30 @@ const (
 	contextRequestStart
 )
 
-// NewServer creates a new Server for the passed in configuration. The server will have to be started
+// NewServer creates a new Server for the passed in runtime. The server will have to be started
 // afterwards, which is when configuration options are checked.
-func NewServer(config *runtime.Config, backend Backend) *Server {
-	// create our top level router
-	logger := slog.Default()
-	return NewServerWithLogger(config, backend, logger)
-}
+func NewServer(rt *runtime.Runtime, backend Backend) *Server {
+	// channelRouter holds the dynamically-registered channel handler routes - mounted at /c/ on the public listener
+	channelRouter := chi.NewRouter()
 
-// NewServerWithLogger creates a new Server for the passed in configuration. The server will have to be started
-// afterwards, which is when configuration options are checked.
-func NewServerWithLogger(config *runtime.Config, backend Backend, logger *slog.Logger) *Server {
-	router := chi.NewRouter()
-	router.Use(middleware.Compress(flate.DefaultCompression))
-	router.Use(middleware.StripSlashes)
-	router.Use(middleware.RequestID)
-	router.Use(middleware.RealIP)
-	router.Use(middleware.Recoverer)
-	router.Use(middleware.Timeout(30 * time.Second))
-
-	publicRouter := chi.NewRouter()
-	router.Mount("/c/", publicRouter)
+	// testRouter mounts channelRouter at /c/ so handler tests can dispatch requests via Router() without
+	// spinning up the listener. It mirrors the public listener's middleware stack so tests exercise the
+	// same chain that /c/* traffic hits in production.
+	testRouter := chi.NewRouter()
+	testRouter.Use(middleware.Compress(flate.DefaultCompression))
+	testRouter.Use(middleware.StripSlashes)
+	testRouter.Use(middleware.RequestID)
+	testRouter.Use(middleware.RealIP)
+	testRouter.Use(middleware.Recoverer)
+	testRouter.Use(middleware.Timeout(30 * time.Second))
+	testRouter.Mount("/c/", channelRouter)
 
 	return &Server{
-		config:  config,
+		rt:      rt,
 		backend: backend,
 
-		router:       router,
-		publicRouter: publicRouter,
+		channelRouter: channelRouter,
+		testRouter:    testRouter,
 
 		stopChan:  make(chan bool),
 		waitGroup: &sync.WaitGroup{},
@@ -74,57 +69,102 @@ func NewServerWithLogger(config *runtime.Config, backend Backend, logger *slog.L
 // if it encounters any unrecoverable (or ignorable) error, though its bias is to move forward despite
 // connection errors
 func (s *Server) Start() error {
-	// start our backend
-	err := s.backend.Start()
+	// bind both listener sockets up front so callers know we're accepting connections by the
+	// time Start returns, and so a bind failure fails fast before we've started the backend,
+	// spool flushers, or anything else that would need to be unwound
+	publicAddr := fmt.Sprintf("%s:%d", s.rt.Config.PublicAddress, s.rt.Config.PublicPort)
+	publicLn, err := net.Listen("tcp", publicAddr)
 	if err != nil {
+		return fmt.Errorf("error binding public listener on %s: %w", publicAddr, err)
+	}
+	internalAddr := fmt.Sprintf("%s:%d", s.rt.Config.InternalAddress, s.rt.Config.InternalPort)
+	internalLn, err := net.Listen("tcp", internalAddr)
+	if err != nil {
+		publicLn.Close()
+		return fmt.Errorf("error binding internal listener on %s: %w", internalAddr, err)
+	}
+
+	// start our backend
+	if err := s.backend.Start(); err != nil {
+		publicLn.Close()
+		internalLn.Close()
 		return err
 	}
 
 	// start our spool flushers
 	startSpoolFlushers(s)
 
-	// wire up our main pages
-	s.router.NotFound(s.handle404)
-	s.router.MethodNotAllowed(s.handle405)
-	s.router.Get("/", s.handleIndex)
-	s.router.Get("/status", s.basicAuthRequired(s.handleStatus))
-	s.router.Post("/ci/attachment/fetch", s.tokenAuthRequired(s.handleFetchAttachment))
-
-	// deprecated - kept for backwards compatibility
-	s.publicRouter.Post("/_fetch-attachment", s.tokenAuthRequired(s.handleFetchAttachment)) // becomes /c/_fetch-attachment
-
-	// initialize our handlers
+	// initialize our handlers (wires routes into channelRouter)
 	s.initializeChannelHandlers()
 
-	// configure timeouts on our server
-	s.httpServer = &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", s.config.Address, s.config.Port),
-		Handler:      s.router,
+	// public listener — exposes /c/*, /
+	publicRouter := chi.NewRouter()
+	publicRouter.Use(middleware.Compress(flate.DefaultCompression))
+	publicRouter.Use(middleware.StripSlashes)
+	publicRouter.Use(middleware.RequestID)
+	publicRouter.Use(middleware.RealIP)
+	publicRouter.Use(middleware.Recoverer)
+	publicRouter.Use(middleware.Timeout(30 * time.Second))
+	publicRouter.NotFound(s.handle404("public"))
+	publicRouter.MethodNotAllowed(s.handle405("public"))
+	publicRouter.Get("/", s.handleHealth)
+	publicRouter.Mount("/c/", s.channelRouter)
+
+	// internal listener — only /ci/* routes and /, no public-facing concerns
+	internalRouter := chi.NewRouter()
+	internalRouter.Use(middleware.Compress(flate.DefaultCompression))
+	internalRouter.Use(middleware.StripSlashes)
+	internalRouter.Use(middleware.RequestID)
+	internalRouter.Use(middleware.Recoverer)
+	internalRouter.Use(middleware.Timeout(30 * time.Second))
+	internalRouter.NotFound(s.handle404("internal"))
+	internalRouter.MethodNotAllowed(s.handle405("internal"))
+	internalRouter.Get("/", s.handleHealth)
+	internalRouter.Post("/ci/attachment/fetch", s.tokenAuthRequired(s.handleFetchAttachment))
+
+	s.publicServer = &http.Server{
+		Addr:         publicAddr,
+		Handler:      publicRouter,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 45 * time.Second,
+		IdleTimeout:  90 * time.Second,
+	}
+	s.internalServer = &http.Server{
+		Addr:         internalAddr,
+		Handler:      internalRouter,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 45 * time.Second,
 		IdleTimeout:  90 * time.Second,
 	}
 
-	s.waitGroup.Add(1)
+	s.waitGroup.Add(2)
 
-	// and start serving HTTP
 	go func() {
 		defer s.waitGroup.Done()
-		err := s.httpServer.ListenAndServe()
+
+		log := slog.With("comp", "server", "listener", "public", "address", s.publicServer.Addr)
+		log.Info("server started", "version", s.rt.Config.Version)
+
+		err := s.publicServer.Serve(publicLn)
 		if err != nil && err != http.ErrServerClosed {
-			slog.Error("failed to start server", "error", err, "comp", "server", "state", "stopping")
+			log.Error("error listening", "error", err)
 		}
 	}()
 
-	slog.Info(fmt.Sprintf("server listening on %d", s.config.Port),
-		"comp", "server",
-		"port", s.config.Port,
-		"state", "started",
-		"version", s.config.Version,
-	)
+	go func() {
+		defer s.waitGroup.Done()
+
+		log := slog.With("comp", "server", "listener", "internal", "address", s.internalServer.Addr)
+		log.Info("server started", "version", s.rt.Config.Version)
+
+		err := s.internalServer.Serve(internalLn)
+		if err != nil && err != http.ErrServerClosed {
+			log.Error("error listening", "error", err)
+		}
+	}()
 
 	// start our foreman for outgoing messages
-	s.foreman = NewForeman(s, s.config.MaxWorkers)
+	s.foreman = NewForeman(s, s.rt.Config.MaxWorkers)
 	s.foreman.Start()
 
 	return nil
@@ -138,9 +178,12 @@ func (s *Server) Stop() error {
 	// stop our foreman
 	s.foreman.Stop()
 
-	// shut down our HTTP server
-	if err := s.httpServer.Shutdown(context.Background()); err != nil {
-		log.Error("error shutting down server", "error", err, "state", "stopping")
+	// shut down both HTTP servers
+	if err := s.publicServer.Shutdown(context.Background()); err != nil {
+		log.Error("error shutting down server", "listener", "public", "error", err, "state", "stopping")
+	}
+	if err := s.internalServer.Shutdown(context.Background()); err != nil {
+		log.Error("error shutting down server", "listener", "internal", "error", err, "state", "stopping")
 	}
 
 	// stop everything
@@ -163,33 +206,32 @@ func (s *Server) GetHandler(ch Channel) ChannelHandler { return activeHandlers[c
 
 func (s *Server) WaitGroup() *sync.WaitGroup { return s.waitGroup }
 func (s *Server) StopChan() chan bool        { return s.stopChan }
-func (s *Server) Config() *runtime.Config    { return s.config }
+func (s *Server) Runtime() *runtime.Runtime  { return s.rt }
 func (s *Server) Stopped() bool              { return s.stopped }
 
 func (s *Server) Backend() Backend   { return s.backend }
-func (s *Server) Router() chi.Router { return s.router }
+func (s *Server) Router() chi.Router { return s.testRouter }
 
 type Server struct {
 	backend Backend
 
-	httpServer   *http.Server
-	router       *chi.Mux
-	publicRouter *chi.Mux
+	publicServer   *http.Server
+	internalServer *http.Server
+	channelRouter  *chi.Mux
+	testRouter     *chi.Mux
 
 	foreman *Foreman
 
-	config *runtime.Config
+	rt *runtime.Runtime
 
 	waitGroup *sync.WaitGroup
 	stopChan  chan bool
 	stopped   bool
-
-	chanRoutes []string // used for index page
 }
 
 func (s *Server) initializeChannelHandlers() {
-	includes := s.config.IncludeChannels
-	excludes := s.config.ExcludeChannels
+	includes := s.rt.Config.IncludeChannels
+	excludes := s.rt.Config.ExcludeChannels
 
 	// initialize handlers which are included/not-excluded in the config
 	for _, handler := range registeredHandlers {
@@ -205,8 +247,6 @@ func (s *Server) initializeChannelHandlers() {
 		}
 	}
 
-	// sort our route help
-	sort.Strings(s.chanRoutes)
 }
 
 func (s *Server) channelHandleWrapper(handler ChannelHandler, handlerFunc ChannelHandleFunc, logType clogs.Type) http.HandlerFunc {
@@ -302,45 +342,14 @@ func (s *Server) AddHandlerRoute(handler ChannelHandler, method string, action s
 	if action != "" {
 		path = fmt.Sprintf("%s/%s", path, action)
 	}
-	s.publicRouter.Method(method, path, s.channelHandleWrapper(handler, handlerFunc, logType))
-	s.chanRoutes = append(s.chanRoutes, fmt.Sprintf("%-20s - %s %s", "/c"+path, handler.ChannelName(), action))
-}
-
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
-
-	var buf bytes.Buffer
-	buf.WriteString("<html><head><title>courier</title></head><body><pre>\n")
-	buf.WriteString(splash)
-	buf.WriteString(s.config.Version)
-	buf.WriteString(s.backend.Health())
-	buf.WriteString("\n\n")
-	buf.WriteString(strings.Join(s.chanRoutes, "\n"))
-	buf.WriteString("</pre></body></html>")
-	w.Write(buf.Bytes())
-}
-
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
-
-	var buf bytes.Buffer
-	buf.WriteString("<html><head><title>courier</title></head><body><pre>\n")
-	buf.WriteString(splash)
-	buf.WriteString(s.config.Version)
-	buf.WriteString("\n\n")
-	buf.WriteString(s.backend.Status())
-	buf.WriteString("\n\n")
-	buf.WriteString("</pre></body></html>")
-	w.Write(buf.Bytes())
+	s.channelRouter.Method(method, path, s.channelHandleWrapper(handler, handlerFunc, logType))
 }
 
 func (s *Server) handleFetchAttachment(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*1)
 	defer cancel()
 
-	resp, err := fetchAttachment(ctx, s.backend, r)
+	resp, err := fetchAttachment(ctx, s.rt, s.backend, r)
 	if err != nil {
 		slog.Error("error fetching attachment", "error", err)
 		WriteError(w, http.StatusBadRequest, err)
@@ -352,48 +361,56 @@ func (s *Server) handleFetchAttachment(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonx.MustMarshal(resp))
 }
 
-func (s *Server) handle404(w http.ResponseWriter, r *http.Request) {
-	slog.Info("not found", "url", r.URL.String(), "method", r.Method, "resp_status", "404")
-	errors := []any{NewErrorData(fmt.Sprintf("not found: %s", r.URL.String()))}
-	err := WriteDataResponse(w, http.StatusNotFound, "Not Found", errors)
-	if err != nil {
-		slog.Error("error writing response", "error", err)
-	}
-}
-
-func (s *Server) handle405(w http.ResponseWriter, r *http.Request) {
-	slog.Info("invalid method", "url", r.URL.String(), "method", r.Method, "resp_status", "405")
-	errors := []any{NewErrorData(fmt.Sprintf("method not allowed: %s", r.Method))}
-	err := WriteDataResponse(w, http.StatusMethodNotAllowed, "Method Not Allowed", errors)
-	if err != nil {
-		slog.Error("error writing response", "error", err)
-
-	}
-}
-
-// wraps a handler to make it use basic auth
-func (s *Server) basicAuthRequired(h http.HandlerFunc) http.HandlerFunc {
+// handle404 returns a 404 handler. The internal listener logs at Error level (sentry-routed via slog-sentry)
+// so we alert on caller-side bugs in rapidpro/mailroom that hit unknown internal paths.
+func (s *Server) handle404(listener string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.config.StatusUsername != "" {
-			user, pass, ok := r.BasicAuth()
-
-			if !ok || !utils.SecretEqual(user, s.config.StatusUsername) || !utils.SecretEqual(pass, s.config.StatusPassword) {
-				w.Header().Set("Content-Type", "text/plain")
-				w.Header().Set("WWW-Authenticate", `Basic realm="Authenticate"`)
-				w.WriteHeader(http.StatusUnauthorized)
-				w.Write([]byte("Unauthorized"))
-				return
-			}
+		if listener == "internal" {
+			slog.Error("not found", "listener", listener, "url", r.URL.String(), "method", r.Method, "resp_status", "404")
+		} else {
+			slog.Info("not found", "listener", listener, "url", r.URL.String(), "method", r.Method, "resp_status", "404")
 		}
-		h(w, r)
+		errors := []any{NewErrorData(fmt.Sprintf("not found: %s", r.URL.String()))}
+		err := WriteDataResponse(w, http.StatusNotFound, "Not Found", errors)
+		if err != nil {
+			slog.Error("error writing response", "error", err)
+		}
 	}
+}
+
+func (s *Server) handle405(listener string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if listener == "internal" {
+			slog.Error("invalid method", "listener", listener, "url", r.URL.String(), "method", r.Method, "resp_status", "405")
+		} else {
+			slog.Info("invalid method", "listener", listener, "url", r.URL.String(), "method", r.Method, "resp_status", "405")
+		}
+		errors := []any{NewErrorData(fmt.Sprintf("method not allowed: %s", r.Method))}
+		err := WriteDataResponse(w, http.StatusMethodNotAllowed, "Method Not Allowed", errors)
+		if err != nil {
+			slog.Error("error writing response", "error", err)
+		}
+	}
+}
+
+// handleHealth is the liveness probe used by ALB health checks. Registered at the root of
+// both listeners and not under any /c or /ci prefix, so no listener rule routes client traffic
+// to it — only direct ALB→target health probes reach it. Also returns the running version so
+// it doubles as a debug endpoint.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonx.MustMarshal(map[string]string{
+		"component": "courier",
+		"version":   s.rt.Config.Version,
+	}))
 }
 
 // wraps a handler to make it use token auth
 func (s *Server) tokenAuthRequired(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") || !utils.SecretEqual(authHeader[7:], s.config.AuthToken) {
+		if !strings.HasPrefix(authHeader, "Bearer ") || !utils.SecretEqual(authHeader[7:], s.rt.Config.AuthToken) {
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte("Unauthorized"))
@@ -402,10 +419,3 @@ func (s *Server) tokenAuthRequired(h http.HandlerFunc) http.HandlerFunc {
 		h(w, r)
 	}
 }
-
-var splash = `
- ____________                   _____             
-   ___  ____/_________  ___________(_)____________
-    _  /  __  __ \  / / /_  ___/_  /_  _ \_  ___/
-    / /__  / /_/ / /_/ /_  /   _  / /  __/  /    
-    \____/ \____/\__,_/ /_/    /_/  \___//_/ v`

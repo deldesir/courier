@@ -46,18 +46,37 @@ var helloMsg = `{
    }]
 }`
 
-var helloMsgWithUserID = `{
-	"contacts":[{
-		"profile": {
-			"name": "Jerry Cooney"
-		},
-		"wa_id": "250788123123"
-	}],
+var helloMsgWithValidBSUID = `{
+  "contacts":[{
+    "profile": {
+      "name": "Jerry Cooney"
+    },
+    "wa_id": "250788123123"
+  }],
   "messages": [{
     "from": "250788123123",
+    "from_bsuid": "US.1234",
     "id": "41",
     "timestamp": "1454119029",
-    "recipient_user_id": "US.1234",
+    "text": {
+      "body": "hello world"
+    },
+    "type": "text"
+   }]
+}`
+
+var helloMsgWithInvalidBSUID = `{
+  "contacts":[{
+    "profile": {
+      "name": "Jerry Cooney"
+    },
+    "wa_id": "250788123123"
+  }],
+  "messages": [{
+    "from": "250788123123",
+    "from_bsuid": "foo_bar",
+    "id": "41",
+    "timestamp": "1454119029",
     "text": {
       "body": "hello world"
     },
@@ -334,9 +353,9 @@ var testCasesTurn = []IncomingTestCase{
 		NoInvalidChannelCheck: true,
 	},
 	{
-		Label:                 "Receive Message with recipient_user_id",
+		Label:                 "Receive Message with valid bsuid",
 		URL:                   turnWhatsappReceiveURL,
-		Data:                  helloMsgWithUserID,
+		Data:                  helloMsgWithValidBSUID,
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  `"type":"msg"`,
 		ExpectedContactName:   Sp("Jerry Cooney"),
@@ -345,6 +364,21 @@ var testCasesTurn = []IncomingTestCase{
 		ExpectedExternalID:    "41",
 		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
 		ExpectedNewURN:        &models.NewURNSpec{Value: "bsuid:US.1234", Action: models.NewURNAppend},
+		NoQueueErrorCheck:     true,
+		NoInvalidChannelCheck: true,
+	},
+	{
+		Label:                 "Receive Message with invalid bsuid, no new URN added",
+		URL:                   turnWhatsappReceiveURL,
+		Data:                  helloMsgWithInvalidBSUID,
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  `"type":"msg"`,
+		ExpectedContactName:   Sp("Jerry Cooney"),
+		ExpectedMsgText:       Sp("hello world"),
+		ExpectedURN:           "whatsapp:250788123123",
+		ExpectedExternalID:    "41",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+		ExpectedNewURN:        nil,
 		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 	},
@@ -544,10 +578,8 @@ func TestIncoming(t *testing.T) {
 }
 
 func TestBuildAttachmentRequest(t *testing.T) {
-	mb := test.NewMockBackend()
-
 	waHandler := &handler{NewBaseHandler(models.ChannelType("TRN"), "WhatsApp")}
-	req, _ := waHandler.BuildAttachmentRequest(context.Background(), mb, testChannels[0], "https://example.org/v1/media/41", nil)
+	req, _ := waHandler.BuildAttachmentRequest(context.Background(), testChannels[0], "https://example.org/v1/media/41", nil)
 	assert.Equal(t, "https://example.org/v1/media/41", req.URL.String())
 	assert.Equal(t, "Bearer a123", req.Header.Get("Authorization"))
 }

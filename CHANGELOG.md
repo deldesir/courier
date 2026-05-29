@@ -1,3 +1,61 @@
+v26.1.41 (2026-05-26)
+-------------------------
+ * Update default cloudwatch namespace to Courier
+ * Route external channel send URLs through optional outbound HTTP proxy
+
+v26.1.40 (2026-05-25)
+-------------------------
+ * Update gocommon to v1.80.1
+ * Fix DisallowedNetworks defaults blocking all outgoing IPv4 traffic
+
+v26.1.39 (2026-05-25)
+-------------------------
+ * Expand default DisallowedNetworks (full loopback, IPv4-mapped IPv6, ULA, CGNAT, and more)
+
+v26.1.38 (2026-05-25)
+-------------------------
+ * Update dependencies
+ * Remove SQ (shaqodoon) channel type
+ * Trim handler User-Agent to avoid leaking build details
+ * Remove BL (bongolive) channel type
+ * Remove KN insecure HTTP requests
+
+v26.1.37 (2026-05-19)
+-------------------------
+ * Serve health response at / on both listeners
+
+v26.1.36 (2026-05-19)
+-------------------------
+ * Remove index and status endpoints from public listener
+
+v26.1.35 (2026-05-18)
+-------------------------
+ * Remove backward-compat /ci/ route from public listener
+
+v26.1.34 (2026-05-18)
+-------------------------
+ * Remove old test channel handler
+
+v26.1.33 (2026-05-18)
+-------------------------
+ * Expose internal endpoint on separate listener port, add /ping
+
+v26.1.32 (2026-05-14)
+-------------------------
+ * Remove plaintext HTTP webhook logging
+
+v26.1.31 (2026-05-13)
+-------------------------
+ * Log warning when /c/* webhook arrives over plaintext HTTP
+
+v26.1.30 (2026-05-12)
+-------------------------
+ * Drop deprecated /c/_fetch-attachment endpoint
+
+v26.1.29 (2026-05-11)
+-------------------------
+ * Properly support BSUID for TRN channels
+
 v26.1.28 (2026-05-07)
 -------------------------
  * Don't count duplicated messages for incoming message metrics

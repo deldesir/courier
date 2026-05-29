@@ -518,7 +518,7 @@ func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel courier.Chann
 	req.Header.Set("Authorization", token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := h.Backend().HttpClient(false).Do(req)
+	resp, err := h.Runtime().HTTP.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -759,11 +759,11 @@ func (h *WuzapiHandler) doRequest(url string, token string, body []byte, res *co
 	return nil
 }
 
-// requestHTTPUnsafe bypasses the backend's HttpAccess configuration to allow requests to private IPs (localhost)
+// requestHTTPUnsafe bypasses the HTTPAccess configuration to allow requests to private IPs (localhost)
 func (h *WuzapiHandler) requestHTTPUnsafe(req *http.Request, clog *courier.ChannelLog) (*http.Response, []byte, error) {
-	client := h.Backend().HttpClient(false)
+	client := h.Runtime().HTTP
 
-	req.Header.Set("User-Agent", fmt.Sprintf("Courier/%s", h.Server().Config().Version))
+	req.Header.Set("User-Agent", fmt.Sprintf("Courier/%s", h.Runtime().Config.Version))
 
 	trace, err := httpx.DoTrace(client, req, nil, nil, 0)
 	if trace != nil {

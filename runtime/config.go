@@ -1,14 +1,12 @@
 package runtime
 
 import (
-	"encoding/csv"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
-	"strings"
 
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/ezconf"
@@ -22,9 +20,11 @@ type Config struct {
 	SpoolDir  string `help:"the local directory where courier will write statuses or msgs that need to be retried (needs to be writable)"`
 	SentryDSN string `help:"the DSN used for logging errors to Sentry"`
 
-	Domain  string `help:"the domain courier is exposed on"`
-	Address string `help:"the network interface address courier will bind to"`
-	Port    int    `help:"the port courier will listen on"`
+	Domain          string `help:"the domain courier is exposed on"`
+	PublicAddress   string `help:"the network interface address our public web server will bind to"`
+	PublicPort      int    `help:"the port our public web server will listen on"`
+	InternalAddress string `help:"the network interface address our internal web server will bind to"`
+	InternalPort    int    `help:"the port our internal web server will listen on"`
 
 	AWSAccessKeyID     string `help:"access key ID to use for AWS services"`
 	AWSSecretAccessKey string `help:"secret access key to use for AWS services"`
@@ -46,11 +46,10 @@ type Config struct {
 	FacebookWebhookSecret        string `help:"the secret for Facebook webhook URL verification"`
 	WhatsappAdminSystemUserToken string `help:"the token of the admin system user for WhatsApp"`
 
-	DisallowedNetworks string     `help:"comma separated list of IP addresses and networks which we disallow fetching attachments from"`
+	DisallowedNetworks []string   `help:"list of IP addresses and networks (CIDR notation) which we disallow making outgoing HTTP requests to"`
+	SendProxyURL       string     `validate:"omitempty,http_url" help:"optional URL of a forward HTTP proxy for handlers that send to user-configured URLs"`
 	MediaDomain        string     `help:"the domain on which we'll try to resolve outgoing media URLs"`
 	MaxWorkers         int        `help:"the maximum number of go routines that will be used for sending (set to 0 to disable sending)"`
-	StatusUsername     string     `help:"the username that is needed to authenticate against the /status endpoint"`
-	StatusPassword     string     `help:"the password that is needed to authenticate against the /status endpoint"`
 	AuthToken          string     `help:"the authentication token need to access non-channel endpoints"`
 	LogLevel           slog.Level `help:"the logging level courier should use"`
 	Version            string     `help:"the version that will be used in request and response headers"`
@@ -77,16 +76,18 @@ func NewDefaultConfig() *Config {
 		Valkey:   "valkey://valkey:6379/15",
 		SpoolDir: "/var/spool/courier",
 
-		Domain:  "localhost",
-		Address: "",
-		Port:    8080,
+		Domain:          "localhost",
+		PublicAddress:   "",
+		PublicPort:      8080,
+		InternalAddress: "localhost",
+		InternalPort:    8081,
 
 		AWSAccessKeyID:     "",
 		AWSSecretAccessKey: "",
 		AWSRegion:          "us-east-1",
 
 		MetricsReporting:    "off",
-		CloudwatchNamespace: "Temba/Courier",
+		CloudwatchNamespace: "Courier",
 		DeploymentID:        "dev",
 		InstanceID:          hostname,
 
@@ -101,7 +102,7 @@ func NewDefaultConfig() *Config {
 		FacebookWebhookSecret:        "missing_facebook_webhook_secret",
 		WhatsappAdminSystemUserToken: "missing_whatsapp_admin_system_user_token",
 
-		DisallowedNetworks: `127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fe80::/10`,
+		DisallowedNetworks: []string{`127.0.0.0/8`, `::1`, `fe80::/10`, `fc00::/7`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `169.254.0.0/16`, `0.0.0.0/8`},
 		MaxWorkers:         32,
 		LogLevel:           slog.LevelWarn,
 		Version:            "Dev",
@@ -147,15 +148,22 @@ func (c *Config) Validate() error {
 	if _, _, err := c.ParseDisallowedNetworks(); err != nil {
 		return fmt.Errorf("unable to parse 'DisallowedNetworks': %w", err)
 	}
+
+	if _, err := c.ParseSendProxyURL(); err != nil {
+		return fmt.Errorf("unable to parse 'SendProxyURL': %w", err)
+	}
 	return nil
 }
 
 // ParseDisallowedNetworks parses the list of IPs and IP networks (written in CIDR notation)
 func (c *Config) ParseDisallowedNetworks() ([]net.IP, []*net.IPNet, error) {
-	addrs, err := csv.NewReader(strings.NewReader(c.DisallowedNetworks)).Read()
-	if err != nil && err != io.EOF {
-		return nil, nil, err
-	}
+	return httpx.ParseNetworks(c.DisallowedNetworks...)
+}
 
-	return httpx.ParseNetworks(addrs...)
+// ParseSendProxyURL parses SendProxyURL. Returns (nil, nil) when SendProxyURL is empty.
+func (c *Config) ParseSendProxyURL() (*url.URL, error) {
+	if c.SendProxyURL == "" {
+		return nil, nil
+	}
+	return url.Parse(c.SendProxyURL)
 }
