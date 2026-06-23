@@ -13,6 +13,7 @@ import (
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/gsm7"
 	"github.com/nyaruka/gocommon/urns"
+	"golang.org/x/text/encoding/unicode"
 )
 
 const (
@@ -167,10 +168,17 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		}
 	}
 
-	// if we are UTF8, set our coding appropriately
+	// if we are unicode, encode the body to UTF-16BE (UCS-2) ourselves and don't send a charset param - that way
+	// kannel skips its server-side recode entirely (which fails with "Charset or body misformed, rejected" on
+	// builds compiled without iconv) and passes our already-encoded body straight through as coding=2 / UCS-2
 	if encoding == encodingUnicode {
+		encoder := unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewEncoder()
+		utf16beText, err := encoder.String(handlers.GetTextAndAttachments(msg))
+		if err != nil {
+			return err
+		}
 		form["coding"] = []string{"2"}
-		form["charset"] = []string{"utf8"}
+		form["text"] = []string{utf16beText}
 	}
 
 	// our send URL may have form parameters in it already, append our own afterwards
