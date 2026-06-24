@@ -22,8 +22,8 @@ import (
 	"github.com/nyaruka/courier/v26"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/utils"
 
-	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
@@ -91,7 +91,7 @@ type WuzapiMessage struct {
 		} `json:"singleSelectReply"`
 	} `json:"listResponseMessage"`
 	ButtonsResponseMessage *struct {
-		SelectedButtonID  string `json:"selectedButtonID"`
+		SelectedButtonID    string `json:"selectedButtonID"`
 		SelectedDisplayText string `json:"selectedDisplayText"`
 	} `json:"buttonsResponseMessage"`
 	TemplateButtonReplyMessage *struct {
@@ -109,7 +109,7 @@ type WuzapiMessage struct {
 }
 
 type WuzapiMediaMessage struct {
-	Caption       string `json:"caption"`        // Image/Video/Doc
+	Caption       string `json:"caption"` // Image/Video/Doc
 	Mimetype      string `json:"mimetype"`
 	URL           string `json:"url"`
 	DirectPath    string `json:"directPath"`
@@ -604,7 +604,7 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *couri
 	if len(attachments) > 0 {
 		var attType string
 		attType, attURL = handlers.SplitAttachment(attachments[0])
-		
+
 		// Sanitize URL
 		if strings.HasPrefix(attURL, "https:///rp/") {
 			attURL = strings.Replace(attURL, "https:///rp/", "http://localhost/rp/", 1)
@@ -691,12 +691,12 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *couri
 				"Body":    msg.Text(),
 				"Buttons": btns,
 			}
-			
+
 			// If media, try to inject it as header image
 			if attURL != "" {
 				payload["Image"] = attURL
 			}
-			
+
 			jsonBody, _ = json.Marshal(payload)
 		}
 	} else {
@@ -759,16 +759,25 @@ func (h *WuzapiHandler) doRequest(url string, token string, body []byte, res *co
 	return nil
 }
 
-// requestHTTPUnsafe bypasses the HTTPAccess configuration to allow requests to private IPs (localhost)
+// requestHTTPUnsafe bypasses the runtime's SSRF access-control client so the handler can reach the
+// WuzAPI service on localhost (which the default DisallowedNetworks blocklist rejects). It uses a
+// plain client with no access control; utils.TraceHTTP still records the trace for channel logging.
 func (h *WuzapiHandler) requestHTTPUnsafe(req *http.Request, clog *courier.ChannelLog) (*http.Response, []byte, error) {
-	client := h.Runtime().HTTP
-
 	req.Header.Set("User-Agent", fmt.Sprintf("Courier/%s", h.Runtime().Config.Version))
 
-	trace, err := httpx.DoTrace(client, req, nil, nil, 0)
+	client := &http.Client{
+		Transport: http.DefaultTransport.(*http.Transport).Clone(),
+		Timeout:   30 * time.Second,
+	}
+
+	trace, resp, err := utils.TraceHTTP(client, req, 0)
+	var body []byte
 	if trace != nil {
 		clog.HTTP(trace)
-		return trace.Response, trace.ResponseBody, err
+		body = trace.ResponseBody
 	}
-	return nil, nil, err
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp, body, nil
 }

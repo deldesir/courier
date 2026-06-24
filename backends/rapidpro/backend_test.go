@@ -17,6 +17,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/courier/v26/testsuite"
+	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/gocommon/aws/dynamo"
 	"github.com/nyaruka/gocommon/aws/dynamo/dyntest"
@@ -838,16 +839,15 @@ func (ts *BackendTestSuite) TestWriteChanneLog() {
 		return dynamo.GetItem(ctx, ts.b.rt.Dynamo, ts.b.rt.Writers.Main.Table(), (&ChannelLog{clog}).DynamoKey())
 	}
 
-	httpx.SetRequestor(httpx.NewMockRequestor(map[string][]*httpx.MockResponse{
+	httpClient := &http.Client{Transport: httpx.WithMocks(nil, map[string][]*httpx.MockResponse{
 		"https://api.messages.com/send.json": {
 			httpx.NewMockResponse(200, nil, []byte(`{"status":"success"}`)),
 		},
-	}))
-	defer httpx.SetRequestor(httpx.DefaultRequestor)
+	})}
 
 	// make a request that will have a response
 	req, _ := http.NewRequest("POST", "https://api.messages.com/send.json", nil)
-	trace, err := httpx.DoTrace(http.DefaultClient, req, nil, nil, 0)
+	trace, _, err := utils.TraceHTTP(httpClient, req, 0)
 	ts.NoError(err)
 
 	clog1 := courier.NewChannelLog(courier.ChannelLogTypeTokenRefresh, channel, nil)

@@ -1,3 +1,46 @@
+v26.2.1 (2026-06-16)
+-------------------------
+ * Retry WhatsApp Cloud media upload errors (131053) instead of failing them
+
+v26.2.0 (2026-06-15)
+-------------------------
+ * Update dependencies
+ * Handle throttling and bare-message errors consistently across WhatsApp Cloud send paths
+
+v26.1.48 (2026-06-04)
+-------------------------
+ * Update to gocommon v1.83.0
+
+v26.1.47 (2026-06-04)
+-------------------------
+ * Update to gocommon v1.82.0 (phonenumbers v2)
+
+v26.1.46 (2026-06-03)
+-------------------------
+ * Update gocommon to v1.81.1 and adopt httpx transport middleware
+
+v26.1.45 (2026-06-02)
+-------------------------
+ * Merge pull request #1030 from nyaruka/fix-kannel-omit-charset
+ * Don't send charset param for kannel unicode - body is already UTF-16BE
+ * Revert "Don't send charset param for kannel unicode - body is already UTF-16BE"
+ * Don't send charset param for kannel unicode - body is already UTF-16BE
+
+v26.1.44 (2026-06-02)
+-------------------------
+ * Merge pull request #1029 from nyaruka/fix-kannel-unicode-charset
+ * Send kannel unicode messages as UTF-16BE to avoid charset recode errors
+
+v26.1.43 (2026-06-02)
+-------------------------
+ * Merge pull request #1028 from nyaruka/fix-charset-KN
+ * Fix kannel charset parameter
+ * Only run code review when PR is opened
+
+v26.1.42 (2026-06-01)
+-------------------------
+ * Update phonenumbers to v1.8.0
+
 v26.1.41 (2026-05-26)
 -------------------------
  * Update default cloudwatch namespace to Courier
