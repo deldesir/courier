@@ -1,3 +1,43 @@
+v26.3.7 (2026-07-09)
+-------------------------
+ * Update to latest gocommon
+
+v26.3.6 (2026-07-08)
+-------------------------
+ * Update to gocommon 1.89.3 and use region from s3x.Service
+
+v26.3.5 (2026-07-07)
+-------------------------
+ * Update to gocommon v1.88.0 and rework Postgres spools on generic spool package
+ * Exit hard if graceful shutdown exceeds 90 seconds
+
+v26.3.4 (2026-07-06)
+-------------------------
+ * Remove InstanceID config setting
+ * Publish instance level metrics without a Host dimension
+ * Remove app node registry
+
+v26.3.3 (2026-07-06)
+-------------------------
+ * Rename PublicAddress/PublicPort config to InternetAddress/InternetPort
+ * Change default internal address to bind all interfaces
+ * Update to gocommon v1.86.2
+ * Fail startup if spool directories aren't writable
+ * Add Centrifugo client to runtime
+
+v26.3.2 (2026-07-02)
+-------------------------
+ * Support sending WhatsApp messages by BSUID URN
+
+v26.3.1 (2026-07-01)
+-------------------------
+ * Update dependencies
+
+v26.3.0 (2026-07-01)
+-------------------------
+ * Resolve AWS credentials and region from the standard SDK default chain
+ * Bump CLA Assistant action to v2.6.1 to fix Node 24 incompatibility
+
 v26.2.1 (2026-06-16)
 -------------------------
  * Retry WhatsApp Cloud media upload errors (131053) instead of failing them

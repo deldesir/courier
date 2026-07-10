@@ -15,6 +15,13 @@ import (
 	slogsentry "github.com/samber/slog-sentry/v2"
 )
 
+// shutdownTimeout is how long we allow for a graceful shutdown before exiting hard. The shutdown phases are
+// individually bounded (in-flight requests and the final status flush at 30s, in-flight sends at 35s) but run
+// partly in sequence, so a legitimate slow shutdown can approach ~60s. Past this budget something is genuinely
+// wedged, and it's better to exit with a record of why than be killed by the orchestrator. Orchestrator stop
+// timeouts should be set a bit above this so the watchdog fires first.
+const shutdownTimeout = 90 * time.Second
+
 // Service starts the courier service, blocks until a termination signal is received, then stops it.
 func Service(version, date string) error {
 	cfg := runtime.LoadConfig()
@@ -26,7 +33,7 @@ func Service(version, date string) error {
 
 	// if we have a DSN entry, try to initialize it
 	if cfg.SentryDSN != "" {
-		err := sentry.Init(sentry.ClientOptions{Dsn: cfg.SentryDSN, ServerName: cfg.InstanceID, Release: version, AttachStacktrace: true})
+		err := sentry.Init(sentry.ClientOptions{Dsn: cfg.SentryDSN, Release: version, AttachStacktrace: true})
 		if err != nil {
 			return err
 		}
@@ -59,6 +66,13 @@ func Service(version, date string) error {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	log.Info("stopping", "signal", <-ch)
+
+	watchdog := time.AfterFunc(shutdownTimeout, func() {
+		log.Error("shutdown timed out, exiting", "timeout", shutdownTimeout)
+		sentry.Flush(2 * time.Second)
+		os.Exit(1)
+	})
+	defer watchdog.Stop()
 
 	return server.Stop()
 }

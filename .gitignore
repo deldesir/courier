@@ -1,11 +1,20 @@
+# General
+*~
 .DS_Store
 .envrc
+.vscode/
 .devcontainer
+deploy
+fabfile.py
+
+# AI
 .claude/
 CLAUDE.md
+CODEX.md
+AGENTS.md
+
+# Go
 coverage.text
-deploy
-fabfile.*
 
 # Build outputs — binaries belong in GitHub Releases, not in git
 /courier

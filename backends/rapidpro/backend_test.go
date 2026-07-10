@@ -3,6 +3,7 @@ package rapidpro
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/gocommon/aws/dynamo"
 	"github.com/nyaruka/gocommon/aws/dynamo/dyntest"
+	"github.com/nyaruka/gocommon/centrifugo"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/dbutil/assertdb"
 	"github.com/nyaruka/gocommon/httpx"
@@ -556,6 +558,47 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 
 }
 
+func (ts *BackendTestSuite) TestMsgStatusSocketPublish() {
+	ctx := context.Background()
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := courier.NewChannelLog(courier.ChannelLogTypeMsgStatus, channel, nil)
+
+	ts.b.rt.Centrifugo.Client.(*centrifugo.MockClient).Clear()
+
+	vc := ts.b.rt.VK.Get()
+	defer vc.Close()
+
+	socket := "history:a984069d-0008-4d8c-a772-b14a8a6acccc"
+
+	// put test message back into queued state
+	ts.b.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q', sent_on = NULL WHERE id = $1`, 10001)
+
+	// write a status update before the contact's socket is subscribed... nothing is published
+	status := ts.b.NewStatusUpdate(channel, "0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusSent, clog)
+	ts.NoError(ts.b.WriteStatusUpdate(ctx, status))
+	ts.b.statusWriter.Flush()
+
+	ts.Empty(testsuite.CentrifugoHistory(ts.T(), ts.b.rt, socket))
+
+	// mark the socket subscribed (as the authorizing service would) and write another status update
+	_, err := vc.Do("SET", centrifugo.SubscriptionKey(socket), "1")
+	ts.NoError(err)
+	defer vc.Do("DEL", centrifugo.SubscriptionKey(socket))
+
+	status = ts.b.NewStatusUpdate(channel, "0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusDelivered, clog)
+	ts.NoError(ts.b.WriteStatusUpdate(ctx, status))
+	ts.b.statusWriter.Flush()
+
+	sent := testsuite.CentrifugoHistory(ts.T(), ts.b.rt, socket)
+	if ts.Len(sent, 1) {
+		var decoded map[string]any
+		ts.NoError(json.Unmarshal(sent[0], &decoded))
+		ts.Equal("msg_status_changed", decoded["type"])
+		ts.Equal("0199df10-10dc-7e6e-834b-3d959ece93b2", decoded["msg_uuid"])
+		ts.Equal("delivered", decoded["status"])
+	}
+}
+
 func (ts *BackendTestSuite) TestSentExternalIDCaching() {
 	rc := ts.b.rt.VK.Get()
 	defer rc.Close()
@@ -1042,7 +1085,7 @@ func (ts *BackendTestSuite) TestWriteMsgWithAttachments() {
 	// should have actually fetched and saved it to storage, with the correct content type
 	err = ts.b.WriteMsg(ctx, msg2, clog)
 	ts.NoError(err)
-	ts.Equal([]string{"image/jpeg:http://localstack:4566/test-attachments/attachments/1/37c5/fddb/37c5fddb-8512-4a80-8c21-38b6e22ef940.jpg"}, msg2.Attachments())
+	ts.Equal([]string{"image/jpeg:http://localstack:4566/test-attachments/attachments/1/9b95/5e36/9b955e36-ac16-4c6b-8ab6-9b9af5cd042a.jpg"}, msg2.Attachments())
 
 	// try an invalid embedded attachment
 	msg3 := ts.b.NewIncomingMsg(ctx, knChannel, urn, "invalid embedded attachment data", "", clog).(*MsgIn)
@@ -1331,6 +1374,20 @@ func (ts *BackendTestSuite) TestResolveMedia() {
 
 	// check we've cached 3 media lookups
 	assertvk.HLen(ts.T(), rc, fmt.Sprintf("{media-lookups}:%s", time.Now().In(time.UTC).Format("2006-01-02")), 3)
+
+	// without an S3 region (e.g. local dev using path-style URLs), stripping is a no-op: unqualified URLs
+	// still resolve and region-qualified URLs no longer match our media domain
+	origRegion := ts.b.rt.S3.Region
+	ts.b.rt.S3.Region = ""
+	defer func() { ts.b.rt.S3.Region = origRegion }()
+
+	media, err := ts.b.ResolveMedia(ctx, "http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg")
+	ts.NoError(err)
+	ts.NotNil(media)
+
+	media, err = ts.b.ResolveMedia(ctx, "http://nyaruka.us-east-1.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg")
+	ts.NoError(err)
+	ts.Nil(media)
 }
 
 func (ts *BackendTestSuite) assertNoQueuedContactTask(contactID models.ContactID) {
@@ -1360,6 +1417,62 @@ func (ts *BackendTestSuite) assertQueuedContactTask(contactID models.ContactID, 
 
 	ts.Equal(expectedType, body["type"])
 	ts.Equal(expectedBody, body["task"])
+}
+
+func (ts *BackendTestSuite) TestSpools() {
+	ctx := context.Background()
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := courier.NewChannelLog(courier.ChannelLogTypeUnknown, channel, nil)
+	urn := urns.URN("tel:+12065552222")
+
+	// drain anything left over from previous runs so we can assert absolute sizes, and delete whatever those
+	// leftovers wrote so our row count assertions start from zero
+	ts.NoError(ts.b.msgSpool.Flush())
+	ts.NoError(ts.b.statusSpool.Flush())
+	ts.NoError(ts.b.eventSpool.Flush())
+	ts.b.rt.DB.MustExec(`DELETE FROM msgs_msg WHERE text = 'spool-flush-test'`)
+	ts.b.rt.DB.MustExec(`DELETE FROM channels_channelevent WHERE extra::jsonb->>'ref_id' = 'spool-flush'`)
+
+	// spool an incoming msg as if the database had been down when it was received
+	msg := ts.b.NewIncomingMsg(ctx, channel, urn, "spool-flush-test", "spool-ext1", clog).(*MsgIn)
+	ts.NoError(ts.b.msgSpool.Add([]*MsgIn{msg}))
+	ts.Equal(1, ts.b.msgSpool.Size())
+
+	// flushing should write it to the database and queue it for handling
+	ts.NoError(ts.b.msgSpool.Flush())
+	ts.Equal(0, ts.b.msgSpool.Size())
+	assertdb.Query(ts.T(), ts.b.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'spool-flush-test'`).Returns(1)
+
+	// flushing a replayed copy of the same msg is deduped by its unique violation rather than failed
+	ts.NoError(ts.b.msgSpool.Add([]*MsgIn{msg}))
+	ts.NoError(ts.b.msgSpool.Flush())
+	ts.Equal(0, ts.b.msgSpool.Size())
+	assertdb.Query(ts.T(), ts.b.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'spool-flush-test'`).Returns(1)
+
+	// spool a status update for an existing message
+	ts.b.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q' WHERE id = $1`, 10001)
+	status := ts.b.NewStatusUpdate(channel, "0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusSent, clog).(*models.StatusUpdate)
+	ts.NoError(ts.b.statusSpool.Add([]*models.StatusUpdate{status}))
+	ts.Equal(1, ts.b.statusSpool.Size())
+
+	ts.NoError(ts.b.statusSpool.Flush())
+	ts.Equal(0, ts.b.statusSpool.Size())
+	assertdb.Query(ts.T(), ts.b.rt.DB, `SELECT status FROM msgs_msg WHERE id = 10001`).Returns("S")
+
+	// a status that can't be resolved to a message flushes without error (logged and dropped)
+	unresolved := ts.b.NewStatusUpdateByExternalID(channel, "no-such-ext-id", models.MsgStatusDelivered, clog).(*models.StatusUpdate)
+	ts.NoError(ts.b.statusSpool.Add([]*models.StatusUpdate{unresolved}))
+	ts.NoError(ts.b.statusSpool.Flush())
+	ts.Equal(0, ts.b.statusSpool.Size())
+
+	// spool a channel event
+	event := ts.b.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithExtra(map[string]string{"ref_id": "spool-flush"}).(*ChannelEvent)
+	ts.NoError(ts.b.eventSpool.Add([]*ChannelEvent{event}))
+	ts.Equal(1, ts.b.eventSpool.Size())
+
+	ts.NoError(ts.b.eventSpool.Flush())
+	ts.Equal(0, ts.b.eventSpool.Size())
+	assertdb.Query(ts.T(), ts.b.rt.DB, `SELECT count(*) FROM channels_channelevent WHERE extra::jsonb->>'ref_id' = 'spool-flush'`).Returns(1)
 }
 
 func TestMsgSuite(t *testing.T) {

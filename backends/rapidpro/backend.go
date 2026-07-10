@@ -30,6 +30,7 @@ import (
 	"github.com/nyaruka/gocommon/cache"
 	"github.com/nyaruka/gocommon/dbutil"
 	"github.com/nyaruka/gocommon/jsonx"
+	"github.com/nyaruka/gocommon/spools"
 	"github.com/nyaruka/gocommon/syncx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
@@ -37,8 +38,6 @@ import (
 )
 
 const (
-	appNodesRunningKey = "app-nodes:running"
-
 	// the name for our message queue
 	msgQueueName = "msgs"
 
@@ -55,6 +54,11 @@ type backend struct {
 
 	statusWriter *StatusWriter
 	writerWG     *sync.WaitGroup
+
+	// spools of items which couldn't be written to the database and will be retried later
+	msgSpool    *spools.Spool[*MsgIn]
+	statusSpool *spools.Spool[*models.StatusUpdate]
+	eventSpool  *spools.Spool[*ChannelEvent]
 
 	channelsByUUID *cache.Local[models.ChannelUUID, *models.Channel]
 	channelsByAddr *cache.Local[models.ChannelAddress, *models.Channel]
@@ -151,6 +155,13 @@ func (b *backend) Start() error {
 		log.Info("s3 disabled — using local filesystem (nanoRP mode)")
 	}
 
+	// test that the Centrifugo server is reachable and accepts our key
+	if err := b.rt.Centrifugo.Client.Info(ctx); err != nil {
+		log.Error("centrifugo not reachable", "error", err)
+	} else {
+		log.Info("centrifugo ok")
+	}
+
 	if err := b.rt.Start(); err != nil {
 		return fmt.Errorf("error starting runtime: %w", err)
 	} else {
@@ -174,22 +185,24 @@ func (b *backend) Start() error {
 	}, time.Minute)
 	b.channelsByAddr.Start()
 
-	// make sure our spool dirs are writable
-	err = courier.EnsureSpoolDirPresent(b.rt.Config.SpoolDir, "msgs")
-	if err == nil {
-		err = courier.EnsureSpoolDirPresent(b.rt.Config.SpoolDir, "statuses")
+	// create our spools and start their background flushing - their Start fails if a spool directory isn't
+	// writable so a misconfigured spool volume can't silently drop items during database outages
+	b.msgSpool = spools.New(path.Join(b.rt.Config.SpoolDir, "msgs"), 30*time.Second, spools.MarshalJSON, spools.UnmarshalJSON, b.flushMsgs)
+	b.statusSpool = spools.New(path.Join(b.rt.Config.SpoolDir, "statuses"), 30*time.Second, spools.MarshalJSON, spools.UnmarshalJSON, b.flushStatuses)
+	b.eventSpool = spools.New(path.Join(b.rt.Config.SpoolDir, "events"), 30*time.Second, spools.MarshalJSON, spools.UnmarshalJSON, b.flushEvents)
+	if err := b.msgSpool.Start(); err != nil {
+		return err
 	}
-	if err == nil {
-		err = courier.EnsureSpoolDirPresent(b.rt.Config.SpoolDir, "events")
+	if err := b.statusSpool.Start(); err != nil {
+		return err
 	}
-	if err != nil {
-		log.Error("spool directories not writable", "error", err)
-	} else {
-		log.Info("spool directories ok")
+	if err := b.eventSpool.Start(); err != nil {
+		return err
 	}
+	log.Info("spools ok")
 
 	// create our batched writers and start them
-	b.statusWriter = NewStatusWriter(b, b.rt.Config.SpoolDir)
+	b.statusWriter = NewStatusWriter(b)
 	b.statusWriter.Start(b.writerWG)
 
 	// store the system user id
@@ -198,49 +211,9 @@ func (b *backend) Start() error {
 		return err
 	}
 
-	// register and start our spool flushers
-	courier.RegisterFlusher(path.Join(b.rt.Config.SpoolDir, "msgs"), b.flushMsgFile)
-	courier.RegisterFlusher(path.Join(b.rt.Config.SpoolDir, "statuses"), b.flushStatusFile)
-	courier.RegisterFlusher(path.Join(b.rt.Config.SpoolDir, "events"), b.flushChannelEventFile)
-
 	b.startMetricsReporter(time.Minute)
 
-	if err := b.checkLastShutdown(ctx); err != nil {
-		return err
-	}
-
 	log.Info("backend started")
-	return nil
-}
-
-func (b *backend) checkLastShutdown(ctx context.Context) error {
-	nodeID := fmt.Sprintf("courier:%s", b.rt.Config.InstanceID)
-	vc := b.rt.VK.Get()
-	defer vc.Close()
-
-	exists, err := redis.Bool(redis.DoContext(vc, ctx, "HEXISTS", appNodesRunningKey, nodeID))
-	if err != nil {
-		return fmt.Errorf("error checking last shutdown: %w", err)
-	}
-
-	if exists {
-		slog.Error("node did not shutdown cleanly last time")
-	} else {
-		if _, err := redis.DoContext(vc, ctx, "HSET", appNodesRunningKey, nodeID, time.Now().UTC().Format(time.RFC3339)); err != nil {
-			return fmt.Errorf("error setting app node state: %w", err)
-		}
-	}
-	return nil
-}
-
-func (b *backend) recordShutdown(ctx context.Context) error {
-	nodeID := fmt.Sprintf("courier:%s", b.rt.Config.InstanceID)
-	vc := b.rt.VK.Get()
-	defer vc.Close()
-
-	if _, err := redis.DoContext(vc, ctx, "HDEL", appNodesRunningKey, nodeID); err != nil {
-		return fmt.Errorf("error recording shutdown: %w", err)
-	}
 	return nil
 }
 
@@ -298,11 +271,12 @@ func (b *backend) Stop() error {
 	// wait for them to flush fully
 	b.writerWG.Wait()
 
-	b.rt.Stop()
+	// stop our spools' background flushing (after the status writer since its failures are spooled)
+	b.msgSpool.Stop()
+	b.statusSpool.Stop()
+	b.eventSpool.Stop()
 
-	if err := b.recordShutdown(context.TODO()); err != nil {
-		return fmt.Errorf("error recording shutdown: %w", err)
-	}
+	b.rt.Stop()
 
 	log.Info("backend stopped")
 	return nil
@@ -652,7 +626,7 @@ func (b *backend) ResolveMedia(ctx context.Context, mediaUrl string) (*models.Me
 	mediaUUID := uuidRegex.FindString(u.Path)
 
 	// if hostname isn't our media domain, or path doesn't contain a UUID, don't try to resolve
-	if strings.Replace(u.Hostname(), fmt.Sprintf("%s.", b.rt.Config.AWSRegion), "", -1) != b.rt.Config.MediaDomain || mediaUUID == "" {
+	if b.stripS3Region(u.Hostname()) != b.rt.Config.MediaDomain || mediaUUID == "" {
 		return nil, nil
 	}
 
@@ -681,11 +655,23 @@ func (b *backend) ResolveMedia(ctx context.Context, mediaUrl string) (*models.Me
 	}
 
 	// if we found a media record but it doesn't match the URL, don't use it
-	if media == nil || (media.URL() != mediaUrl && media.URL() != strings.Replace(mediaUrl, fmt.Sprintf("%s.", b.rt.Config.AWSRegion), "", -1)) {
+	if media == nil || (media.URL() != mediaUrl && media.URL() != b.stripS3Region(mediaUrl)) {
 		return nil, nil
 	}
 
 	return media, nil
+}
+
+// strips the region qualifier that S3 adds to virtual-host style URLs so they can be compared against our
+// unqualified media domain and URLs, e.g. foo.s3.us-east-1.amazonaws.com becomes foo.s3.amazonaws.com. No-op
+// when there's no region (e.g. local dev setups using path-style URLs).
+func (b *backend) stripS3Region(s string) string {
+	// nanoRP mode: no S3 service at all — nothing to strip. ResolveMedia runs
+	// on every inbound attachment, so this must not deref a nil client.
+	if b.rt.S3 == nil || b.rt.S3.Region == "" {
+		return s
+	}
+	return strings.Replace(s, fmt.Sprintf("%s.", b.rt.S3.Region), "", -1)
 }
 
 func (b *backend) reportMetrics(ctx context.Context) (int, error) {
@@ -734,19 +720,24 @@ func (b *backend) reportMetrics(ctx context.Context) (int, error) {
 	b.dbWaitDuration = dbStats.WaitDuration
 	b.redisWaitDuration = redisStats.WaitDuration
 
-	hostDim := cwatch.Dimension("Host", b.rt.Config.InstanceID)
+	// instance level metrics are published without an instance dimension so that instances (which come and go with
+	// deploys) are just samples of the same metric, and can be aggregated with statistics like Max and Sum
 	metrics = append(metrics,
-		cwatch.Datum("DBConnectionsInUse", float64(dbStats.InUse), cwtypes.StandardUnitCount, hostDim),
-		cwatch.Datum("DBConnectionWaitDuration", float64(dbWaitDurationInPeriod)/float64(time.Second), cwtypes.StandardUnitSeconds, hostDim),
-		cwatch.Datum("ValkeyConnectionsInUse", float64(redisStats.ActiveCount), cwtypes.StandardUnitCount, hostDim),
-		cwatch.Datum("ValkeyConnectionsWaitDuration", float64(redisWaitDurationInPeriod)/float64(time.Second), cwtypes.StandardUnitSeconds, hostDim),
+		cwatch.Datum("DBConnectionsInUse", float64(dbStats.InUse), cwtypes.StandardUnitCount),
+		cwatch.Datum("DBConnectionWaitDuration", float64(dbWaitDurationInPeriod)/float64(time.Second), cwtypes.StandardUnitSeconds),
+		cwatch.Datum("ValkeyConnectionsInUse", float64(redisStats.ActiveCount), cwtypes.StandardUnitCount),
+		cwatch.Datum("ValkeyConnectionsWaitDuration", float64(redisWaitDurationInPeriod)/float64(time.Second), cwtypes.StandardUnitSeconds),
 		cwatch.Datum("QueuedMsgs", float64(bulkSize), cwtypes.StandardUnitCount, cwatch.Dimension("QueueName", "bulk")),
 		cwatch.Datum("QueuedMsgs", float64(prioritySize), cwtypes.StandardUnitCount, cwatch.Dimension("QueueName", "priority")),
+		cwatch.Datum("PostgresSpooledItems", float64(b.msgSpool.Size()), cwtypes.StandardUnitCount, cwatch.Dimension("SpoolName", "msgs")),
+		cwatch.Datum("PostgresSpooledItems", float64(b.statusSpool.Size()), cwtypes.StandardUnitCount, cwatch.Dimension("SpoolName", "statuses")),
+		cwatch.Datum("PostgresSpooledItems", float64(b.eventSpool.Size()), cwtypes.StandardUnitCount, cwatch.Dimension("SpoolName", "events")),
 	)
 
+	// Dynamo spool metric only when Dynamo is enabled (nanoRP mode: rt.Spool is nil)
 	if b.rt.Spool != nil {
 		metrics = append(metrics,
-			cwatch.Datum("DynamoSpooledItems", float64(b.rt.Spool.Size()), cwtypes.StandardUnitCount, hostDim),
+			cwatch.Datum("DynamoSpooledItems", float64(b.rt.Spool.Size()), cwtypes.StandardUnitCount),
 		)
 	}
 

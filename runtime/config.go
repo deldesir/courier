@@ -21,19 +21,14 @@ type Config struct {
 	SentryDSN string `help:"the DSN used for logging errors to Sentry"`
 
 	Domain          string `help:"the domain courier is exposed on"`
-	PublicAddress   string `help:"the network interface address our public web server will bind to"`
-	PublicPort      int    `help:"the port our public web server will listen on"`
-	InternalAddress string `help:"the network interface address our internal web server will bind to"`
+	InternetAddress string `help:"the address our internet facing web server will bind to, empty means all interfaces"`
+	InternetPort    int    `help:"the port our internet facing web server will listen on"`
+	InternalAddress string `help:"the address our internal web server will bind to, empty means all interfaces"`
 	InternalPort    int    `help:"the port our internal web server will listen on"`
-
-	AWSAccessKeyID     string `help:"access key ID to use for AWS services"`
-	AWSSecretAccessKey string `help:"secret access key to use for AWS services"`
-	AWSRegion          string `help:"region to use for AWS services, e.g. us-east-1"`
 
 	MetricsReporting    string `validate:"eq=off|eq=basic|eq=advanced"     help:"the level of metrics reporting"`
 	CloudwatchNamespace string `help:"the namespace to use for cloudwatch metrics"`
 	DeploymentID        string `help:"the deployment identifier to use for metrics"`
-	InstanceID          string `help:"the instance identifier to use for metrics"`
 
 	DynamoEndpoint    string `help:"DynamoDB service endpoint, e.g. https://dynamodb.us-east-1.amazonaws.com"`
 	DynamoTablePrefix string `help:"prefix to use for DynamoDB tables"`
@@ -41,6 +36,9 @@ type Config struct {
 	S3Endpoint          string `help:"S3 service endpoint, e.g. https://s3.amazonaws.com"`
 	S3AttachmentsBucket string `help:"S3 bucket to write attachments to"`
 	S3PathStyle         bool   `help:"S3 should use path style URLs"`
+
+	CentrifugoEndpoint string `validate:"url" help:"the endpoint of the Centrifugo server"`
+	CentrifugoKey      string `help:"the API key for the Centrifugo server"`
 
 	FacebookApplicationSecret    string `help:"the Facebook app secret"`
 	FacebookWebhookSecret        string `help:"the secret for Facebook webhook URL verification"`
@@ -63,8 +61,6 @@ type Config struct {
 
 // NewDefaultConfig returns a new default configuration object
 func NewDefaultConfig() *Config {
-	hostname, _ := os.Hostname()
-
 	// Detect Android/Termux environment
 	isAndroid := false
 	if _, err := os.Stat("/data/data/com.termux"); err == nil {
@@ -74,29 +70,26 @@ func NewDefaultConfig() *Config {
 	conf := &Config{
 		DB:       "postgres://temba:temba@postgres/temba?sslmode=disable",
 		Valkey:   "valkey://valkey:6379/15",
-		SpoolDir: "/var/spool/courier",
+		SpoolDir: "./_spool",
 
 		Domain:          "localhost",
-		PublicAddress:   "",
-		PublicPort:      8080,
-		InternalAddress: "localhost",
+		InternetAddress: "",
+		InternetPort:    8080,
+		InternalAddress: "",
 		InternalPort:    8081,
-
-		AWSAccessKeyID:     "",
-		AWSSecretAccessKey: "",
-		AWSRegion:          "us-east-1",
 
 		MetricsReporting:    "off",
 		CloudwatchNamespace: "Courier",
 		DeploymentID:        "dev",
-		InstanceID:          hostname,
 
 		DynamoEndpoint:    "", // let library generate it
 		DynamoTablePrefix: "",
 
 		S3Endpoint:          "https://s3.amazonaws.com",
-		S3AttachmentsBucket: "temba-attachments",
+		S3AttachmentsBucket: "", // nanoRP default: no S3; set to re-enable (upstream: temba-attachments)
 		S3PathStyle:         false,
+
+		CentrifugoEndpoint: "http://localhost:8000/api",
 
 		FacebookApplicationSecret:    "missing_facebook_app_secret",
 		FacebookWebhookSecret:        "missing_facebook_webhook_secret",

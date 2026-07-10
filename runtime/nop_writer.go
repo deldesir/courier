@@ -25,3 +25,6 @@ func (w *NopWriter) Stop() {}
 
 // Flush is a no-op.
 func (w *NopWriter) Flush() {}
+
+// Table returns an empty name — there is no backing DynamoDB table.
+func (w *NopWriter) Table() string { return "" }

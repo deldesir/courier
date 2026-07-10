@@ -12,6 +12,8 @@ type DynamoWriter interface {
 	Queue(i dynamo.ItemMarshaler) (int, error)
 	Start()
 	Stop()
+	Flush()
+	Table() string
 }
 
 type Writers struct {
