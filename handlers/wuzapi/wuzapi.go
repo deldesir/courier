@@ -25,6 +25,7 @@ import (
 	"github.com/nyaruka/courier/v26/utils"
 
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/core/events"
 )
 
 func init() {
@@ -359,6 +360,12 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *mode
 		return nil, nil
 	}
 
+	// best-effort read receipt: mark the message read in WhatsApp as soon as
+	// courier has accepted it (blue ticks while the reply is being produced)
+	if event.Info.ID != "" {
+		h.markRead(channel, phone, []string{event.Info.ID}, clog)
+	}
+
 	msg := models.NewIncomingMsg(channel, urn, text, event.Info.ID, clog).
 		WithContactName(event.Info.PushName)
 
@@ -615,6 +622,15 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg *models.MsgOut, res *chann
 		endpointType = "text"
 	}
 
+	// url quick replies can't be tappable buttons on this channel — append them
+	// to the body as labelled links instead of dropping them
+	body := msg.Text()
+	for _, qr := range handlers.FilterQuickRepliesByType(msg.QuickReplies(), "url") {
+		if qr.Extra != "" {
+			body += "\n\n" + qr.Text + ": " + qr.Extra
+		}
+	}
+
 	// Check for Quick Replies (Interactive Messages)
 	qrs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "text")
 	qrsAsList := false
@@ -650,7 +666,7 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg *models.MsgOut, res *chann
 
 			payload := map[string]interface{}{
 				"Phone":      phone,
-				"Desc":       msg.Text(),
+				"Desc":       body,
 				"ButtonText": "Select",
 				"Sections": []section{
 					{
@@ -679,7 +695,7 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg *models.MsgOut, res *chann
 
 			payload := map[string]interface{}{
 				"Phone":   phone,
-				"Body":    msg.Text(),
+				"Body":    body,
 				"Buttons": btns,
 			}
 
@@ -694,14 +710,14 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg *models.MsgOut, res *chann
 		if endpointType == "text" {
 			payload := map[string]string{
 				"Phone": phone,
-				"Body":  msg.Text(),
+				"Body":  body,
 			}
 			jsonBody, _ = json.Marshal(payload)
 		} else {
 			payload := map[string]string{
 				"Phone":   phone,
 				"Body":    attURL,
-				"Caption": msg.Text(),
+				"Caption": body,
 			}
 			jsonBody, _ = json.Marshal(payload)
 		}
@@ -771,4 +787,72 @@ func (h *WuzapiHandler) requestHTTPUnsafe(req *http.Request, clog *models.Channe
 		return nil, nil, err
 	}
 	return resp, body, nil
+}
+
+// WhatsApp shows a typing indicator for ~25 seconds; resend more often to sustain it
+var sendableEvents = map[string]time.Duration{
+	events.TypeTypingStarted: 20 * time.Second,
+	events.TypeTypingStopped: 0,
+}
+
+// SendableEvents declares support for typing indicators
+func (h *WuzapiHandler) SendableEvents(*models.Channel) map[string]time.Duration {
+	return sendableEvents
+}
+
+// SendEvent sends typing indicators as WuzAPI chat presence, marking the triggering
+// message read first when we know it (the WhatsApp convention: read, then typing)
+func (h *WuzapiHandler) SendEvent(ctx context.Context, ch *models.Channel, event events.Event, clog *models.ChannelLog) error {
+	var state, msgID string
+	var urn urns.URN
+	switch typed := event.(type) {
+	case *events.TypingStarted:
+		urn, state, msgID = typed.URN, "composing", typed.MsgExternalID
+	case *events.TypingStopped:
+		urn, state = typed.URN, "paused"
+	default:
+		return fmt.Errorf("unsupported event type: %s", event.Type())
+	}
+
+	phone := strings.TrimPrefix(urn.Path(), "+")
+	if msgID != "" {
+		h.markRead(ch, phone, []string{msgID}, clog)
+	}
+
+	payload, _ := json.Marshal(map[string]string{"Phone": phone, "State": state, "Media": ""})
+	return h.wuzapiPost(ch, "/chat/presence", payload, clog)
+}
+
+// markRead marks messages read in WhatsApp, best-effort — a failure only logs
+func (h *WuzapiHandler) markRead(ch *models.Channel, phone string, ids []string, clog *models.ChannelLog) {
+	payload, _ := json.Marshal(map[string]any{"Id": ids, "ChatPhone": phone, "SenderPhone": phone})
+	if err := h.wuzapiPost(ch, "/chat/markread", payload, clog); err != nil {
+		log.Printf("Wuzapi DEBUG: markread failed: %s", err)
+	}
+}
+
+// wuzapiPost sends an authenticated request to the channel's WuzAPI instance
+func (h *WuzapiHandler) wuzapiPost(ch *models.Channel, path string, body []byte, clog *models.ChannelLog) error {
+	wuzapiURL := ch.StringConfigForKey("wuzapi_url", "")
+	token := ch.StringConfigForKey("wuzapi_token", "")
+	if wuzapiURL == "" || token == "" {
+		return channels.ErrChannelConfig
+	}
+
+	req, err := http.NewRequest(http.MethodPost, wuzapiURL+path, bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", token)
+	req.Header.Set("token", token) // Compatibility with unpatched Wuzapi
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, respBody, err := h.requestHTTPUnsafe(req, clog)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("wuzapi error: %s", string(respBody))
+	}
+	return nil
 }
