@@ -1,3 +1,158 @@
+v26.3.35 (2026-08-12)
+-------------------------
+ * Parse derived config values once in Config.Parse rather than at each use site
+ * Switch to Business Source License 1.1
+ * Bring Turn handler to parity with other WhatsApp handlers
+ * Use captions of incoming Turn video messages as message text
+ * Group the outbound HTTP clients into a single runtime.HTTP
+ * Group the DynamoDB writers, spool and client into a single runtime.Dynamo
+ * Truncate WhatsApp quick reply texts that exceed their character limits
+ * Log WhatsApp quick replies that are dropped instead of discarding them silently
+ * Allow application attachments as WhatsApp interactive message headers
+ * Log and skip attachments that can't be sent as WhatsApp media messages
+ * Port Turn handler onto the shared WhatsApp payload builder
+ * Support attachment headers on WhatsApp CTA URL messages
+ * Move handler test helpers out of the handlers package
+ * Add utils.DoTraced so the trace-and-drain pattern lives in one place
+ * Use shared svclogs package and context-scoped HTTP tracing
+
+v26.3.34 (2026-08-12)
+-------------------------
+ * Resolve testsuite fixture paths relative to the package source
+
+v26.3.33 (2026-08-12)
+-------------------------
+ * Move the HTTP server into web, the sender into core/sender and the channel handler contract into core/channels
+ * Replace the Backend interface with models functions taking a runtime
+ * Include Twilio and MessageBird stop contact events in request logs and incoming metrics
+
+v26.3.32 (2026-08-11)
+-------------------------
+ * Stop using the same structs for incoming msg and channel event database rows and spool files
+ * Replace the Msg and ChannelEvent interfaces with their concrete types
+ * Replace the StatusUpdate and Contact interfaces with their concrete types
+
+v26.3.31 (2026-08-11)
+-------------------------
+ * Fix Play Mobile incoming prefix stripping never being applied for channels loaded from the database
+ * Replace the Channel interface with the concrete channel model type
+ * Fail Turn sends when media can't be uploaded instead of falling back to a link
+ * Support Turn WhatsApp media and interactive template components
+ * Treat HTTP 429 responses as throttling across all channel handlers
+ * Retry transient failures on the LINE batched send and WeChat token fetch
+ * Move ChannelLog into core/models so model code can own channel log writes
+
+v26.3.30 (2026-08-10)
+-------------------------
+ * Don't make Telegram keyboards single use when they contain form or location buttons
+ * Treat Turn HTTP 429 rate limits as throttled so messages retry
+ * Update GitHub actions to versions that run on Node.js 24
+
+v26.3.29 (2026-08-06)
+-------------------------
+ * Use inline keyboards for Telegram url quick replies, falling back to reply keyboards for the rest
+ * Clear any previous reply keyboard before sending an inline keyboard
+ * Drop url quick replies with invalid URLs instead of failing the send
+ * Add shared helper for filtering quick replies that require an extra value
+
+v26.3.28 (2026-08-05)
+-------------------------
+ * Handle WhatsApp message webhooks where the sender has no phone number
+ * Match incoming WhatsApp messages to existing contacts by BSUID when the phone number is new
+
+v26.3.27 (2026-08-05)
+-------------------------
+ * Remove creation of optin/optout channel events and sending of optin request messages
+
+v26.3.26 (2026-08-05)
+-------------------------
+ * Save incoming WhatsApp BSUIDs as secondary whatsapp URNs
+
+v26.3.25 (2026-08-04)
+-------------------------
+ * Support sending to WhatsApp BSUIDs held as whatsapp URNs
+
+v26.3.24 (2026-08-03)
+-------------------------
+ * Allow cmd entry points to take customized config defaults
+
+v26.3.23 (2026-07-30)
+-------------------------
+ * Keep captions and interactive message bodies within WhatsApp's 1024 char limit
+ * Increase max message length to 4096 for WhatsApp Cloud
+
+v26.3.22 (2026-07-30)
+-------------------------
+ * Ignore quick replies of types a channel doesn't support, logging a channel error for each one dropped
+ * Add support for sending url quick replies on Line, Viber and VK, and location quick replies on VK
+ * Add support for sending form quick replies as Telegram Mini App buttons
+
+v26.3.21 (2026-07-28)
+-------------------------
+ * Add support for sending url quick replies as WhatsApp CTA URL button messages
+
+v26.3.20 (2026-07-28)
+-------------------------
+ * Add support for sending form quick replies as WhatsApp flow messages
+ * Update FB graph API version to v25.0
+
+v26.3.19 (2026-07-27)
+-------------------------
+ * Update to vkutil v0.22.0 and gocommon v1.92.0 which now provides the fair queue as queues.FairV2
+
+v26.3.18 (2026-07-27)
+-------------------------
+ * Add support for WhatsApp flow (nfm) replies with structured payloads passed to mailroom
+
+v26.3.17 (2026-07-23)
+-------------------------
+ * Add typing event support to LINE, VK and WeChat channels
+ * Remove CHP channel handler
+ * Update to latest goflow and gocommon
+
+v26.3.16 (2026-07-22)
+-------------------------
+ * Add typing event support to 360Dialog and Twilio WhatsApp channels
+
+v26.3.15 (2026-07-22)
+-------------------------
+ * Add typing event support to Facebook and Instagram channels
+ * Update goflow to v0.284.0
+
+v26.3.14 (2026-07-21)
+-------------------------
+ * Log and ignore unknown Kannel delivery report statuses instead of marking messages as failed
+ * Update dependencies
+
+v26.3.13 (2026-07-20)
+-------------------------
+ * Update to gocommon v1.89.7
+
+v26.3.12 (2026-07-16)
+-------------------------
+ * Remove internal channel info endpoint since capability is exercised per event send instead of queried up front
+
+v26.3.11 (2026-07-16)
+-------------------------
+ * Rework chat action sending into event sending which uses goflow engine events as its vocabulary
+ * Drop support for mark_read as standalone action since WhatsApp typing indicators already mark messages as read
+
+v26.3.10 (2026-07-15)
+-------------------------
+ * Throttle sustained chat actions to their declared interval so callers don't need to know per-channel cadences
+ * Stop building darwin release binaries
+
+v26.3.9 (2026-07-14)
+-------------------------
+ * Add support for sending chat actions (typing indicators, read receipts) via new internal endpoint, implemented for Telegram and WhatsApp Cloud
+ * Add internal endpoint to get channel info such as supported chat actions
+ * Replace unmaintained patrickmn/go-cache with gocommon's cache.Local
+
+v26.3.8 (2026-07-14)
+-------------------------
+ * Update to latest goflow
+ * Use goflow's msg_status_changed event instead of hand-rolled struct
+
 v26.3.7 (2026-07-09)
 -------------------------
  * Update to latest gocommon

@@ -2,16 +2,13 @@ package main
 
 import (
 	"github.com/nyaruka/courier/v26/cmd"
-
-	// load available backends
-	_ "github.com/nyaruka/courier/v26/backends/rapidpro"
+	"github.com/nyaruka/courier/v26/runtime"
 
 	// load channel handler packages
 	_ "github.com/nyaruka/courier/v26/handlers/africastalking"
 	_ "github.com/nyaruka/courier/v26/handlers/arabiacell"
 	_ "github.com/nyaruka/courier/v26/handlers/bandwidth"
 	_ "github.com/nyaruka/courier/v26/handlers/burstsms"
-	_ "github.com/nyaruka/courier/v26/handlers/chip"
 	_ "github.com/nyaruka/courier/v26/handlers/clickatell"
 	_ "github.com/nyaruka/courier/v26/handlers/clickmobile"
 	_ "github.com/nyaruka/courier/v26/handlers/clicksend"
@@ -74,5 +71,5 @@ var (
 )
 
 func main() {
-	cmd.Run(cmd.Service(version, date))
+	cmd.Run(cmd.Service(runtime.NewDefaultConfig(), version, date))
 }

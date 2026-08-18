@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/urns"
@@ -60,21 +60,20 @@ var (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("VP"), "Viber")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
 	return nil
 }
 
@@ -117,7 +116,7 @@ type welcomeMessagePayload struct {
 }
 
 // receiveEvent is our HTTP handler function for incoming messages
-func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *eventPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *eventPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	err := h.validateSignature(channel, r)
 	if err != nil {
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
@@ -126,12 +125,12 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 	event := payload.Event
 	switch event {
 	case "webhook":
-		clog.Type = courier.ChannelLogTypeWebhookVerify
+		clog.Type = models.ChannelLogTypeWebhookVerify
 
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "webhook valid")
 
 	case "conversation_started":
-		clog.Type = courier.ChannelLogTypeEventReceive
+		clog.Type = models.ChannelLogTypeEventReceive
 
 		msgText := channel.StringConfigForKey(configViberWelcomeMessage, "")
 		if msgText == "" {
@@ -147,17 +146,17 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid viber id"))
 		}
 		// build the channel event
-		channelEvent := h.Backend().NewChannelEvent(channel, models.EventTypeWelcomeMessage, urn, clog).WithContactName(ContactName)
+		channelEvent := models.NewChannelEvent(channel, models.EventTypeWelcomeMessage, urn, clog).WithContactName(ContactName)
 
-		err = h.Backend().WriteChannelEvent(ctx, channelEvent, clog)
+		err = models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
 		if err != nil {
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
 		}
 
-		return []courier.Event{channelEvent}, writeWelcomeMessageResponse(w, channel, channelEvent)
+		return []channels.Event{channelEvent}, writeWelcomeMessageResponse(w, channel, channelEvent)
 
 	case "subscribed":
-		clog.Type = courier.ChannelLogTypeEventReceive
+		clog.Type = models.ChannelLogTypeEventReceive
 
 		viberID := payload.User.ID
 		ContactName := payload.User.Name
@@ -169,17 +168,17 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 		}
 
 		// build the channel event
-		channelEvent := h.Backend().NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(ContactName)
+		channelEvent := models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(ContactName)
 
-		err = h.Backend().WriteChannelEvent(ctx, channelEvent, clog)
+		err = models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
 		if err != nil {
 			return nil, err
 		}
 
-		return []courier.Event{channelEvent}, courier.WriteChannelEventSuccess(w, channelEvent)
+		return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
 
 	case "unsubscribed":
-		clog.Type = courier.ChannelLogTypeEventReceive
+		clog.Type = models.ChannelLogTypeEventReceive
 
 		viberID := payload.UserID
 
@@ -189,29 +188,29 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid viber id"))
 		}
 		// build the channel event
-		channelEvent := h.Backend().NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
+		channelEvent := models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
 
-		err = h.Backend().WriteChannelEvent(ctx, channelEvent, clog)
+		err = models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
 		if err != nil {
 			return nil, err
 		}
 
-		return []courier.Event{channelEvent}, courier.WriteChannelEventSuccess(w, channelEvent)
+		return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
 
 	case "failed":
-		clog.Type = courier.ChannelLogTypeMsgStatus
+		clog.Type = models.ChannelLogTypeMsgStatus
 
-		msgStatus := h.Backend().NewStatusUpdateByExternalID(channel, fmt.Sprintf("%d", payload.MessageToken), models.MsgStatusFailed, clog)
+		msgStatus := models.NewStatusUpdateByExternalID(channel, fmt.Sprintf("%d", payload.MessageToken), models.MsgStatusFailed, clog)
 		return handlers.WriteMsgStatusAndResponse(ctx, h, channel, msgStatus, w, r)
 
 	case "delivered":
-		clog.Type = courier.ChannelLogTypeMsgStatus
+		clog.Type = models.ChannelLogTypeMsgStatus
 
 		// we ignore delivered events for viber as they send these for incoming messages too and its not worth the db hit to verify that
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring delivered status")
 
 	case "message":
-		clog.Type = courier.ChannelLogTypeMsgReceive
+		clog.Type = models.ChannelLogTypeMsgReceive
 
 		sender := payload.Sender.ID
 		if sender == "" {
@@ -263,18 +262,18 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 		}
 
 		// build our msg
-		msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, fmt.Sprintf("%d", payload.MessageToken), clog).WithContactName(contactName)
+		msg := models.NewIncomingMsg(channel, urn, text, fmt.Sprintf("%d", payload.MessageToken), clog).WithContactName(contactName)
 		if mediaURL != "" {
 			msg.WithAttachment(mediaURL)
 		}
 		// and finally write our message
-		return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+		return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 	}
 
-	return nil, courier.WriteError(w, http.StatusBadRequest, fmt.Errorf("not handled, unknown event: %s", event))
+	return nil, channels.WriteError(w, http.StatusBadRequest, fmt.Errorf("not handled, unknown event: %s", event))
 }
 
-func writeWelcomeMessageResponse(w http.ResponseWriter, channel courier.Channel, event courier.Event) error {
+func writeWelcomeMessageResponse(w http.ResponseWriter, channel *models.Channel, event channels.Event) error {
 
 	authToken := channel.StringConfigForKey(models.ConfigAuthToken, "")
 	msgText := channel.StringConfigForKey(configViberWelcomeMessage, "")
@@ -297,7 +296,7 @@ func writeWelcomeMessageResponse(w http.ResponseWriter, channel courier.Channel,
 }
 
 // see https://developers.viber.com/docs/api/rest-bot-api/#callbacks
-func (h *handler) validateSignature(channel courier.Channel, r *http.Request) error {
+func (h *handler) validateSignature(channel *models.Channel, r *http.Request) error {
 	actual := r.Header.Get(viberSignatureHeader)
 	if actual == "" {
 		return fmt.Errorf("missing request signature")
@@ -349,14 +348,14 @@ type mtResponse struct {
 	StatusMessage string `json:"status_message"`
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	authToken := msg.Channel().StringConfigForKey(models.ConfigAuthToken, "")
 	if authToken == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	// figure out whether we have a keyboard to send as well
-	qrs := msg.QuickReplies()
+	qrs := handlers.FilterSupportedQuickReplies(msg.QuickReplies(), clog, models.QuickReplyTypeText, models.QuickReplyTypeLocation, models.QuickReplyTypeURL)
 	var keyboard *Keyboard
 
 	if len(qrs) > 0 {
@@ -400,7 +399,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 				msgText = ""
 
 			default:
-				clog.Error(courier.ErrorMediaUnsupported(mediaType))
+				clog.Error(models.ErrorMediaUnsupported(mediaType))
 			}
 
 		} else {
@@ -436,16 +435,14 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		req.Header.Set("Accept", "application/json")
 
 		resp, respBody, err := h.RequestHTTP(req, clog)
-		if err != nil || resp.StatusCode/100 == 5 {
-			return courier.ErrConnectionFailed
-		} else if resp.StatusCode/100 != 2 {
-			return courier.ErrResponseStatus
+		if err := handlers.ErrorFromResponse(resp, err); err != nil {
+			return err
 		}
 
 		respPayload := &mtResponse{}
 		err = json.Unmarshal(respBody, respPayload)
 		if err != nil {
-			return courier.ErrResponseUnparseable
+			return channels.ErrResponseUnparseable
 		}
 
 		if respPayload.Status != 0 {
@@ -453,7 +450,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 			if !found {
 				errorMessage = "General error"
 			}
-			return courier.ErrFailedWithReason(strconv.Itoa(respPayload.Status), errorMessage)
+			return channels.ErrFailedWithReason(strconv.Itoa(respPayload.Status), errorMessage)
 		}
 
 		keyboard = nil
@@ -461,7 +458,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	return nil
 }
 
-func (h *handler) getAttachmentSize(u string, clog *courier.ChannelLog) (int, error) {
+func (h *handler) getAttachmentSize(u string, clog *models.ChannelLog) (int, error) {
 	req, err := http.NewRequest(http.MethodHead, u, nil)
 	if err != nil {
 		return 0, err

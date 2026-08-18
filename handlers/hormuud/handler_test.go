@@ -6,8 +6,10 @@ import (
 	"testing"
 
 	"github.com/gomodule/redigo/redis"
-	"github.com/nyaruka/courier/v26"
-	. "github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/core/channels"
+	"github.com/nyaruka/courier/v26/core/models"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
@@ -23,7 +25,7 @@ var (
 	//statusValid         = "/c/hm/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status/?id=12345&status=4"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "HM", "2020", "US", []string{urns.Phone.Prefix}, nil),
 }
 
@@ -157,7 +159,26 @@ var sendTestCases = []OutgoingTestCase{
 			},
 			Body: `{"mobile":"250788383383","message":"Error Sending","senderid":"2020","mType":-1,"eType":-1,"UDH":""}`,
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Sending",
+		MsgURN:  "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://smsapi.hormuud.com/api/SendSMS": {
+				httpx.NewMockResponse(429, nil, []byte(`[{"Response": "101"}]`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{
+				"Content-Type":  "application/json",
+				"Accept":        "application/json",
+				"Authorization": "Bearer ghK_Wt4lshZhN",
+			},
+			Body: `{"mobile":"250788383383","message":"Error Sending","senderid":"2020","mType":-1,"eType":-1,"UDH":""}`,
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Connection Error",
@@ -176,7 +197,7 @@ var sendTestCases = []OutgoingTestCase{
 			},
 			Body: `{"mobile":"250788383383","message":"Error","senderid":"2020","mType":-1,"eType":-1,"UDH":""}`,
 		}},
-		ExpectedError: courier.ErrConnectionFailed,
+		ExpectedError: channels.ErrConnectionFailed,
 	},
 	{
 		Label:   "Null MessageID",
@@ -219,7 +240,7 @@ var tokenTestCases = []OutgoingTestCase{
 				},
 			},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 }
 
@@ -235,9 +256,12 @@ func TestOutgoing(t *testing.T) {
 	h := newHandler()
 	RunOutgoingTestCases(t, defaultChannel, h, sendTestCases, []string{"sesame"}, nil)
 
-	conn := h.(*handler).Backend().RedisPool().Get()
-	redis.String(conn.Do("DEL", fmt.Sprintf("hm_token_%s", defaultChannel.UUID())))
-	defer conn.Close()
+	// ensure the token cached by the previous cases is cleared so these cases fetch a new one
+	clearToken := func(t *testing.T, rt *runtime.Runtime) {
+		rc := rt.VK.Get()
+		defer rc.Close()
+		redis.String(rc.Do("DEL", fmt.Sprintf("hm_token_%s", defaultChannel.UUID())))
+	}
 
-	RunOutgoingTestCases(t, defaultChannel, h, tokenTestCases, []string{"sesame"}, nil)
+	RunOutgoingTestCases(t, defaultChannel, h, tokenTestCases, []string{"sesame"}, clearToken)
 }

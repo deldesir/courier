@@ -5,11 +5,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
-	"github.com/nyaruka/courier/v26"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/gocommon/svclogs"
 )
 
 var (
@@ -17,7 +18,7 @@ var (
 )
 
 // GetTextAndAttachments returns both the text of our message as well as any attachments, newline delimited
-func GetTextAndAttachments(m courier.MsgOut) string {
+func GetTextAndAttachments(m *models.MsgOut) string {
 	buf := bytes.NewBuffer([]byte(m.Text()))
 	for _, a := range m.Attachments() {
 		_, url := SplitAttachment(a)
@@ -40,18 +41,34 @@ func SplitAttachment(attachment string) (string, string) {
 func TextOnlyQuickReplies(qrs []models.QuickReply) []string {
 	t := make([]string, 0, len(qrs))
 	for _, qr := range qrs {
-		if qr.Type == "text" {
+		if qr.Type == models.QuickReplyTypeText {
 			t = append(t, qr.Text)
 		}
 	}
 	return t
 }
 
-// FilterQuickRepliesByType returns quick replies of some type only
-func FilterQuickRepliesByType(qrs []models.QuickReply, type_ string) []models.QuickReply {
+// FilterQuickRepliesByType returns quick replies of the given types only
+func FilterQuickRepliesByType(qrs []models.QuickReply, types ...string) []models.QuickReply {
 	t := make([]models.QuickReply, 0, len(qrs))
 	for _, qr := range qrs {
-		if qr.Type == type_ {
+		if slices.Contains(types, qr.Type) {
+			t = append(t, qr)
+		}
+	}
+	return t
+}
+
+// FilterSupportedQuickReplies returns quick replies of the given types only, logging a channel error for each one
+// dropped - either because the channel can't render its type, or because it's missing the extra value its type needs.
+func FilterSupportedQuickReplies(qrs []models.QuickReply, clog *models.ChannelLog, types ...string) []models.QuickReply {
+	t := make([]models.QuickReply, 0, len(qrs))
+	for _, qr := range qrs {
+		if !slices.Contains(types, qr.Type) {
+			clog.Error(&svclogs.Error{Message: fmt.Sprintf("quick reply of type %s isn't supported by this channel and can't be sent", qr.Type)})
+		} else if qr.RequiresExtra() && qr.Extra == "" {
+			clog.Error(&svclogs.Error{Message: fmt.Sprintf("quick reply of type %s is missing its extra value and can't be sent", qr.Type)})
+		} else {
 			t = append(t, qr)
 		}
 	}

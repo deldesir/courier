@@ -5,32 +5,38 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"fmt"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
-	"github.com/nyaruka/courier/v26/utils/clogs"
+	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
 	"github.com/stretchr/testify/assert"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "T", "2020", "US", []string{urns.Phone.Prefix}, map[string]any{"auth_token": "6789"}),
 }
 
-var tmsTestChannels = []courier.Channel{
+var tmsTestChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "TMS", "2020", "US", []string{urns.Phone.Prefix}, map[string]any{"auth_token": "6789"}),
 }
 
-var twTestChannels = []courier.Channel{
+var twTestChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "TW", "2020", "US", []string{urns.Phone.Prefix}, map[string]any{"auth_token": "6789"}),
 }
 
-var swTestChannels = []courier.Channel{
+var swTestChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "SW", "2020", "US", []string{urns.Phone.Prefix}, map[string]any{"auth_token": "6789"}),
 }
 
@@ -78,6 +84,8 @@ var (
 
 	waReceiveValid         = "ToCountry=US&ToState=District+Of+Columbia&SmsMessageSid=SMe287d7109a5a925f182f0e07fe5b223b&NumMedia=0&ToCity=&FromZip=01022&SmsSid=SMe287d7109a5a925f182f0e07fe5b223b&FromState=MA&SmsStatus=received&FromCity=CHICOPEE&Body=Msg&FromCountry=US&To=whatsapp:%2B12028831111&ToZip=&NumSegments=1&MessageSid=SMe287d7109a5a925f182f0e07fe5b223b&AccountSid=acctid&From=whatsapp:%2B14133881111&ApiVersion=2010-04-01"
 	waReceiveBSUIDValid    = "ToCountry=US&ToState=District+Of+Columbia&SmsMessageSid=SMe287d7109a5a925f182f0e07fe5b223b&NumMedia=0&ToCity=&FromZip=01022&SmsSid=SMe287d7109a5a925f182f0e07fe5b223b&FromState=MA&SmsStatus=received&FromCity=CHICOPEE&Body=Msg&FromCountry=US&To=whatsapp:%2B12028831111&ToZip=&NumSegments=1&MessageSid=SMe287d7109a5a925f182f0e07fe5b223b&AccountSid=acctid&From=whatsapp:%2B14133881111&ExternalUserId=whatsapp:US.1234&ApiVersion=2010-04-01"
+	waReceiveFromBSUID     = "ToCountry=US&ToState=District+Of+Columbia&SmsMessageSid=SMe287d7109a5a925f182f0e07fe5b223b&NumMedia=0&ToCity=&FromZip=01022&SmsSid=SMe287d7109a5a925f182f0e07fe5b223b&FromState=MA&SmsStatus=received&FromCity=CHICOPEE&Body=Msg&FromCountry=US&To=whatsapp:%2B12028831111&ToZip=&NumSegments=1&MessageSid=SMe287d7109a5a925f182f0e07fe5b223b&AccountSid=acctid&From=whatsapp:US.1234&ExternalUserId=whatsapp:US.1234&ApiVersion=2010-04-01"
+	waReceiveBSUIDInvalid  = "ToCountry=US&ToState=District+Of+Columbia&SmsMessageSid=SMe287d7109a5a925f182f0e07fe5b223b&NumMedia=0&ToCity=&FromZip=01022&SmsSid=SMe287d7109a5a925f182f0e07fe5b223b&FromState=MA&SmsStatus=received&FromCity=CHICOPEE&Body=Msg&FromCountry=US&To=whatsapp:%2B12028831111&ToZip=&NumSegments=1&MessageSid=SMe287d7109a5a925f182f0e07fe5b223b&AccountSid=acctid&From=whatsapp:%2B14133881111&ExternalUserId=whatsapp:foo_bar&ApiVersion=2010-04-01"
 	waReceiveButtonValid   = "ToCountry=US&ToState=District+Of+Columbia&SmsMessageSid=SMe287d7109a5a925f182f0e07fe5b223b&NumMedia=0&ToCity=&FromZip=01022&SmsSid=SMe287d7109a5a925f182f0e07fe5b223b&FromState=MA&SmsStatus=received&FromCity=CHICOPEE&Body=Msg&ButtonText=Confirm&FromCountry=US&To=whatsapp:%2B12028831111&ToZip=&NumSegments=1&MessageSid=SMe287d7109a5a925f182f0e07fe5b223b&AccountSid=acctid&From=whatsapp:%2B14133881111&ApiVersion=2010-04-01"
 	waReceivePrefixlessURN = "ToCountry=US&ToState=CA&SmsMessageSid=SM681a1f26d9ec591431ce406e8f399525&NumMedia=0&ToCity=&FromZip=60625&SmsSid=SM681a1f26d9ec591431ce406e8f399525&FromState=IL&SmsStatus=received&FromCity=CHICAGO&Body=Msg&FromCountry=US&To=%2B12028831111&ToZip=&NumSegments=1&MessageSid=SM681a1f26d9ec591431ce406e8f399525&AccountSid=acctid&From=%2B14133881111&ApiVersion=2010-04-01"
 )
@@ -143,7 +151,7 @@ var testCases = []IncomingTestCase{
 		ExpectedEvents: []ExpectedEvent{
 			{Type: models.EventTypeStopContact, URN: "tel:+12028831111"},
 		},
-		ExpectedErrors: []*clogs.Error{courier.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
+		ExpectedErrors: []*svclogs.Error{models.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
 		PrepRequest:    addValidSignature,
 	},
 	{
@@ -241,7 +249,7 @@ var tmsTestCases = []IncomingTestCase{
 		ExpectedEvents: []ExpectedEvent{
 			{Type: models.EventTypeStopContact, URN: "tel:+12028831111"},
 		},
-		ExpectedErrors: []*clogs.Error{courier.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
+		ExpectedErrors: []*svclogs.Error{models.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
 		PrepRequest:    addValidSignature,
 	},
 	{
@@ -341,7 +349,7 @@ var twTestCases = []IncomingTestCase{
 		ExpectedEvents: []ExpectedEvent{
 			{Type: models.EventTypeStopContact, URN: "tel:+12028831111"},
 		},
-		ExpectedErrors: []*clogs.Error{courier.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
+		ExpectedErrors: []*svclogs.Error{models.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
 		PrepRequest:    addValidSignature,
 	},
 	{Label: "Status No Params", URL: twStatusURL, Data: " ", ExpectedRespStatus: 200, ExpectedBodyContains: "no msg status, ignoring",
@@ -405,7 +413,7 @@ var swTestCases = []IncomingTestCase{
 		ExpectedEvents: []ExpectedEvent{
 			{Type: models.EventTypeStopContact, URN: "tel:+12028831111"},
 		},
-		ExpectedErrors: []*clogs.Error{courier.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
+		ExpectedErrors: []*svclogs.Error{models.ErrorExternal("21610", "Attempt to send to unsubscribed recipient")},
 		PrepRequest:    addValidSignature,
 	},
 	{Label: "Status No Params", URL: swStatusURL, Data: " ", ExpectedRespStatus: 200, ExpectedBodyContains: "no msg status, ignoring"},
@@ -454,7 +462,13 @@ var twaTestCases = []IncomingTestCase{
 		ExpectedMsgText: Sp("Msg"), ExpectedURN: "whatsapp:14133881111", ExpectedExternalID: "SMe287d7109a5a925f182f0e07fe5b223b",
 		PrepRequest: addValidSignature},
 	{Label: "Receive BSUID Valid", URL: twaReceiveURL, Data: waReceiveBSUIDValid, ExpectedRespStatus: 200, ExpectedBodyContains: "<Response/>",
-		ExpectedMsgText: Sp("Msg"), ExpectedURN: "whatsapp:14133881111", ExpectedNewURN: &models.NewURNSpec{Value: "bsuid:US.1234", Action: models.NewURNAppend}, ExpectedExternalID: "SMe287d7109a5a925f182f0e07fe5b223b",
+		ExpectedMsgText: Sp("Msg"), ExpectedURN: "whatsapp:14133881111", ExpectedNewURN: &models.NewURNSpec{Value: "whatsapp:US.1234", Action: models.NewURNAppend}, ExpectedExternalID: "SMe287d7109a5a925f182f0e07fe5b223b",
+		PrepRequest: addValidSignature},
+	{Label: "Receive From BSUID with no phone", URL: twaReceiveURL, Data: waReceiveFromBSUID, ExpectedRespStatus: 200, ExpectedBodyContains: "<Response/>",
+		ExpectedMsgText: Sp("Msg"), ExpectedURN: "whatsapp:US.1234", ExpectedExternalID: "SMe287d7109a5a925f182f0e07fe5b223b",
+		PrepRequest: addValidSignature},
+	{Label: "Receive with invalid ExternalUserId, no new URN added", URL: twaReceiveURL, Data: waReceiveBSUIDInvalid, ExpectedRespStatus: 200, ExpectedBodyContains: "<Response/>",
+		ExpectedMsgText: Sp("Msg"), ExpectedURN: "whatsapp:14133881111", ExpectedNewURN: nil, ExpectedExternalID: "SMe287d7109a5a925f182f0e07fe5b223b",
 		PrepRequest: addValidSignature},
 	{Label: "Receive Valid", URL: twaReceiveURL, Data: waReceiveButtonValid, ExpectedRespStatus: 200, ExpectedBodyContains: "<Response/>",
 		ExpectedMsgText: Sp("Confirm"), ExpectedURN: "whatsapp:14133881111", ExpectedExternalID: "SMe287d7109a5a925f182f0e07fe5b223b",
@@ -498,7 +512,7 @@ var twaTestCases = []IncomingTestCase{
 			{ExternalID: "SMe287d7109a5a925f182f0e07fe5b223b", Status: models.MsgStatusErrored},
 		},
 		PrepRequest:    addValidSignature,
-		ExpectedErrors: []*clogs.Error{courier.ErrorExternal("63018", "Rate limit exceeded for Channel")},
+		ExpectedErrors: []*svclogs.Error{models.ErrorExternal("63018", "Rate limit exceeded for Channel")},
 	},
 	{
 		Label:                "Status ID Invalid",
@@ -536,14 +550,14 @@ func TestIncoming(t *testing.T) {
 	RunIncomingTestCases(t, twTestChannels, newTWIMLHandler("TW", "TwiML API", true), twTestCases)
 	RunIncomingTestCases(t, swTestChannels, newTWIMLHandler("SW", "SignalWire", false), swTestCases)
 
-	waChannel := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "SW", "+12065551212", "US",
+	waChannel := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "T", "+12065551212", "US",
 		[]string{urns.WhatsApp.Prefix},
 		map[string]any{
 			configAccountSID:       "accountSID",
 			models.ConfigAuthToken: "6789",
 		},
 	)
-	RunIncomingTestCases(t, []courier.Channel{waChannel}, newTWIMLHandler("T", "TwilioWhatsApp", true), waTestCases)
+	RunIncomingTestCases(t, []*models.Channel{waChannel}, newTWIMLHandler("T", "TwilioWhatsApp", true), waTestCases)
 
 	twaChannel := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "TWA", "+12065551212", "US",
 		[]string{urns.WhatsApp.Prefix},
@@ -552,7 +566,7 @@ func TestIncoming(t *testing.T) {
 			models.ConfigAuthToken: "6789",
 		},
 	)
-	RunIncomingTestCases(t, []courier.Channel{twaChannel}, newTWIMLHandler("TWA", "Twilio WhatsApp", true), twaTestCases)
+	RunIncomingTestCases(t, []*models.Channel{twaChannel}, newTWIMLHandler("TWA", "Twilio WhatsApp", true), twaTestCases)
 }
 
 var defaultSendTestCases = []OutgoingTestCase{
@@ -610,7 +624,21 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Error Message"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/t/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Message",
+		MsgURN:  "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.twilio.com/2010-04-01/Accounts/accountSID/Messages.json": {
+				httpx.NewMockResponse(429, nil, []byte(`{ "code": 20429, "message": "Too Many Requests" }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Form: url.Values{"Body": {"Error Message"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/t/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Error Code",
@@ -624,7 +652,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Error Code"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/t/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrFailedWithReason("1001", "Service specific error: 1001."),
+		ExpectedError: channels.ErrFailedWithReason("1001", "Service specific error: 1001."),
 	},
 	{
 		Label:   "Stopped Contact Code",
@@ -638,7 +666,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Stopped Contact"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/t/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrContactStopped,
+		ExpectedError: channels.ErrContactStopped,
 	},
 	{
 		Label:   "No SID",
@@ -652,7 +680,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"No SID"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/t/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedLogErrors: []*clogs.Error{courier.ErrorResponseValueMissing("sid")},
+		ExpectedLogErrors: []*svclogs.Error{models.ErrorResponseValueMissing("sid")},
 	},
 	{
 		Label:          "Single attachment and text",
@@ -760,7 +788,7 @@ var tmsDefaultSendTestCases = []OutgoingTestCase{
 				Form:    url.Values{"Body": {"Error Message"}, "To": {"+250788383383"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/tms/8eb23e93-5ecb-45ba-b726-3b064e0c56cd/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 			},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 	{
 		Label:   "Error Code",
@@ -774,7 +802,7 @@ var tmsDefaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Error Code"}, "To": {"+250788383383"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/tms/8eb23e93-5ecb-45ba-b726-3b064e0c56cd/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrFailedWithReason("1001", "Service specific error: 1001."),
+		ExpectedError: channels.ErrFailedWithReason("1001", "Service specific error: 1001."),
 	},
 	{
 		Label:   "Stopped Contact Code",
@@ -788,7 +816,7 @@ var tmsDefaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Stopped Contact"}, "To": {"+250788383383"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/tms/8eb23e93-5ecb-45ba-b726-3b064e0c56cd/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrContactStopped,
+		ExpectedError: channels.ErrContactStopped,
 	},
 	{
 		Label:   "No SID",
@@ -802,7 +830,7 @@ var tmsDefaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"No SID"}, "To": {"+250788383383"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/tms/8eb23e93-5ecb-45ba-b726-3b064e0c56cd/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedLogErrors: []*clogs.Error{courier.ErrorResponseValueMissing("sid")},
+		ExpectedLogErrors: []*svclogs.Error{models.ErrorResponseValueMissing("sid")},
 	},
 	{
 		Label:          "Send Attachment",
@@ -897,7 +925,7 @@ var twDefaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Error Message"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/tw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 	{
 		Label:   "Error Code",
@@ -911,7 +939,7 @@ var twDefaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Error Code"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/tw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrFailedWithReason("1001", "Service specific error: 1001."),
+		ExpectedError: channels.ErrFailedWithReason("1001", "Service specific error: 1001."),
 	},
 	{
 		Label:   "Stopped Contact Code",
@@ -925,7 +953,7 @@ var twDefaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Stopped Contact"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/tw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrContactStopped,
+		ExpectedError: channels.ErrContactStopped,
 	},
 	{
 		Label:   "No SID",
@@ -939,7 +967,7 @@ var twDefaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"No SID"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/tw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedLogErrors: []*clogs.Error{courier.ErrorResponseValueMissing("sid")},
+		ExpectedLogErrors: []*svclogs.Error{models.ErrorResponseValueMissing("sid")},
 	},
 	{
 		Label:          "Send Attachment",
@@ -1013,7 +1041,7 @@ var swSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Error Message"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/sw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 	{
 		Label:   "Error Code",
@@ -1027,7 +1055,7 @@ var swSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Error Code"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/sw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrFailedWithReason("1001", "Service specific error: 1001."),
+		ExpectedError: channels.ErrFailedWithReason("1001", "Service specific error: 1001."),
 	},
 	{
 		Label:   "Stopped Contact Code",
@@ -1041,7 +1069,7 @@ var swSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"Stopped Contact"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/sw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedError: courier.ErrContactStopped,
+		ExpectedError: channels.ErrContactStopped,
 	},
 	{
 		Label:   "No SID",
@@ -1055,7 +1083,7 @@ var swSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Form: url.Values{"Body": {"No SID"}, "To": {"+250788383383"}, "From": {"2020"}, "StatusCallback": {"https://localhost/c/sw/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
 		}},
-		ExpectedLogErrors: []*clogs.Error{courier.ErrorResponseValueMissing("sid")},
+		ExpectedLogErrors: []*svclogs.Error{models.ErrorResponseValueMissing("sid")},
 	},
 	{
 		Label:          "Send Attachment",
@@ -1138,6 +1166,36 @@ var twaSendTestCases = []OutgoingTestCase{
 		ExpectedExtIDs: []string{"1002"},
 	},
 	{
+		Label:   "Plain Send with BSUID as whatsapp URN",
+		MsgText: "Simple Message ☺",
+		MsgURN:  "whatsapp:US.1234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.twilio.com/2010-04-01/Accounts/accountSID/Messages.json": {
+				httpx.NewMockResponse(200, nil, []byte(`{ "sid": "1002" }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Form:    url.Values{"Body": {"Simple Message ☺"}, "To": {"whatsapp:US.1234"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
+			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
+		}},
+		ExpectedExtIDs: []string{"1002"},
+	},
+	{
+		Label:   "Plain Send with BSUID as bsuid URN",
+		MsgText: "Simple Message ☺",
+		MsgURN:  "bsuid:US.1234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.twilio.com/2010-04-01/Accounts/accountSID/Messages.json": {
+				httpx.NewMockResponse(200, nil, []byte(`{ "sid": "1002" }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Form:    url.Values{"Body": {"Simple Message ☺"}, "To": {"whatsapp:US.1234"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}},
+			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
+		}},
+		ExpectedExtIDs: []string{"1002"},
+	},
+	{
 		Label:     "Template Send",
 		MsgText:   "templated message",
 		MsgURN:    "whatsapp:250788383383",
@@ -1161,6 +1219,34 @@ var twaSendTestCases = []OutgoingTestCase{
 		},
 		ExpectedRequests: []ExpectedRequest{{
 			Form:    url.Values{"To": {"whatsapp:+250788383383"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}, "ContentSid": {"ext_id_revive_issue"}, "ContentVariables": {"{\"1\":\"Chef\",\"2\":\"tomorrow\"}"}},
+			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
+		}},
+		ExpectedExtIDs: []string{"1002"},
+	},
+	{
+		Label:     "Template Send with BSUID as whatsapp URN",
+		MsgText:   "templated message",
+		MsgURN:    "whatsapp:US.1234",
+		MsgLocale: "eng",
+		MsgTemplating: `{
+			"template": {"uuid": "171f8a4d-f725-46d7-85a6-11aceff0bfe3", "name": "revive_issue"},
+			"components": [
+				{"type": "body", "name": "body", "variables": {"1": 0, "2": 1}}
+			],
+			"variables": [
+				{"type": "text", "value": "Chef"},
+				{"type": "text" , "value": "tomorrow"}
+			],
+			"external_id": "ext_id_revive_issue",
+			"language": "en_US"
+		}`,
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.twilio.com/2010-04-01/Accounts/accountSID/Messages.json": {
+				httpx.NewMockResponse(200, nil, []byte(`{ "sid": "1002" }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Form:    url.Values{"To": {"whatsapp:US.1234"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}, "ContentSid": {"ext_id_revive_issue"}, "ContentVariables": {"{\"1\":\"Chef\",\"2\":\"tomorrow\"}"}},
 			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
 		}},
 		ExpectedExtIDs: []string{"1002"},
@@ -1237,7 +1323,7 @@ var twaSendTestCases = []OutgoingTestCase{
 			],
 			"language": "en_US"
 		}`,
-		ExpectedError: courier.ErrMessageInvalid,
+		ExpectedError: channels.ErrMessageInvalid,
 	},
 	{
 		Label:     "Error Code",
@@ -1265,7 +1351,7 @@ var twaSendTestCases = []OutgoingTestCase{
 			Form:    url.Values{"To": {"whatsapp:+250788383383"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}, "ContentSid": {"ext_id_revive_issue"}, "ContentVariables": {"{\"1\":\"Chef\",\"2\":\"tomorrow\"}"}},
 			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
 		}},
-		ExpectedError: courier.ErrFailedWithReason("1001", "Service specific error: 1001."),
+		ExpectedError: channels.ErrFailedWithReason("1001", "Service specific error: 1001."),
 	},
 	{
 		Label:     "Stopped Contact Code",
@@ -1293,7 +1379,7 @@ var twaSendTestCases = []OutgoingTestCase{
 			Form:    url.Values{"To": {"whatsapp:+250788383383"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}, "ContentSid": {"ext_id_revive_issue"}, "ContentVariables": {"{\"1\":\"Chef\",\"2\":\"tomorrow\"}"}},
 			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
 		}},
-		ExpectedError: courier.ErrContactStopped,
+		ExpectedError: channels.ErrContactStopped,
 	},
 	{
 		Label:     "No SID",
@@ -1321,7 +1407,7 @@ var twaSendTestCases = []OutgoingTestCase{
 			Form:    url.Values{"To": {"whatsapp:+250788383383"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}, "ContentSid": {"ext_id_revive_issue"}, "ContentVariables": {"{\"1\":\"Chef\",\"2\":\"tomorrow\"}"}},
 			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
 		}},
-		ExpectedLogErrors: []*clogs.Error{courier.ErrorResponseValueMissing("sid")},
+		ExpectedLogErrors: []*svclogs.Error{models.ErrorResponseValueMissing("sid")},
 	},
 	{
 		Label:     "Error Sending",
@@ -1349,7 +1435,7 @@ var twaSendTestCases = []OutgoingTestCase{
 			Form:    url.Values{"To": {"whatsapp:+250788383383"}, "From": {"whatsapp:+12065551212"}, "MessagingServiceSid": {"messageServiceSID"}, "StatusCallback": {"https://localhost/c/twa/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&action=callback"}, "ContentSid": {"ext_id_revive_issue"}, "ContentVariables": {"{\"1\":\"Chef\",\"2\":\"tomorrow\"}"}},
 			Headers: map[string]string{"Authorization": "Basic YWNjb3VudFNJRDphdXRoVG9rZW4="},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 }
 
@@ -1444,4 +1530,63 @@ func TestBuildAttachmentRequest(t *testing.T) {
 	req, _ = swHandler.BuildAttachmentRequest(context.Background(), swChannel, "https://example.org/v1/media/41", nil)
 	assert.Equal(t, "https://example.org/v1/media/41", req.URL.String())
 	assert.Equal(t, "", req.Header.Get("Authorization"))
+}
+
+func TestSendEvent(t *testing.T) {
+	channel := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "TWA", "+12065551212", "US",
+		[]string{urns.WhatsApp.Prefix},
+		map[string]any{
+			configAccountSID:       "accountSID",
+			models.ConfigAuthToken: "authToken",
+		},
+	)
+
+	s := web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()))
+
+	h := newTWIMLHandler("TWA", "Twilio Whatsapp", true).(*handler)
+	s.MountHandler(h)
+
+	s.Runtime().HTTP.Default.Transport = test.MockTransport(map[string][]*httpx.MockResponse{
+		"https://messaging.twilio.com/v3/Indicators/Typing.json": {
+			httpx.NewMockResponse(200, nil, []byte(`{"success": true}`)),
+			httpx.NewMockResponse(400, nil, []byte(`{"code": 21211, "message": "Invalid message SID"}`)),
+			httpx.MockConnectionError,
+		},
+	})
+
+	// typing indicators are supported on Twilio WhatsApp channels but no other TWIML channel types
+	assert.Equal(t, map[string]time.Duration{events.TypeTypingStarted: 20 * time.Second}, h.SendableEvents(channel))
+	assert.Nil(t, newTWIMLHandler("T", "Twilio", true).(*handler).SendableEvents(channel))
+
+	channelRef := assets.NewChannelReference("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "Twilio Whatsapp")
+	typing := events.NewTypingStarted(events.DirectionOutgoing, channelRef, "whatsapp:12065551212", "SMabcdef1234567890abcdef1234567890")
+
+	// a typing indicator is sent as a typing indicators resource call referencing the incoming message
+	clog := models.NewChannelLogForEventSend(channel, nil)
+	err := h.SendEvent(context.Background(), channel, typing, clog)
+	assert.NoError(t, err)
+	assert.Len(t, clog.HttpLogs, 1)
+	assert.Equal(t, "https://messaging.twilio.com/v3/Indicators/Typing.json", clog.HttpLogs[0].URL)
+	assert.Contains(t, clog.HttpLogs[0].Request, `{"channel":"WHATSAPP","messageId":"SMabcdef1234567890abcdef1234567890"}`)
+
+	// an error response is a response error
+	err = h.SendEvent(context.Background(), channel, typing, clog)
+	assert.Equal(t, channels.ErrResponseStatus, err)
+
+	// as is a connection error
+	err = h.SendEvent(context.Background(), channel, typing, clog)
+	assert.Equal(t, channels.ErrConnectionFailed, err)
+
+	// an event without a msg external ID can't be sent
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStarted(events.DirectionOutgoing, channelRef, "whatsapp:12065551212", ""), clog)
+	assert.ErrorContains(t, err, "requires msg_external_id")
+
+	// a channel without complete auth config can't send
+	noAuth := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "TWA", "+12065551212", "US", []string{urns.WhatsApp.Prefix}, map[string]any{})
+	err = h.SendEvent(context.Background(), noAuth, typing, clog)
+	assert.Equal(t, channels.ErrChannelConfig, err)
+
+	// nor can an event type the handler doesn't declare support for
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStopped(events.DirectionOutgoing, channelRef, "whatsapp:12065551212", ""), clog)
+	assert.ErrorContains(t, err, "unsupported event type: typing_stopped")
 }

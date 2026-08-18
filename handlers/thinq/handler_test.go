@@ -6,16 +6,16 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
-	"github.com/nyaruka/courier/v26/utils/clogs"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "TQ", "+12065551212", "US", []string{urns.Phone.Prefix}, nil),
 }
 
@@ -59,7 +59,7 @@ var testCases = []IncomingTestCase{
 		ExpectedRespStatus:   200,
 		ExpectedBodyContains: "Accepted",
 		ExpectedURN:          "tel:+12065551234",
-		ExpectedAttachments:  []string{"data:" + testJpgBase64},
+		ExpectedAttachments:  []string{"image/jpeg:http://localstack:4566/test-attachments/attachments/1/2244/0ad6/22440ad6-cbd5-4fee-a12f-03a352fff1dd.jpg"},
 	},
 	{
 		Label:                "Status Valid",
@@ -156,8 +156,8 @@ var sendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Body: `{"from_did":"2065551212","to_did":"2067791234","message":"No External ID"}`,
 		}},
-		ExpectedLogErrors: []*clogs.Error{courier.ErrorResponseValueMissing("guid")},
-		ExpectedError:     courier.ErrResponseContent,
+		ExpectedLogErrors: []*svclogs.Error{models.ErrorResponseValueMissing("guid")},
+		ExpectedError:     channels.ErrResponseContent,
 	},
 	{
 		Label:   "Error Sending",
@@ -171,7 +171,21 @@ var sendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Body: `{"from_did":"2065551212","to_did":"2067791234","message":"Error Message"}`,
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Message",
+		MsgURN:  "tel:+12067791234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.thinq.com/account/1234/product/origination/sms/send": {
+				httpx.NewMockResponse(429, nil, []byte(`{ "error": "failed" }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"from_did":"2065551212","to_did":"2067791234","message":"Error Message"}`,
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Connection Error",
@@ -185,7 +199,7 @@ var sendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Body: `{"from_did":"2065551212","to_did":"2067791234","message":"Error Message"}`,
 		}},
-		ExpectedError: courier.ErrConnectionFailed,
+		ExpectedError: channels.ErrConnectionFailed,
 	},
 	{
 		Label:   "Reponse Unexpected",
@@ -200,8 +214,8 @@ var sendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Authorization": "Basic dXNlcjE6c2VzYW1l"},
 			Body:    `{"from_did":"2065551212","to_did":"2067791234","message":"Simple Message ☺"}`,
 		}},
-		ExpectedLogErrors: []*clogs.Error{courier.ErrorResponseValueMissing("guid")},
-		ExpectedError:     courier.ErrResponseContent,
+		ExpectedLogErrors: []*svclogs.Error{models.ErrorResponseValueMissing("guid")},
+		ExpectedError:     channels.ErrResponseContent,
 	},
 }
 

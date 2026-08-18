@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -18,17 +17,16 @@ import (
 
 	"github.com/buger/jsonparser"
 	"github.com/gomodule/redigo/redis"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/handlers/meta/whatsapp"
-	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/gocommon/cache"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/vkutil"
-	"github.com/patrickmn/go-cache"
 )
 
 var (
@@ -37,27 +35,27 @@ var (
 	configNamespace = "fb_namespace"
 
 	mediaCacheKeyPattern = "turn_whatsapp_media_%s"
-	failedMediaCache     *cache.Cache
+	failedMediaCache     *cache.Local[string, bool]
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 
-	failedMediaCache = cache.New(15*time.Minute, 15*time.Minute)
+	failedMediaCache = cache.NewLocal[string, bool](nil, 15*time.Minute)
+	failedMediaCache.Start()
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("TRN"), "Turn.io WhatsApp")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMultiReceive, handlers.JSONPayload(h, h.receiveEvents))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMultiReceive, handlers.JSONPayload(h, h.receiveEvents))
 
 	return nil
 }
@@ -84,10 +82,11 @@ type eventsPayload struct {
 		Profile struct {
 			Name string `json:"name"`
 		} `json:"profile"`
-		WaID string `json:"wa_id"`
+		WaID   string `json:"wa_id"`
+		UserID string `json:"user_id"`
 	} `json:"contacts"`
 	Messages []struct {
-		From      string `json:"from"      validate:"required"`
+		From      string `json:"from"`
 		FromBSUID string `json:"from_bsuid"`
 		ID        string `json:"id"        validate:"required"`
 		GroupID   string `json:"group_id,omitempty"`
@@ -97,32 +96,18 @@ type eventsPayload struct {
 			Body string `json:"body"`
 		} `json:"text"`
 		Audio *struct {
-			File     string `json:"file"      validate:"required"`
-			ID       string `json:"id"        validate:"required"`
-			Link     string `json:"link"`
-			MimeType string `json:"mime_type" validate:"required"`
-			Sha256   string `json:"sha256"    validate:"required"`
+			ID string `json:"id"`
 		} `json:"audio"`
 		Button *struct {
-			Payload string `json:"payload"`
-			Text    string `json:"text"    validate:"required"`
+			Text string `json:"text"`
 		} `json:"button"`
 		Document *struct {
-			File     string `json:"file"      validate:"required"`
-			ID       string `json:"id"        validate:"required"`
-			Link     string `json:"link"`
-			MimeType string `json:"mime_type" validate:"required"`
-			Sha256   string `json:"sha256"    validate:"required"`
-			Caption  string `json:"caption"`
-			Filename string `json:"filename"`
+			ID      string `json:"id"`
+			Caption string `json:"caption"`
 		} `json:"document"`
 		Image *struct {
-			File     string `json:"file"      validate:"required"`
-			ID       string `json:"id"        validate:"required"`
-			Link     string `json:"link"`
-			MimeType string `json:"mime_type" validate:"required"`
-			Sha256   string `json:"sha256"    validate:"required"`
-			Caption  string `json:"caption"`
+			ID      string `json:"id"`
+			Caption string `json:"caption"`
 		} `json:"image"`
 		Interactive *struct {
 			ButtonReply *struct {
@@ -134,49 +119,53 @@ type eventsPayload struct {
 				Title       string `json:"title"`
 				Description string `json:"description"`
 			} `json:"list_reply"`
+			NFMReply *struct {
+				Name         string `json:"name"`
+				Body         string `json:"body"`
+				ResponseJSON string `json:"response_json"`
+			} `json:"nfm_reply"`
 			Type string `json:"type"`
-		}
+		} `json:"interactive"`
 		Location *struct {
-			Address   string  `json:"address"   validate:"required"`
-			Latitude  float32 `json:"latitude"  validate:"required"`
-			Longitude float32 `json:"longitude" validate:"required"`
-			Name      string  `json:"name"      validate:"required"`
-			URL       string  `json:"url"       validate:"required"`
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
 		} `json:"location"`
 		Video *struct {
-			File     string `json:"file"      validate:"required"`
-			ID       string `json:"id"        validate:"required"`
-			Link     string `json:"link"`
-			MimeType string `json:"mime_type" validate:"required"`
-			Sha256   string `json:"sha256"    validate:"required"`
+			ID      string `json:"id"`
+			Caption string `json:"caption"`
 		} `json:"video"`
 		Voice *struct {
-			File     string `json:"file"      validate:"required"`
-			ID       string `json:"id"        validate:"required"`
-			Link     string `json:"link"`
-			MimeType string `json:"mime_type" validate:"required"`
-			Sha256   string `json:"sha256"    validate:"required"`
+			ID string `json:"id"`
 		} `json:"voice"`
+		Errors []whatsapp.WAError `json:"errors"`
 	} `json:"messages"`
 	Statuses []struct {
-		ID        string `json:"id"           validate:"required"`
-		Timestamp string `json:"timestamp"    validate:"required"`
-		Status    string `json:"status"       validate:"required"`
+		ID        string             `json:"id"           validate:"required"`
+		Timestamp string             `json:"timestamp"    validate:"required"`
+		Status    string             `json:"status"       validate:"required"`
+		Errors    []whatsapp.WAError `json:"errors"`
 	} `json:"statuses"`
 }
 
 // receiveEvents is our HTTP handler function for incoming messages and status updates
-func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *eventsPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
-	events := make([]courier.Event, 0, 2)
+func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *eventsPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+	events := make([]channels.Event, 0, 2)
 
 	// the list of data we will return in our response
 	data := make([]any, 0, 2)
 
 	seenMsgIDs := make(map[string]bool, 2)
 
+	// contacts are keyed by both identifiers they can carry, as a message from a user with a username may
+	// only reference them by their user_id
 	var contactNames = make(map[string]string)
 	for _, contact := range payload.Contacts {
-		contactNames[contact.WaID] = contact.Profile.Name
+		if contact.WaID != "" {
+			contactNames[contact.WaID] = contact.Profile.Name
+		}
+		if contact.UserID != "" {
+			contactNames[contact.UserID] = contact.Profile.Name
+		}
 	}
 
 	// first deal with any received messages
@@ -186,7 +175,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 		}
 
 		if msg.GroupID != "" {
-			data = append(data, courier.NewInfoData("ignoring group message"))
+			data = append(data, channels.NewInfoData("ignoring group message"))
 			continue
 		}
 
@@ -197,14 +186,23 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 		}
 		date := time.Unix(ts, 0).UTC()
 
-		// create our URN
-		urn, err := urns.New(urns.WhatsApp, msg.From)
+		// create our URN from the sender's phone number, falling back to their business-scoped user ID as a user
+		// who has adopted a WhatsApp username can have their phone number omitted from the webhook entirely
+		sender := cmp.Or(msg.From, msg.FromBSUID)
+
+		urn, err := urns.New(urns.WhatsApp, sender)
 		if err != nil {
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid whatsapp id"))
 		}
 
+		for _, msgError := range msg.Errors {
+			msgError.ErrorChannelLog(clog)
+		}
+
 		text := ""
 		mediaURL := ""
+		var msgPayload json.RawMessage
+		supported := true
 
 		if msg.Type == "text" {
 			text = msg.Text.Body
@@ -218,51 +216,71 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 		} else if msg.Type == "image" && msg.Image != nil {
 			text = msg.Image.Caption
 			mediaURL, err = resolveMediaURL(channel, msg.Image.ID)
-		} else if msg.Type == "interactive" && msg.Interactive != nil {
-			if msg.Interactive.Type == "button_reply" && msg.Interactive.ButtonReply != nil {
-				text = msg.Interactive.ButtonReply.Title
-			} else if msg.Interactive.Type == "list_reply" && msg.Interactive.ListReply != nil {
-				text = msg.Interactive.ListReply.Title
+		} else if msg.Type == "interactive" && msg.Interactive != nil && msg.Interactive.Type == "button_reply" && msg.Interactive.ButtonReply != nil {
+			text = msg.Interactive.ButtonReply.Title
+		} else if msg.Type == "interactive" && msg.Interactive != nil && msg.Interactive.Type == "list_reply" && msg.Interactive.ListReply != nil {
+			text = msg.Interactive.ListReply.Title
+		} else if msg.Type == "interactive" && msg.Interactive != nil && msg.Interactive.Type == "nfm_reply" && msg.Interactive.NFMReply != nil {
+			text = msg.Interactive.NFMReply.Body
+			// attach the response JSON as the msg payload if it's a valid JSON object
+			raw := strings.TrimSpace(msg.Interactive.NFMReply.ResponseJSON)
+			if strings.HasPrefix(raw, "{") && json.Valid([]byte(raw)) {
+				msgPayload = json.RawMessage(raw)
+			} else if msg.Interactive.NFMReply.ResponseJSON != "" {
+				channels.LogRequestError(r, channel, errors.New("nfm_reply response_json is not a valid JSON object"))
 			}
 		} else if msg.Type == "location" && msg.Location != nil {
 			mediaURL = fmt.Sprintf("geo:%f,%f", msg.Location.Latitude, msg.Location.Longitude)
 		} else if msg.Type == "video" && msg.Video != nil {
+			text = msg.Video.Caption
 			mediaURL, err = resolveMediaURL(channel, msg.Video.ID)
 		} else if msg.Type == "voice" && msg.Voice != nil {
 			mediaURL, err = resolveMediaURL(channel, msg.Voice.ID)
 		} else {
-			// we received a message type we do not support.
-			courier.LogRequestError(r, channel, fmt.Errorf("unsupported message type %s", msg.Type))
+			supported = false
+		}
+
+		// we received a message type we do not support - don't create an empty message for it
+		if !supported {
+			channels.LogRequestError(r, channel, fmt.Errorf("unsupported message type %s", msg.Type))
+			continue
 		}
 
 		// create our message
-		event := h.Backend().NewIncomingMsg(ctx, channel, urn, text, msg.ID, clog).WithReceivedOn(date).WithContactName(contactNames[msg.From])
+		event := models.NewIncomingMsg(channel, urn, text, msg.ID, clog).WithReceivedOn(date).WithContactName(contactNames[sender])
 
 		// we had an error downloading media
 		if err != nil {
-			courier.LogRequestError(r, channel, err)
+			channels.LogRequestError(r, channel, err)
 		}
 
 		if mediaURL != "" {
 			event.WithAttachment(mediaURL)
 		}
 
+		if msgPayload != nil {
+			event.WithPayload(msgPayload)
+		}
+
+		// if we have a from_bsuid, add it as a secondary whatsapp URN (unless it's already the primary URN)
 		if msg.FromBSUID != "" {
-			userIDURN, urnErr := urns.New(urns.BSUID, msg.FromBSUID)
+			userIDURN, urnErr := urns.New(urns.WhatsApp, msg.FromBSUID)
 			if urnErr == nil {
-				event.WithNewURN(userIDURN, models.NewURNAppend)
+				if userIDURN != urn {
+					event.WithNewURN(userIDURN, models.NewURNAppend)
+				}
 			} else {
-				courier.LogRequestError(r, channel, fmt.Errorf("invalid from_bsuid for BSUID URN: %w", urnErr))
+				channels.LogRequestError(r, channel, fmt.Errorf("invalid from_bsuid for whatsapp URN: %w", urnErr))
 			}
 		}
 
-		err = h.Backend().WriteMsg(ctx, event, clog)
+		err = models.WriteMsg(ctx, h.Runtime(), event, clog)
 		if err != nil {
 			return nil, err
 		}
 
 		events = append(events, event)
-		data = append(data, courier.NewMsgReceiveData(event))
+		data = append(data, channels.NewMsgReceiveData(event))
 		seenMsgIDs[msg.ID] = true
 	}
 
@@ -271,27 +289,31 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 		msgStatus, found := turnWaStatusMapping[status.Status]
 		if !found {
 			if turnWaIgnoreStatuses[status.Status] {
-				data = append(data, courier.NewInfoData(fmt.Sprintf("ignoring status: %s", status.Status)))
+				data = append(data, channels.NewInfoData(fmt.Sprintf("ignoring status: %s", status.Status)))
 			} else {
-				handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown status: %s", status.Status))
+				handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, fmt.Sprintf("unknown status: %s", status.Status))
 			}
 			continue
 		}
 
-		event := h.Backend().NewStatusUpdateByExternalID(channel, status.ID, msgStatus, clog)
-		err := h.Backend().WriteStatusUpdate(ctx, event)
+		for _, statusError := range status.Errors {
+			statusError.ErrorChannelLog(clog)
+		}
+
+		event := models.NewStatusUpdateByExternalID(channel, status.ID, msgStatus, clog)
+		err := models.WriteStatusUpdate(ctx, h.Runtime(), event)
 		if err != nil {
 			return nil, err
 		}
 
 		events = append(events, event)
-		data = append(data, courier.NewStatusData(event))
+		data = append(data, channels.NewStatusData(event))
 	}
 
-	return events, courier.WriteDataResponse(w, http.StatusOK, "Events Handled", data)
+	return events, channels.WriteDataResponse(w, http.StatusOK, "Events Handled", data)
 }
 
-func resolveMediaURL(channel courier.Channel, mediaID string) (string, error) {
+func resolveMediaURL(channel *models.Channel, mediaID string) (string, error) {
 	// sometimes WA will send an attachment with status=undownloaded and no ID
 	if mediaID == "" {
 		return "", nil
@@ -312,7 +334,7 @@ func resolveMediaURL(channel courier.Channel, mediaID string) (string, error) {
 }
 
 // BuildAttachmentRequest to download media for message attachment with Bearer token set
-func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Channel, attachmentURL string, clog *courier.ChannelLog) (*http.Request, error) {
+func (h *handler) BuildAttachmentRequest(ctx context.Context, channel *models.Channel, attachmentURL string, clog *models.ChannelLog) (*http.Request, error) {
 	token := channel.StringConfigForKey(models.ConfigAuthToken, "")
 	if token == "" {
 		return nil, fmt.Errorf("missing token for TRN channel")
@@ -325,7 +347,7 @@ func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Ch
 	return req, nil
 }
 
-var _ courier.AttachmentRequestBuilder = (*handler)(nil)
+var _ channels.AttachmentRequestBuilder = (*handler)(nil)
 
 var turnWaStatusMapping = map[string]models.MsgStatus{
 	"sending":   models.MsgStatusWired,
@@ -369,7 +391,7 @@ type recipient struct {
 }
 
 // newRecipient builds the recipient fields from the message URN.
-func newRecipient(msg courier.MsgOut) recipient {
+func newRecipient(msg *models.MsgOut) recipient {
 	to, rcpt := whatsapp.RecipientFields(msg.URN())
 	return recipient{To: to, Recipient: rcpt}
 }
@@ -383,84 +405,29 @@ type mtTextPayload struct {
 	} `json:"text"`
 }
 
+// interactive messages have the same shape as their Cloud API counterparts, and their headers CAN reference
+// media by link
 type mtInteractivePayload struct {
 	recipient
-	Type        string `json:"type" validate:"required"`
-	Interactive struct {
-		Type   string `json:"type" validate:"required"` //"text" | "image" | "video" | "document"
-		Header *struct {
-			Type     string `json:"type"`
-			Text     string `json:"text,omitempty"`
-			Video    string `json:"video,omitempty"`
-			Image    string `json:"image,omitempty"`
-			Document string `json:"document,omitempty"`
-		} `json:"header,omitempty"`
-		Body struct {
-			Text string `json:"text"`
-		} `json:"body" validate:"required"`
-		Footer *struct {
-			Text string `json:"text"`
-		} `json:"footer,omitempty"`
-		Action struct {
-			Name     string      `json:"name,omitempty"`
-			Button   string      `json:"button,omitempty"`
-			Sections []mtSection `json:"sections,omitempty"`
-			Buttons  []mtButton  `json:"buttons,omitempty"`
-		} `json:"action" validate:"required"`
-	} `json:"interactive"`
+	Type        string                `json:"type" validate:"required"`
+	Interactive *whatsapp.Interactive `json:"interactive"`
 }
 
-type mtSection struct {
-	Title string         `json:"title,omitempty"`
-	Rows  []mtSectionRow `json:"rows" validate:"required"`
-}
-
-type mtSectionRow struct {
-	ID          string `json:"id" validate:"required"`
-	Title       string `json:"title,omitempty"`
-	Description string `json:"description,omitempty"`
-}
-
-type mtButton struct {
-	Type  string `json:"type" validate:"required"`
-	Reply struct {
-		ID    string `json:"id" validate:"required"`
-		Title string `json:"title" validate:"required"`
-	} `json:"reply" validate:"required"`
-}
-
+// media messages reference media by the id returned from /v1/media - they can't carry a link
 type mediaObject struct {
 	ID       string `json:"id,omitempty"`
-	Link     string `json:"link,omitempty"`
 	Caption  string `json:"caption,omitempty"`
 	Filename string `json:"filename,omitempty"`
-}
-
-type LocalizableParam struct {
-	Default string `json:"default"`
-}
-
-type Param struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type Component struct {
-	Type       string  `json:"type"`
-	Parameters []Param `json:"parameters,omitempty"`
 }
 
 type templatePayload struct {
 	recipient
 	Type     string `json:"type"`
 	Template struct {
-		Namespace string `json:"namespace"`
-		Name      string `json:"name"`
-		Language  struct {
-			Policy string `json:"policy"`
-			Code   string `json:"code"`
-		} `json:"language"`
-		Components []Component `json:"components,omitempty"`
+		Namespace  string                `json:"namespace"`
+		Name       string                `json:"name"`
+		Language   whatsapp.Language     `json:"language"`
+		Components []*whatsapp.Component `json:"components,omitempty"`
 	} `json:"template"`
 }
 
@@ -488,305 +455,105 @@ type mtVideoPayload struct {
 	Video *mediaObject `json:"video"`
 }
 
-func buildPayloads(ctx context.Context, msg courier.MsgOut, h *handler, clog *courier.ChannelLog) ([]any, error) {
-	var payloads []any
-	var err error
-
+func (h *handler) buildPayloads(ctx context.Context, msg *models.MsgOut, clog *models.ChannelLog) ([]any, error) {
 	rcpt := newRecipient(msg)
 
-	parts := handlers.SplitMsgByChannel(msg.Channel(), msg.Text(), maxMsgLength)
-
-	qrs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "text")
-	qrsAsList := false
-	for i, qr := range qrs {
-		if i > 2 || qr.Extra != "" {
-			qrsAsList = true
+	// Template messages must be sent as a single template payload. Mailroom/goflow may also
+	// attach preview media and button quick-replies on the same message; those must not be
+	// turned into separate image/interactive sends.
+	if msg.Templating() != nil {
+		// prefer the language mailroom resolved for the template, falling back to deriving one from the msg locale
+		langCode := cmp.Or(msg.Templating().Language, getSupportedLanguage(msg.Locale()))
+		namespace := msg.Templating().Namespace
+		if namespace == "" {
+			namespace = msg.Channel().StringConfigForKey(configNamespace, "")
 		}
+		if namespace == "" {
+			return nil, fmt.Errorf("cannot send template message without Facebook namespace for channel: %s", msg.Channel().UUID())
+		}
+
+		waTpl := whatsapp.GetTemplatePayload(msg.Templating())
+
+		payload := templatePayload{
+			recipient: rcpt,
+			Type:      "template",
+		}
+		payload.Template.Namespace = namespace
+		payload.Template.Name = waTpl.Name
+		payload.Template.Language = whatsapp.Language{Policy: "deterministic", Code: langCode}
+		payload.Template.Components = waTpl.Components
+
+		return []any{payload}, nil
 	}
 
-	locationQRs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "location")
-
-	isInteractiveMsg := len(msg.QuickReplies()) > 0
-
-	textAsCaption := false
-
-	if len(msg.Attachments()) > 0 {
-		for attachmentCount, attachment := range msg.Attachments() {
-
-			mimeType, mediaURL := handlers.SplitAttachment(attachment)
-			mediaID, err := h.fetchMediaID(ctx, msg, mediaURL, clog)
-			if err != nil {
-				slog.Error("error while uploading media to whatsapp", "error", err, "channel_uuid", msg.Channel().UUID())
-			}
-			fileURL := mediaURL
-			if err == nil && mediaID != "" {
-				mediaURL = ""
-			}
-			mediaPayload := &mediaObject{ID: mediaID, Link: mediaURL}
-			if strings.HasPrefix(mimeType, "audio") {
-				payload := mtAudioPayload{
-					recipient: rcpt,
-					Type:      "audio",
-				}
-				payload.Audio = mediaPayload
-				payloads = append(payloads, payload)
-			} else if strings.HasPrefix(mimeType, "application") || strings.HasPrefix(mimeType, "document") {
-				payload := mtDocumentPayload{
-					recipient: rcpt,
-					Type:      "document",
-				}
-				if attachmentCount == 0 && !isInteractiveMsg {
-					mediaPayload.Caption = msg.Text()
-					textAsCaption = true
-				}
-				mediaPayload.Filename, err = utils.BasePathForURL(fileURL)
-
-				// Logging error
-				if err != nil {
-					slog.Error("Error while parsing the media URL", "error", err, "channel_uuid", msg.Channel().UUID())
-				}
-				payload.Document = mediaPayload
-				payloads = append(payloads, payload)
-			} else if strings.HasPrefix(mimeType, "image") {
-				payload := mtImagePayload{
-					recipient: rcpt,
-					Type:      "image",
-				}
-				if attachmentCount == 0 && !isInteractiveMsg {
-					mediaPayload.Caption = msg.Text()
-					textAsCaption = true
-				}
-				payload.Image = mediaPayload
-				payloads = append(payloads, payload)
-			} else if strings.HasPrefix(mimeType, "video") {
-				payload := mtVideoPayload{
-					recipient: rcpt,
-					Type:      "video",
-				}
-				if attachmentCount == 0 && !isInteractiveMsg {
-					mediaPayload.Caption = msg.Text()
-					textAsCaption = true
-				}
-				payload.Video = mediaPayload
-				payloads = append(payloads, payload)
-			} else {
-				clog.Error(courier.ErrorMediaUnsupported(mimeType))
-				break
-			}
-		}
-
-		if !textAsCaption && !isInteractiveMsg {
-			for _, part := range parts {
-
-				//check if you have a link
-				var payload mtTextPayload
-				if strings.Contains(part, "https://") || strings.Contains(part, "http://") {
-					payload = mtTextPayload{
-						recipient:  rcpt,
-						Type:       "text",
-						PreviewURL: true,
-					}
-				} else {
-					payload = mtTextPayload{
-						recipient: rcpt,
-						Type:      "text",
-					}
-				}
-				payload.Text.Body = part
-				payloads = append(payloads, payload)
-			}
-		}
-
-		if isInteractiveMsg {
-			for i, part := range parts {
-				if i < (len(parts) - 1) { //if split into more than one message, the first parts will be text and the last interactive
-					payload := mtTextPayload{
-						recipient: rcpt,
-						Type:      "text",
-					}
-					payload.Text.Body = part
-					payloads = append(payloads, payload)
-
-				} else {
-					payload := mtInteractivePayload{
-						recipient: rcpt,
-						Type:      "interactive",
-					}
-
-					if len(locationQRs) > 0 {
-						payload.Interactive.Type = "location_request_message"
-						payload.Interactive.Body.Text = part
-						payload.Interactive.Action.Name = "send_location"
-						payloads = append(payloads, payload)
-
-					} else if !qrsAsList { // we show buttons
-						payload.Interactive.Type = "button"
-						payload.Interactive.Body.Text = part
-						btns := make([]mtButton, len(qrs))
-						for btnIdx, qr := range qrs {
-							btns[btnIdx] = mtButton{
-								Type: "reply",
-							}
-							btns[btnIdx].Reply.ID = fmt.Sprint(btnIdx)
-							btns[btnIdx].Reply.Title = qr.Text
-						}
-						payload.Interactive.Action.Buttons = btns
-						payloads = append(payloads, payload)
-					} else {
-						payload.Interactive.Type = "list"
-						payload.Interactive.Body.Text = part
-						payload.Interactive.Action.Button = "Menu"
-						section := mtSection{
-							Rows: make([]mtSectionRow, len(qrs)),
-						}
-						for rowIdx, qr := range qrs {
-							section.Rows[rowIdx] = mtSectionRow{
-								ID:          fmt.Sprint(rowIdx),
-								Title:       qr.Text,
-								Description: qr.Extra,
-							}
-						}
-						payload.Interactive.Action.Sections = []mtSection{
-							section,
-						}
-						payloads = append(payloads, payload)
-					}
-				}
-			}
-		}
-
-	} else {
-		// do we have a template?
-		if msg.Templating() != nil {
-			langCode := getSupportedLanguage(msg.Locale())
-			namespace := msg.Templating().Namespace
-			if namespace == "" {
-				namespace = msg.Channel().StringConfigForKey(configNamespace, "")
-			}
-			if namespace == "" {
-				return nil, fmt.Errorf("cannot send template message without Facebook namespace for channel: %s", msg.Channel().UUID())
-			}
-
-			payload := templatePayload{
-				recipient: rcpt,
-				Type:      "template",
-			}
-			payload.Template.Namespace = namespace
-			payload.Template.Name = msg.Templating().Template.Name
-			payload.Template.Language.Policy = "deterministic"
-			payload.Template.Language.Code = langCode
-
-			for _, comp := range msg.Templating().Components {
-				// get the variables used by this component in order of their names 1, 2 etc
-				compParams := make([]models.TemplatingVariable, 0, len(comp.Variables))
-
-				for _, varName := range slices.SortedFunc(maps.Keys(comp.Variables), func(a, b string) int {
-					ai, _ := strconv.Atoi(a)
-					bi, _ := strconv.Atoi(b)
-					return cmp.Compare(ai, bi)
-				}) {
-					compParams = append(compParams, msg.Templating().Variables[comp.Variables[varName]])
-				}
-
-				if comp.Type == "body" || strings.HasPrefix(comp.Type, "body/") {
-					component := &Component{Type: "body"}
-					for _, p := range compParams {
-						component.Parameters = append(component.Parameters, Param{Type: p.Type, Text: p.Value})
-					}
-					payload.Template.Components = append(payload.Template.Components, *component)
-
-				}
-
-			}
-
-			payloads = append(payloads, payload)
-
-		} else {
-
-			if isInteractiveMsg {
-				for i, part := range parts {
-					if i < (len(parts) - 1) { //if split into more than one message, the first parts will be text and the last interactive
-						payload := mtTextPayload{
-							recipient: rcpt,
-							Type:      "text",
-						}
-						payload.Text.Body = part
-						payloads = append(payloads, payload)
-
-					} else {
-						payload := mtInteractivePayload{
-							recipient: rcpt,
-							Type:      "interactive",
-						}
-
-						if len(locationQRs) > 0 {
-							payload.Interactive.Type = "location_request_message"
-							payload.Interactive.Body.Text = part
-							payload.Interactive.Action.Name = "send_location"
-							payloads = append(payloads, payload)
-
-						} else if !qrsAsList { // we show buttons
-							payload.Interactive.Type = "button"
-							payload.Interactive.Body.Text = part
-							btns := make([]mtButton, len(qrs))
-							for i, qr := range qrs {
-								btns[i] = mtButton{
-									Type: "reply",
-								}
-								btns[i].Reply.ID = fmt.Sprint(i)
-								btns[i].Reply.Title = qr.Text
-							}
-							payload.Interactive.Action.Buttons = btns
-							payloads = append(payloads, payload)
-						} else {
-							payload.Interactive.Type = "list"
-							payload.Interactive.Body.Text = part
-							payload.Interactive.Action.Button = "Menu"
-							section := mtSection{
-								Rows: make([]mtSectionRow, len(qrs)),
-							}
-							for i, qr := range qrs {
-								section.Rows[i] = mtSectionRow{
-									ID:          fmt.Sprint(i),
-									Title:       qr.Text,
-									Description: qr.Extra,
-								}
-							}
-							payload.Interactive.Action.Sections = []mtSection{
-								section,
-							}
-							payloads = append(payloads, payload)
-						}
-					}
-				}
-			} else {
-				for _, part := range parts {
-
-					// check if you have a link
-					var payload mtTextPayload
-					if strings.Contains(part, "https://") || strings.Contains(part, "http://") {
-						payload = mtTextPayload{
-							recipient:  rcpt,
-							Type:       "text",
-							PreviewURL: true,
-						}
-					} else {
-						payload = mtTextPayload{
-							recipient: rcpt,
-							Type:      "text",
-						}
-					}
-					payload.Text.Body = part
-					payloads = append(payloads, payload)
-				}
-			}
-		}
+	requests, err := whatsapp.GetMsgPayloads(ctx, msg, maxMsgLength, clog)
+	if err != nil {
+		return nil, err
 	}
-	return payloads, err
+
+	payloads := make([]any, 0, len(requests))
+	for _, request := range requests {
+		payload, err := h.convertPayload(ctx, msg, rcpt, request, clog)
+		if err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, payload)
+	}
+	return payloads, nil
+}
+
+// convertPayload converts a Cloud API style send request from the shared payload builder into this API's format:
+// media messages must reference media uploaded to /v1/media by id - unlike template headers and interactive
+// headers, they can't carry a link - and URL previews are a top level field.
+func (h *handler) convertPayload(ctx context.Context, msg *models.MsgOut, rcpt recipient, request whatsapp.SendRequest, clog *models.ChannelLog) (any, error) {
+	switch request.Type {
+	case "text":
+		payload := mtTextPayload{recipient: rcpt, Type: "text", PreviewURL: request.Text.PreviewURL}
+		payload.Text.Body = request.Text.Body
+		return payload, nil
+
+	case "image", "audio", "video", "document":
+		var media *whatsapp.Media
+		switch request.Type {
+		case "image":
+			media = request.Image
+		case "audio":
+			media = request.Audio
+		case "video":
+			media = request.Video
+		case "document":
+			media = request.Document
+		}
+
+		mediaID, err := h.fetchMediaID(ctx, msg, media.Link, clog)
+		if err != nil {
+			slog.Error("error while uploading media to whatsapp", "error", err, "channel_uuid", msg.Channel().UUID())
+		}
+		if mediaID == "" {
+			return nil, channels.ErrRetryableWithReason("media_upload_failed", "unable to upload media to WhatsApp")
+		}
+
+		object := &mediaObject{ID: mediaID, Caption: media.Caption, Filename: media.Filename}
+		switch request.Type {
+		case "image":
+			return mtImagePayload{recipient: rcpt, Type: "image", Image: object}, nil
+		case "audio":
+			return mtAudioPayload{recipient: rcpt, Type: "audio", Audio: object}, nil
+		case "video":
+			return mtVideoPayload{recipient: rcpt, Type: "video", Video: object}, nil
+		default:
+			return mtDocumentPayload{recipient: rcpt, Type: "document", Document: object}, nil
+		}
+
+	case "interactive":
+		return mtInteractivePayload{recipient: rcpt, Type: "interactive", Interactive: request.Interactive}, nil
+	}
+
+	return nil, fmt.Errorf("unsupported payload type: %s", request.Type)
 }
 
 // fetchMediaID tries to fetch the id for the uploaded media, setting the result in redis.
-func (h *handler) fetchMediaID(ctx context.Context, msg courier.MsgOut, mediaURL string, clog *courier.ChannelLog) (string, error) {
+func (h *handler) fetchMediaID(ctx context.Context, msg *models.MsgOut, mediaURL string, clog *models.ChannelLog) (string, error) {
 	// check in cache first
 	cacheKey := fmt.Sprintf(mediaCacheKeyPattern, msg.Channel().UUID())
 	mediaCache := vkutil.NewIntervalHash(cacheKey, time.Hour*24, 2)
@@ -805,10 +572,9 @@ func (h *handler) fetchMediaID(ctx context.Context, msg courier.MsgOut, mediaURL
 
 	// check in failure cache
 	failKey := fmt.Sprintf("%s-%s", msg.Channel().UUID(), mediaURL)
-	found, _ := failedMediaCache.Get(failKey)
 
-	// any non nil value means we cached a failure, don't try again until our cache expires
-	if found != nil {
+	// if we cached a failure, don't try again until our cache expires
+	if failedMediaCache.Get(failKey) {
 		return "", nil
 	}
 
@@ -820,7 +586,7 @@ func (h *handler) fetchMediaID(ctx context.Context, msg courier.MsgOut, mediaURL
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
 	if err != nil || resp.StatusCode/100 != 2 {
-		failedMediaCache.Set(failKey, true, cache.DefaultExpiration)
+		failedMediaCache.Set(failKey, true)
 		return "", nil
 	}
 
@@ -842,7 +608,7 @@ func (h *handler) fetchMediaID(ctx context.Context, msg courier.MsgOut, mediaURL
 
 	resp, respBody, err = h.RequestHTTP(req, clog)
 	if err != nil || resp.StatusCode/100 != 2 {
-		failedMediaCache.Set(failKey, true, cache.DefaultExpiration)
+		failedMediaCache.Set(failKey, true)
 		if err != nil {
 			return "", fmt.Errorf("error uploading media to whatsapp: %w", err)
 		} else {
@@ -868,18 +634,16 @@ func (h *handler) fetchMediaID(ctx context.Context, msg courier.MsgOut, mediaURL
 	return mediaID, nil
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	accessToken := msg.Channel().StringConfigForKey(models.ConfigAuthToken, "")
 	urlStr := msg.Channel().StringConfigForKey(models.ConfigBaseURL, "")
 	url, err := url.Parse(urlStr)
 	if accessToken == "" || err != nil {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 	sendURL, _ := url.Parse("/v1/messages")
 
-	requestPayloads, err := buildPayloads(ctx, msg, h, clog)
-
-	//requestPayloads, err := whatsapp.GetMsgPayloads(ctx, msg, maxMsgLength, clog)
+	requestPayloads, err := h.buildPayloads(ctx, msg, clog)
 	if err != nil {
 		return err
 	}
@@ -915,7 +679,7 @@ type mtResponsePayload struct {
 	} `json:"error"`
 }
 
-func (h *handler) makeAPIRequest(payload any, accessToken string, res *courier.SendResult, wacPhoneURL *url.URL, clog *courier.ChannelLog) error {
+func (h *handler) makeAPIRequest(payload any, accessToken string, res *channels.SendResult, wacPhoneURL *url.URL, clog *models.ChannelLog) error {
 	jsonBody := jsonx.MustMarshal(payload)
 
 	req, err := http.NewRequest(http.MethodPost, wacPhoneURL.String(), bytes.NewReader(jsonBody))
@@ -929,35 +693,41 @@ func (h *handler) makeAPIRequest(payload any, accessToken string, res *courier.S
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
 	if err != nil || resp.StatusCode/100 == 5 {
-		return courier.ErrConnectionFailed
+		return channels.ErrConnectionFailed
+	}
+	// Turn returns HTTP 429 with its own rate-limit payload (errors[].code=429) and
+	// Retry-After / X-Ratelimit-* headers. Treat that as throttled so the message is
+	// retried via the errored queue rather than permanently failed.
+	if handlers.IsThrottled(resp) {
+		return channels.ErrConnectionThrottled
 	}
 
 	respPayload := &mtResponsePayload{}
 	err = json.Unmarshal(respBody, respPayload)
 	if err != nil {
-		return courier.ErrResponseUnparseable
+		return channels.ErrResponseUnparseable
 	}
 
-	if slices.Contains(whatsapp.WACThrottlingErrorCodes, respPayload.Error.Code) {
-		return courier.ErrConnectionThrottled
+	if respPayload.Error.Code == 429 || slices.Contains(whatsapp.WACThrottlingErrorCodes, respPayload.Error.Code) {
+		return channels.ErrConnectionThrottled
 	}
 
 	if slices.Contains(whatsapp.WACRetryableErrorCodes, respPayload.Error.Code) {
-		return courier.ErrRetryableWithReason(strconv.Itoa(respPayload.Error.Code), respPayload.Error.Message)
+		return channels.ErrRetryableWithReason(strconv.Itoa(respPayload.Error.Code), respPayload.Error.Message)
 	}
 
 	if respPayload.Error.Code != 0 || respPayload.Error.Message != "" {
-		return courier.ErrFailedWithReason(strconv.Itoa(respPayload.Error.Code), respPayload.Error.Message)
+		return channels.ErrFailedWithReason(strconv.Itoa(respPayload.Error.Code), respPayload.Error.Message)
 	}
 
 	if len(respPayload.Errors) > 0 {
-		if slices.Contains(whatsapp.WACThrottlingErrorCodes, respPayload.Errors[0].Code) {
-			return courier.ErrConnectionThrottled
+		if respPayload.Errors[0].Code == 429 || slices.Contains(whatsapp.WACThrottlingErrorCodes, respPayload.Errors[0].Code) {
+			return channels.ErrConnectionThrottled
 		}
 		if slices.Contains(whatsapp.WACRetryableErrorCodes, respPayload.Errors[0].Code) {
-			return courier.ErrRetryableWithReason(strconv.Itoa(respPayload.Errors[0].Code), respPayload.Errors[0].Title)
+			return channels.ErrRetryableWithReason(strconv.Itoa(respPayload.Errors[0].Code), respPayload.Errors[0].Title)
 		}
-		return courier.ErrFailedWithReason(strconv.Itoa(respPayload.Errors[0].Code), respPayload.Errors[0].Title)
+		return channels.ErrFailedWithReason(strconv.Itoa(respPayload.Errors[0].Code), respPayload.Errors[0].Title)
 	}
 
 	if len(respPayload.Messages) > 0 {

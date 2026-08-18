@@ -10,11 +10,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 )
 
@@ -125,6 +127,75 @@ var defaultSendTestCases = []OutgoingTestCase{
 		}},
 	},
 	{
+		Label:           "Quick Reply, unsupported types ignored",
+		MsgText:         "Are you happy?",
+		MsgURN:          "viber:xy5/5y6O81+/kbWHpLhBoA==",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Extra: "1234"}, {Type: "text", Text: "Yes"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://chatapi.viber.com/pa/send_message": {
+				httpx.NewMockResponse(200, nil, []byte(`{"status":0,"status_message":"ok","message_token":4987381194038857789}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
+			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Are you happy?","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b","keyboard":{"Type":"keyboard","DefaultHeight":false,"Buttons":[{"ActionType":"reply","ActionBody":"Yes","Text":"Yes","TextSize":"regular","Columns":"6"}]}}`,
+		}},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type form isn't supported by this channel and can't be sent"},
+		},
+	},
+	{
+		Label:           "Quick Reply, URL Type",
+		MsgText:         "Read more?",
+		MsgURN:          "viber:xy5/5y6O81+/kbWHpLhBoA==",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit", Extra: "http://example.com"}, {Type: "text", Text: "No"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://chatapi.viber.com/pa/send_message": {
+				httpx.NewMockResponse(200, nil, []byte(`{"status":0,"status_message":"ok","message_token":4987381194038857789}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
+			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Read more?","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b","keyboard":{"Type":"keyboard","DefaultHeight":false,"Buttons":[{"ActionType":"open-url","ActionBody":"http://example.com","Text":"Visit","TextSize":"regular","Columns":"3"},{"ActionType":"reply","ActionBody":"No","Text":"No","TextSize":"regular","Columns":"3"}]}}`,
+		}},
+	},
+	{
+		Label:           "Quick Reply, URL Type without a URL is dropped",
+		MsgText:         "Are you happy?",
+		MsgURN:          "viber:xy5/5y6O81+/kbWHpLhBoA==",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit"}, {Type: "text", Text: "Yes"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://chatapi.viber.com/pa/send_message": {
+				httpx.NewMockResponse(200, nil, []byte(`{"status":0,"status_message":"ok","message_token":4987381194038857789}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
+			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Are you happy?","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b","keyboard":{"Type":"keyboard","DefaultHeight":false,"Buttons":[{"ActionType":"reply","ActionBody":"Yes","Text":"Yes","TextSize":"regular","Columns":"6"}]}}`,
+		}},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type url is missing its extra value and can't be sent"},
+		},
+	},
+	{
+		Label:           "Quick Reply, only unsupported types means no keyboard",
+		MsgText:         "Are you happy?",
+		MsgURN:          "viber:xy5/5y6O81+/kbWHpLhBoA==",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Extra: "1234"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://chatapi.viber.com/pa/send_message": {
+				httpx.NewMockResponse(200, nil, []byte(`{"status":0,"status_message":"ok","message_token":4987381194038857789}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
+			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Are you happy?","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b"}`,
+		}},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type form isn't supported by this channel and can't be sent"},
+		},
+	},
+	{
 		Label:          "Send Attachment",
 		MsgText:        "My pic!",
 		MsgURN:         "viber:xy5/5y6O81+/kbWHpLhBoA==",
@@ -233,7 +304,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
 			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Simple Message","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b"}`,
 		}},
-		ExpectedError: courier.ErrFailedWithReason("3", "There is an error in the request itself (missing comma, brackets, etc.)"),
+		ExpectedError: channels.ErrFailedWithReason("3", "There is an error in the request itself (missing comma, brackets, etc.)"),
 	},
 	{
 		Label:   "Got general error response",
@@ -249,7 +320,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Simple Message","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b"}`,
 		}},
 
-		ExpectedError: courier.ErrFailedWithReason("99", "General error"),
+		ExpectedError: channels.ErrFailedWithReason("99", "General error"),
 	},
 	{
 		Label:   "Got Invalid JSON response",
@@ -264,7 +335,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
 			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Simple Message","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b"}`,
 		}},
-		ExpectedError: courier.ErrResponseUnparseable,
+		ExpectedError: channels.ErrResponseUnparseable,
 	},
 	{
 		Label:   "Error Sending",
@@ -279,14 +350,29 @@ var defaultSendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
 			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Error Message","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b"}`,
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Message",
+		MsgURN:  "viber:xy5/5y6O81+/kbWHpLhBoA==",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://chatapi.viber.com/pa/send_message": {
+				httpx.NewMockResponse(429, nil, []byte(`{"status":"5"}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
+			Body:    `{"auth_token":"Token","receiver":"xy5/5y6O81+/kbWHpLhBoA==","text":"Error Message","type":"text","tracking_data":"0191e180-7d60-7000-aded-7d8b151cbd5b"}`,
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 }
 
 var invalidTokenSendTestCases = []OutgoingTestCase{
 	{
 		Label:         "Invalid token",
-		ExpectedError: courier.ErrChannelConfig,
+		ExpectedError: channels.ErrChannelConfig,
 	},
 }
 
@@ -333,13 +419,13 @@ func TestOutgoing(t *testing.T) {
 	RunOutgoingTestCases(t, buttonLayoutChannel, newHandler(), buttonLayoutSendTestCases, []string{"Token"}, nil)
 }
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "VP", "2020", "", []string{urns.Viber.Prefix}, map[string]any{
 		models.ConfigAuthToken: "Token",
 	}),
 }
 
-var testChannelsWithWelcomeMessage = []courier.Channel{
+var testChannelsWithWelcomeMessage = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "VP", "2020", "", []string{urns.Viber.Prefix}, map[string]any{
 		models.ConfigAuthToken:    "Token",
 		configViberWelcomeMessage: "Welcome to VP, Please subscribe here for more.",
@@ -691,7 +777,7 @@ var testWelcomeMessageCases = []IncomingTestCase{
 		URL:                  receiveURL,
 		Data:                 validConversationStarted,
 		ExpectedRespStatus:   200,
-		ExpectedBodyContains: `{"auth_token":"Token","text":"Welcome to VP, Please subscribe here for more.","type":"text","tracking_data":"0199dd4c-8a88-7000-95b3-58675999c4b7"}`,
+		ExpectedBodyContains: `{"auth_token":"Token","text":"Welcome to VP, Please subscribe here for more.","type":"text","tracking_data":"0199dd4c-9a28-7000-9955-f9b28b006b78"}`,
 		ExpectedEvents: []ExpectedEvent{
 			{Type: models.EventTypeWelcomeMessage, URN: "viber:xy5/5y6O81+/kbWHpLhBoA=="},
 		},

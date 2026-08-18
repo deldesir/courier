@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/jsonx"
@@ -27,19 +27,18 @@ type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("JCL"), "JustCall")}
 }
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
-// Initialize implements courier.ChannelHandler
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	s.AddHandlerRoute(h, http.MethodPost, "status", courier.ChannelLogTypeMsgStatus, handlers.JSONPayload(h, h.statusMessage))
+// Initialize implements channels.Handler
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
+	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, handlers.JSONPayload(h, h.statusMessage))
 	return nil
 }
 
@@ -95,7 +94,7 @@ type moPayload struct {
 	} `json:"data"`
 }
 
-func (h *handler) receiveMessage(ctx context.Context, c courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	if payload.Data.Type != "sms" || payload.Data.Direction != "I" {
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "Ignoring request, no message")
 	}
@@ -117,14 +116,14 @@ func (h *handler) receiveMessage(ctx context.Context, c courier.Channel, w http.
 	}
 
 	// build our msg
-	msg := h.Backend().NewIncomingMsg(ctx, c, urn, payload.Data.Content, fmt.Sprint(payload.Data.MessageID), clog).WithReceivedOn(date)
+	msg := models.NewIncomingMsg(c, urn, payload.Data.Content, fmt.Sprint(payload.Data.MessageID), clog).WithReceivedOn(date)
 
 	if len(payload.Data.MMS) > 0 {
 		msg.WithAttachment(payload.Data.MMS[0].MediaURL)
 	}
 
 	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -134,7 +133,7 @@ var statusMapping = map[string]models.MsgStatus{
 	"failed":      models.MsgStatusFailed,
 }
 
-func (h *handler) statusMessage(ctx context.Context, c courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) statusMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	if payload.Data.Type != "sms" || payload.Data.Direction != "O" {
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "Ignoring request, no message")
 	}
@@ -144,7 +143,7 @@ func (h *handler) statusMessage(ctx context.Context, c courier.Channel, w http.R
 		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("unknown status '%s', must be one of send, delivered, undelivered, failed", payload.Data.Status))
 	}
 	// write our status
-	status := h.Backend().NewStatusUpdateByExternalID(c, fmt.Sprint(payload.Data.MessageID), msgStatus, clog)
+	status := models.NewStatusUpdateByExternalID(c, fmt.Sprint(payload.Data.MessageID), msgStatus, clog)
 	return handlers.WriteMsgStatusAndResponse(ctx, h, c, status, w, r)
 }
 
@@ -155,11 +154,11 @@ type mtPayload struct {
 	MediaURL string `json:"media_url,omitempty"`
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	apiKey := msg.Channel().StringConfigForKey(models.ConfigAPIKey, "")
 	apiSecret := msg.Channel().StringConfigForKey(models.ConfigSecret, "")
 	if apiKey == "" || apiSecret == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	mediaURLs := make([]string, 0, 5)
@@ -189,24 +188,22 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	req.Header.Set("Authorization", fmt.Sprintf("%s:%s", apiKey, apiSecret))
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
-	if err != nil || resp.StatusCode/100 == 5 {
-		return courier.ErrConnectionFailed
-	} else if resp.StatusCode/100 != 2 {
-		return courier.ErrResponseStatus
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
 	}
 
 	respStatus, err := jsonparser.GetString(respBody, "status")
 	if err != nil {
-		clog.Error(courier.ErrorResponseValueMissing("status"))
+		clog.Error(models.ErrorResponseValueMissing("status"))
 	}
 	if respStatus != "success" {
-		return courier.ErrResponseContent
+		return channels.ErrResponseContent
 
 	}
 
 	externalID, err := jsonparser.GetInt(respBody, "id")
 	if err != nil {
-		clog.Error(courier.ErrorResponseValueMissing("id"))
+		clog.Error(models.ErrorResponseValueMissing("id"))
 	} else {
 		res.AddExternalID(strconv.Itoa(int(externalID)))
 	}

@@ -5,9 +5,9 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
@@ -18,7 +18,7 @@ const (
 	statusURL  = "/c/js/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status/"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "JS", "2020", "US", []string{urns.Phone.Prefix}, nil),
 }
 
@@ -226,7 +226,33 @@ var defaultSendTestCases = []OutgoingTestCase{
 				"dlr-url":    {"https://localhost/c/js/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status"},
 			},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:           "Throttled",
+		MsgText:         "Error Message",
+		MsgURN:          "tel:+250788383383",
+		MsgHighPriority: false,
+		MockResponses: map[string][]*httpx.MockResponse{
+			"http://example.com/send*": {
+				httpx.NewMockResponse(429, nil, []byte(`Failed Sending`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Params: url.Values{
+				"content":    {"Error Message"},
+				"to":         {"250788383383"},
+				"from":       {"2020"},
+				"coding":     {"0"},
+				"dlr-level":  {"2"},
+				"dlr":        {"yes"},
+				"dlr-method": {http.MethodPost},
+				"username":   {"Username"},
+				"password":   {"Password"},
+				"dlr-url":    {"https://localhost/c/js/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status"},
+			},
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 }
 

@@ -4,12 +4,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
-	"github.com/nyaruka/courier/v26/utils/clogs"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/stretchr/testify/assert"
 )
@@ -231,12 +232,12 @@ var incomingCases = []IncomingTestCase{
 		ExpectedRespStatus:   200,
 		ExpectedBodyContains: `"status":"F"`,
 		ExpectedStatuses:     []ExpectedStatus{{ExternalID: "14762070468292kw2fuqty55yp2b2", Status: models.MsgStatusFailed}},
-		ExpectedErrors:       []*clogs.Error{courier.ErrorExternal("4432", "forbidden to country")},
+		ExpectedErrors:       []*svclogs.Error{models.ErrorExternal("4432", "forbidden to country")},
 	},
 }
 
 func TestIncoming(t *testing.T) {
-	chs := []courier.Channel{
+	chs := []*models.Channel{
 		test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "BW", "2020", "US",
 			[]string{urns.Phone.Prefix},
 			map[string]any{models.ConfigUsername: "user1", models.ConfigPassword: "pass1", configAccountID: "accound-id", configMsgApplicationID: "application-id"},
@@ -351,7 +352,28 @@ var outgoingCases = []OutgoingTestCase{
 				Body: `{"applicationId":"application-id","to":["+12067791234"],"from":"2020","text":"Error Message"}`,
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("request-validation", "Your request could not be accepted"),
+		ExpectedError: channels.ErrFailedWithReason("request-validation", "Your request could not be accepted"),
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Message",
+		MsgURN:  "tel:+12067791234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://messaging.bandwidth.com/api/v2/users/accound-id/messages": {
+				httpx.NewMockResponse(429, nil, []byte(`{ "type": "request-validation", "description": "Your request could not be accepted" }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Headers: map[string]string{
+					"Content-Type":  "application/json",
+					"Accept":        "application/json",
+					"Authorization": "Basic dXNlcjE6cGFzczE=",
+				},
+				Body: `{"applicationId":"application-id","to":["+12067791234"],"from":"2020","text":"Error Message"}`,
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 }
 

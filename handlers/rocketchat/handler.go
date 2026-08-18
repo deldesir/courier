@@ -8,7 +8,7 @@ import (
 	"net/http"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/jsonx"
@@ -24,21 +24,20 @@ const (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("RC"), "RocketChat")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
 	return nil
 }
 
@@ -58,11 +57,11 @@ type moPayload struct {
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	// check authorization
 	secret := channel.StringConfigForKey(configSecret, "")
 	if fmt.Sprintf("Token %s", secret) != r.Header.Get("Authorization") {
-		return nil, courier.WriteAndLogUnauthorized(w, r, channel, fmt.Errorf("invalid Authorization header"))
+		return nil, channels.WriteAndLogUnauthorized(w, r, channel, fmt.Errorf("invalid Authorization header"))
 	}
 
 	// check content empty
@@ -75,16 +74,16 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
 	}
 
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, payload.Text, "", clog).WithContactName(payload.User.FullName)
+	msg := models.NewIncomingMsg(channel, urn, payload.Text, "", clog).WithContactName(payload.User.FullName)
 	for _, attachment := range payload.Attachments {
 		msg.WithAttachment(attachment.URL)
 	}
 
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 }
 
 // BuildAttachmentRequest download media for message attachment with RC auth_token/user_id set
-func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Channel, attachmentURL string, clog *courier.ChannelLog) (*http.Request, error) {
+func (h *handler) BuildAttachmentRequest(ctx context.Context, channel *models.Channel, attachmentURL string, clog *models.ChannelLog) (*http.Request, error) {
 	adminAuthToken := channel.StringConfigForKey(configAdminAuthToken, "")
 	adminUserID := channel.StringConfigForKey(configAdminUserID, "")
 	if adminAuthToken == "" || adminUserID == "" {
@@ -97,7 +96,7 @@ func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Ch
 	return req, nil
 }
 
-var _ courier.AttachmentRequestBuilder = (*handler)(nil)
+var _ channels.AttachmentRequestBuilder = (*handler)(nil)
 
 type mtPayload struct {
 	UserURN     string         `json:"user"`
@@ -106,12 +105,12 @@ type mtPayload struct {
 	Attachments []RCAttachment `json:"attachments,omitempty"`
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	baseURL := msg.Channel().StringConfigForKey(configBaseURL, "")
 	secret := msg.Channel().StringConfigForKey(configSecret, "")
 	botUsername := msg.Channel().StringConfigForKey(configBotUsername, "")
 	if baseURL == "" || secret == "" || botUsername == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 	payload := &mtPayload{
 		UserURN:     msg.URN().Path(),
@@ -133,15 +132,13 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	req.Header.Set("Authorization", fmt.Sprintf("Token %s", secret))
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
-	if err != nil || resp.StatusCode/100 == 5 {
-		return courier.ErrConnectionFailed
-	} else if resp.StatusCode/100 != 2 {
-		return courier.ErrResponseStatus
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
 	}
 
 	msgID, err := jsonparser.GetString(respBody, "id")
 	if err != nil {
-		return courier.ErrResponseContent
+		return channels.ErrResponseContent
 	}
 	res.AddExternalID(msgID)
 

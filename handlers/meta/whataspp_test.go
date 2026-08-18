@@ -5,19 +5,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
-	"github.com/nyaruka/courier/v26/utils/clogs"
+	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
 	"github.com/stretchr/testify/assert"
 )
 
-var whatsappTestChannels = []courier.Channel{
-	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c568c", "WAC", "12345", "", []string{urns.WhatsApp.Prefix}, map[string]any{models.ConfigAuthToken: "a123"}),
+var whatsappTestChannels = []*models.Channel{
+	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c568c", "WAC", "1234567890", "", []string{urns.WhatsApp.Prefix}, map[string]any{models.ConfigAuthToken: "a123"}),
 }
 
 var whatappReceiveURL = "/c/wac/receive"
@@ -29,7 +33,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/hello.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Hello World"),
 		ExpectedURN:           "whatsapp:5678",
@@ -43,14 +46,63 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/hello_user_id.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Hello World"),
 		ExpectedURN:           "whatsapp:5678",
 		ExpectedExternalID:    "external_id",
 		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
-		ExpectedNewURN:        &models.NewURNSpec{Value: "bsuid:US.1234", Action: models.NewURNAppend},
+		ExpectedNewURN:        &models.NewURNSpec{Value: "whatsapp:US.1234", Action: models.NewURNAppend},
 		PrepRequest:           addValidSignature,
+	},
+	{
+		Label:                 "Receive Message WAC with invalid user_id, no new URN added",
+		URL:                   whatappReceiveURL,
+		Data:                  string(test.ReadFile("./testdata/wac/hello_invalid_user_id.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Hello World"),
+		ExpectedURN:           "whatsapp:5678",
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+		ExpectedNewURN:        nil,
+		PrepRequest:           addValidSignature,
+	},
+	{
+		Label:                 "Receive Message WAC from BSUID with no phone",
+		URL:                   whatappReceiveURL,
+		Data:                  string(test.ReadFile("./testdata/wac/hello_from_bsuid.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Hello World"),
+		ExpectedURN:           "whatsapp:US.1234",
+		ExpectedContactName:   Sp("Kerry Fisher"),
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+		PrepRequest:           addValidSignature,
+	},
+	{
+		Label:                 "Receive Message WAC with BSUID in from",
+		URL:                   whatappReceiveURL,
+		Data:                  string(test.ReadFile("./testdata/wac/hello_bsuid_in_from.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Hello World"),
+		ExpectedURN:           "whatsapp:US.1234",
+		ExpectedContactName:   Sp("Kerry Fisher"),
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+		PrepRequest:           addValidSignature,
+	},
+	{
+		Label:                "Receive Message WAC with no from or from_user_id",
+		URL:                  whatappReceiveURL,
+		Data:                 string(test.ReadFile("./testdata/wac/no_from.json")),
+		ExpectedRespStatus:   200,
+		ExpectedBodyContains: "invalid whatsapp id",
+		PrepRequest:          addValidSignature,
 	},
 	{
 		Label:                 "Receive Duplicate Valid Message",
@@ -58,7 +110,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/duplicate.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Hello World"),
 		ExpectedURN:           "whatsapp:5678",
@@ -72,7 +123,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/voice.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp(""),
 		ExpectedURN:           "whatsapp:5678",
@@ -87,7 +137,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/button.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("No"),
 		ExpectedURN:           "whatsapp:5678",
@@ -101,7 +150,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/document.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("80skaraokesonglistartist"),
 		ExpectedURN:           "whatsapp:5678",
@@ -116,7 +164,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/image.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Check out my new phone!"),
 		ExpectedURN:           "whatsapp:5678",
@@ -131,7 +178,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/video.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Check out my new phone!"),
 		ExpectedURN:           "whatsapp:5678",
@@ -146,7 +192,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/audio.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Check out my new phone!"),
 		ExpectedURN:           "whatsapp:5678",
@@ -207,7 +252,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/hello.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "invalid request signature",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		PrepRequest:           addInvalidSignature,
 	},
@@ -217,7 +261,7 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/error_msg.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		ExpectedErrors:        []*clogs.Error{courier.ErrorExternal("131051", "Unsupported message type")},
+		ExpectedErrors:        []*svclogs.Error{models.ErrorExternal("131051", "Unsupported message type")},
 		NoInvalidChannelCheck: true,
 		PrepRequest:           addValidSignature,
 	},
@@ -227,7 +271,7 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/error_errors.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		ExpectedErrors:        []*clogs.Error{courier.ErrorExternal("0", "We were unable to authenticate the app user")},
+		ExpectedErrors:        []*svclogs.Error{models.ErrorExternal("0", "We were unable to authenticate the app user")},
 		NoInvalidChannelCheck: true,
 		PrepRequest:           addValidSignature,
 	},
@@ -251,8 +295,8 @@ var whatsappIncomingTests = []IncomingTestCase{
 		ExpectedStatuses: []ExpectedStatus{
 			{ExternalID: "external_id", Status: models.MsgStatusFailed},
 		},
-		ExpectedErrors: []*clogs.Error{
-			courier.ErrorExternal("131014", "Request for url https://URL.jpg failed with error: 404 (Not Found)"),
+		ExpectedErrors: []*svclogs.Error{
+			models.ErrorExternal("131014", "Request for url https://URL.jpg failed with error: 404 (Not Found)"),
 		},
 		PrepRequest: addValidSignature,
 	},
@@ -278,7 +322,6 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/button_reply.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Yes"),
 		ExpectedURN:           "whatsapp:5678",
@@ -292,9 +335,35 @@ var whatsappIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/wac/list_reply.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Yes"),
+		ExpectedURN:           "whatsapp:5678",
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+		PrepRequest:           addValidSignature,
+	},
+	{
+		Label:                 "Receive Valid Interactive Flow Reply Message",
+		URL:                   whatappReceiveURL,
+		Data:                  string(test.ReadFile("./testdata/wac/nfm_reply.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Sent"),
+		ExpectedPayload:       `{"flow_token": "fl0w+t0k3n", "first_name": "Bob", "age": "32"}`,
+		ExpectedURN:           "whatsapp:5678",
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+		PrepRequest:           addValidSignature,
+	},
+	{
+		Label:                 "Receive Interactive Flow Reply Message With Non-Object Response JSON",
+		URL:                   whatappReceiveURL,
+		Data:                  string(test.ReadFile("./testdata/wac/nfm_reply_non_object.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Sent"),
 		ExpectedURN:           "whatsapp:5678",
 		ExpectedExternalID:    "external_id",
 		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
@@ -344,6 +413,23 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 		ExpectedExtIDs: []string{"157b5e14568e8"},
 	},
 	{
+		Label:   "Plain Send with BSUID as whatsapp URN",
+		MsgText: "Simple Message",
+		MsgURN:  "whatsapp:US.1234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Path: "/12345_ID/messages",
+				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","recipient":"US.1234","type":"text","text":{"body":"Simple Message","preview_url":false}}`,
+			},
+		},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
+	},
+	{
 		Label:   "Plain Send with user_id in response",
 		MsgText: "Simple Message",
 		MsgURN:  "whatsapp:250788123123",
@@ -353,19 +439,27 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 			},
 		},
 		ExpectedExtIDs: []string{"157b5e14568e8"},
-		ExpectedContactURNs: map[string]bool{
-			"whatsapp:250788123123": true,
-			"bsuid:US.1234":         true,
-		},
+		ExpectedNewURN: "whatsapp:US.1234",
 	},
 	{
 		Label:               "Plain Send with user_id already on contact",
 		MsgText:             "Simple Message",
 		MsgURN:              "whatsapp:250788123123",
-		MsgContactOtherURNs: []urns.URN{"bsuid:US.1234"},
+		MsgContactOtherURNs: []urns.URN{"whatsapp:US.1234"},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"*/12345_ID/messages": {
 				httpx.NewMockResponse(201, nil, []byte(`{ "contacts": [{"input": "250788123123", "user_id": "US.1234"}], "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
+	},
+	{
+		Label:   "Send to BSUID with same user_id in response",
+		MsgText: "Simple Message",
+		MsgURN:  "whatsapp:US.1234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "contacts": [{"input": "US.1234", "user_id": "US.1234"}], "messages": [{"id": "157b5e14568e8"}] }`)),
 			},
 		},
 		ExpectedExtIDs: []string{"157b5e14568e8"},
@@ -660,7 +754,7 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"list","body":{"text":"Interactive List Msg"},"action":{"button":"Menu","sections":[{"rows":[{"id":"0","title":"ROW1"},{"id":"1","title":"ROW2"},{"id":"2","title":"ROW3"},{"id":"3","title":"ROW4"},{"id":"4","title":"ROW5"},{"id":"5","title":"ROW6"},{"id":"6","title":"ROW7"},{"id":"7","title":"ROW8"},{"id":"8","title":"ROW9"},{"id":"9","title":"ROW10"}]}]}}}`,
 		}},
 		ExpectedExtIDs:    []string{"157b5e14568e8"},
-		ExpectedLogErrors: []*clogs.Error{&clogs.Error{Message: "too many quick replies WhatsApp supports only up to 10 quick replies"}},
+		ExpectedLogErrors: []*svclogs.Error{&svclogs.Error{Message: "too many quick replies WhatsApp supports only up to 10 quick replies"}},
 	},
 	{
 		Label:           "Interactive List Message Send In Spanish",
@@ -799,7 +893,8 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"location_request_message","body":{"text":"Interactive send location"},"action":{"name":"send_location"}}}`,
 		}},
-		ExpectedExtIDs: []string{"157b5e14568e8"},
+		ExpectedExtIDs:    []string{"157b5e14568e8"},
+		ExpectedLogErrors: []*svclogs.Error{{Message: "quick reply of type text can't be combined with a location quick reply and won't be sent"}},
 	},
 	{
 		Label:           "Interactive with location request, with attachment",
@@ -818,6 +913,134 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 			{Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"location_request_message","body":{"text":"Interactive send location"},"action":{"name":"send_location"}}}`},
 		},
 		ExpectedExtIDs: []string{"157b5e14568e8", "157b5e14568e8"},
+	},
+	{
+		Label:           "Interactive with form",
+		MsgText:         "Interactive form msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Text: "Book now", Extra: "123456"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"flow","body":{"text":"Interactive form msg"},"action":{"name":"flow","parameters":{"flow_message_version":"3","flow_id":"123456","flow_cta":"Book now"}}}}`,
+		}},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
+	},
+	{
+		Label:           "Interactive with form, with extra quick replies ignored and default CTA",
+		MsgText:         "Interactive form msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Extra: "123456"}, {Type: "text", Text: "Yes"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"flow","body":{"text":"Interactive form msg"},"action":{"name":"flow","parameters":{"flow_message_version":"3","flow_id":"123456","flow_cta":"Open Form"}}}}`,
+		}},
+		ExpectedExtIDs:    []string{"157b5e14568e8"},
+		ExpectedLogErrors: []*svclogs.Error{{Message: "quick reply of type text can't be combined with a form quick reply and won't be sent"}},
+	},
+	{
+		Label:           "Interactive with form, with attachment",
+		MsgText:         "Interactive form msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Text: "Book now", Extra: "123456"}},
+		MsgAttachments:  []string{"image/jpeg:https://foo.bar/image.jpg"},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"image","image":{"link":"https://foo.bar/image.jpg"}}`},
+			{Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"flow","body":{"text":"Interactive form msg"},"action":{"name":"flow","parameters":{"flow_message_version":"3","flow_id":"123456","flow_cta":"Book now"}}}}`},
+		},
+		ExpectedExtIDs: []string{"157b5e14568e8", "157b5e14568e8"},
+	},
+	{
+		Label:           "Interactive with form missing form ID, sent as text",
+		MsgText:         "Interactive form msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Text: "Book now"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Interactive form msg","preview_url":false}}`,
+		}},
+		ExpectedExtIDs:    []string{"157b5e14568e8"},
+		ExpectedLogErrors: []*svclogs.Error{{Message: "quick reply of type form is missing its extra value and can't be sent"}},
+	},
+	{
+		Label:           "Interactive with URL button",
+		MsgText:         "Interactive URL msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit", Extra: "https://example.com"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"cta_url","body":{"text":"Interactive URL msg"},"action":{"name":"cta_url","parameters":{"display_text":"Visit","url":"https://example.com"}}}}`,
+		}},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
+	},
+	{
+		Label:           "Interactive with URL button, with extra quick replies ignored and default display text",
+		MsgText:         "Interactive URL msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Extra: "https://example.com"}, {Type: "text", Text: "Yes"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"cta_url","body":{"text":"Interactive URL msg"},"action":{"name":"cta_url","parameters":{"display_text":"Open Link","url":"https://example.com"}}}}`,
+		}},
+		ExpectedExtIDs:    []string{"157b5e14568e8"},
+		ExpectedLogErrors: []*svclogs.Error{{Message: "quick reply of type text can't be combined with a url quick reply and won't be sent"}},
+	},
+	{
+		Label:           "Interactive with URL button, with attachment",
+		MsgText:         "Interactive URL msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit", Extra: "https://example.com"}},
+		MsgAttachments:  []string{"image/jpeg:https://foo.bar/image.jpg"},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"cta_url","header":{"type":"image","image":{"link":"https://foo.bar/image.jpg"}},"body":{"text":"Interactive URL msg"},"action":{"name":"cta_url","parameters":{"display_text":"Visit","url":"https://example.com"}}}}`},
+		},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
+	},
+	{
+		Label:           "Interactive with URL button missing URL, sent as text",
+		MsgText:         "Interactive URL msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Interactive URL msg","preview_url":false}}`,
+		}},
+		ExpectedExtIDs:    []string{"157b5e14568e8"},
+		ExpectedLogErrors: []*svclogs.Error{{Message: "quick reply of type url is missing its extra value and can't be sent"}},
 	},
 	{
 		Label:   "Link Sending",
@@ -845,7 +1068,7 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 				httpx.NewMockResponse(403, nil, []byte(`bad json`)),
 			},
 		},
-		ExpectedError: courier.ErrResponseUnparseable,
+		ExpectedError: channels.ErrResponseUnparseable,
 	},
 	{
 		Label:   "Error Channel Contact Pair limit hit",
@@ -856,7 +1079,7 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 				httpx.NewMockResponse(403, nil, []byte(`{ "error": {"message": "(#131056) (Business Account, Consumer Account) pair rate limit hit","code": 131056 }}`)),
 			},
 		},
-		ExpectedError: courier.ErrConnectionThrottled,
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Error Throttled",
@@ -867,7 +1090,18 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 				httpx.NewMockResponse(403, nil, []byte(`{ "error": {"message": "(#130429) Rate limit hit","code": 130429 }}`)),
 			},
 		},
-		ExpectedError: courier.ErrConnectionThrottled,
+		ExpectedError: channels.ErrConnectionThrottled,
+	},
+	{
+		Label:   "Error HTTP 429",
+		MsgText: "Error",
+		MsgURN:  "whatsapp:250788123123",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/12345_ID/messages": {
+				httpx.NewMockResponse(429, nil, []byte(`{ "error": {"message": "Calls to this api have exceeded the rate limit","code": 613 }}`)),
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Error Retryable",
@@ -878,7 +1112,7 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 				httpx.NewMockResponse(400, nil, []byte(`{ "error": {"message": "Media upload error","code": 131053 }}`)),
 			},
 		},
-		ExpectedError: courier.ErrRetryableWithReason("131053", "Media upload error"),
+		ExpectedError: channels.ErrRetryableWithReason("131053", "Media upload error"),
 	},
 	{
 		Label:   "Error",
@@ -889,7 +1123,7 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 				httpx.NewMockResponse(403, nil, []byte(`{ "error": {"message": "(#368) Temporarily blocked for policies violations","code": 368 }}`)),
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("368", "(#368) Temporarily blocked for policies violations"),
+		ExpectedError: channels.ErrFailedWithReason("368", "(#368) Temporarily blocked for policies violations"),
 	},
 	{
 		Label:   "Error Message",
@@ -900,7 +1134,7 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 				httpx.NewMockResponse(403, nil, []byte(`{ "error": {"message": "Other error with message","code": 0 }}`)),
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("0", "Other error with message"),
+		ExpectedError: channels.ErrFailedWithReason("0", "Other error with message"),
 	},
 	{
 		Label:   "Error Connection",
@@ -911,13 +1145,13 @@ var whatsappOutgoingTests = []OutgoingTestCase{
 				httpx.NewMockResponse(500, nil, []byte(`Bad Gateway`)),
 			},
 		},
-		ExpectedError: courier.ErrConnectionFailed,
+		ExpectedError: channels.ErrConnectionFailed,
 	},
 }
 
 func TestWhatsAppOutgoing(t *testing.T) {
 	// shorter max msg length for testing
-	maxMsgLength = 100
+	maxMsgLengthWAC = 100
 
 	var channel = test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "WAC", "12345_ID", "", []string{urns.WhatsApp.Prefix}, map[string]any{models.ConfigAuthToken: "a123"})
 
@@ -929,8 +1163,8 @@ func TestWhatsAppOutgoing(t *testing.T) {
 func TestWhatsAppDescribeURN(t *testing.T) {
 	channel := whatsappTestChannels[0]
 	handler := newHandler("WAC", "Cloud API WhatsApp")
-	handler.Initialize(newServerWithWAC(nil))
-	clog := courier.NewChannelLog(courier.ChannelLogTypeUnknown, channel, handler.RedactValues(channel))
+	newServerWithWAC().MountHandler(handler)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, handler.RedactValues(channel))
 
 	tcs := []struct {
 		urn              urns.URN
@@ -941,7 +1175,7 @@ func TestWhatsAppDescribeURN(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
-		metadata, _ := handler.(courier.URNDescriber).DescribeURN(context.Background(), whatsappTestChannels[0], tc.urn, clog)
+		metadata, _ := handler.(models.URNDescriber).DescribeURN(context.Background(), whatsappTestChannels[0], tc.urn, clog)
 		assert.Equal(t, metadata, tc.expectedMetadata)
 	}
 
@@ -949,17 +1183,69 @@ func TestWhatsAppDescribeURN(t *testing.T) {
 }
 
 func TestWhatsAppBuildAttachmentRequest(t *testing.T) {
-	mb := test.NewMockBackend()
-	s := newServerWithWAC(mb)
+	s := newServerWithWAC()
 	handler := &handler{NewBaseHandler(models.ChannelType("WAC"), "WhatsApp Cloud", DisableUUIDRouting())}
-	handler.Initialize(s)
+	s.MountHandler(handler)
 	req, _ := handler.BuildAttachmentRequest(context.Background(), whatsappTestChannels[0], "https://example.org/v1/media/41", nil)
 	assert.Equal(t, "https://example.org/v1/media/41", req.URL.String())
 	assert.Equal(t, "Bearer wac_admin_system_user_token", req.Header.Get("Authorization"))
 }
 
-func newServerWithWAC(backend courier.Backend) *courier.Server {
+func newServerWithWAC() *web.Server {
 	cfg := runtime.NewDefaultConfig()
 	cfg.WhatsappAdminSystemUserToken = "wac_admin_system_user_token"
-	return courier.NewServer(runtime.NewTestRuntime(cfg), backend)
+	return web.NewServer(runtime.NewTestRuntime(cfg))
+}
+
+func TestWhatsAppSendEvent(t *testing.T) {
+	// other tests repoint graphURL at mock servers, so pin it for this test
+	defer func(u string) { graphURL = u }(graphURL)
+	graphURL = "https://graph.facebook.com/v25.0/"
+
+	channel := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "WAC", "12345_ID", "", []string{urns.WhatsApp.Prefix}, map[string]any{models.ConfigAuthToken: "a123"})
+
+	cfg := runtime.NewDefaultConfig()
+	cfg.WhatsappAdminSystemUserToken = "wac_admin_system_user_token"
+	s := web.NewServer(runtime.NewTestRuntime(cfg))
+
+	h := newHandler("WAC", "WhatsApp Cloud").(*handler)
+	s.MountHandler(h)
+
+	s.Runtime().HTTP.Default.Transport = test.MockTransport(map[string][]*httpx.MockResponse{
+		"https://graph.facebook.com/12345_ID/messages": {
+			httpx.NewMockResponse(200, nil, []byte(`{"success": true}`)),
+			httpx.NewMockResponse(400, nil, []byte(`{"error": {"message": "(#131009) Parameter value is not valid", "code": 131009}}`)),
+			httpx.MockConnectionError,
+		},
+	})
+
+	// typing indicators are supported on WhatsApp channels, but there's no explicit stop
+	assert.Equal(t, map[string]time.Duration{events.TypeTypingStarted: 20 * time.Second}, h.SendableEvents(channel))
+
+	channelRef := assets.NewChannelReference("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "WhatsApp")
+	typing := events.NewTypingStarted(events.DirectionOutgoing, channelRef, "whatsapp:5511987654321", "wamid.HBgMNTU3")
+
+	// a typing indicator is sent as a mark-as-read call with a typing_indicator field
+	clog := models.NewChannelLogForEventSend(channel, nil)
+	err := h.SendEvent(context.Background(), channel, typing, clog)
+	assert.NoError(t, err)
+	assert.Len(t, clog.HttpLogs, 1)
+	assert.Equal(t, "https://graph.facebook.com/12345_ID/messages", clog.HttpLogs[0].URL)
+	assert.Contains(t, clog.HttpLogs[0].Request, `{"messaging_product":"whatsapp","status":"read","message_id":"wamid.HBgMNTU3","typing_indicator":{"type":"text"}}`)
+
+	// an error response is a response error
+	err = h.SendEvent(context.Background(), channel, typing, clog)
+	assert.Equal(t, channels.ErrResponseStatus, err)
+
+	// as is a connection error
+	err = h.SendEvent(context.Background(), channel, typing, clog)
+	assert.Equal(t, channels.ErrConnectionFailed, err)
+
+	// an event without a msg external ID can't be sent
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStarted(events.DirectionOutgoing, channelRef, "whatsapp:5511987654321", ""), clog)
+	assert.ErrorContains(t, err, "requires msg_external_id")
+
+	// nor can an event type the handler doesn't declare support for
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStopped(events.DirectionOutgoing, channelRef, "whatsapp:5511987654321", ""), clog)
+	assert.ErrorContains(t, err, "unsupported event type: typing_stopped")
 }

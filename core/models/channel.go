@@ -121,7 +121,7 @@ var ErrChannelNotFound = errors.New("channel not found")
 // ErrChannelWrongType is returned when we find a channel with the set UUID but with a different type
 var ErrChannelWrongType = errors.New("channel type wrong")
 
-// Channel is the RapidPro specific concrete type satisfying the courier.Channel interface
+// Channel is a channel as loaded from the database, along with the config of the org which owns it
 type Channel struct {
 	OrgID_       OrgID          `db:"org_id"`
 	UUID_        ChannelUUID    `db:"uuid"`
@@ -264,7 +264,7 @@ SELECT
   JOIN orgs_org o ON c.org_id = o.id
  WHERE c.uuid = $1 AND c.is_active = TRUE AND c.org_id IS NOT NULL`
 
-func GetChannelByUUID(ctx context.Context, rt *runtime.Runtime, uuid ChannelUUID) (*Channel, error) {
+func loadChannelByUUID(ctx context.Context, rt *runtime.Runtime, uuid ChannelUUID) (*Channel, error) {
 	channel := &Channel{}
 	err := rt.DB.GetContext(ctx, channel, sqlSelectChannelFromUUID, uuid)
 
@@ -292,7 +292,7 @@ SELECT
   JOIN orgs_org o ON c.org_id = o.id
  WHERE c.address = $1 AND c.is_active = TRUE AND c.org_id IS NOT NULL`
 
-func GetChannelByAddress(ctx context.Context, rt *runtime.Runtime, addr ChannelAddress) (*Channel, error) {
+func loadChannelByAddress(ctx context.Context, rt *runtime.Runtime, addr ChannelAddress) (*Channel, error) {
 	channel := &Channel{}
 	err := rt.DB.GetContext(ctx, channel, sqlSelectChannelFromAddress, addr)
 
@@ -300,4 +300,51 @@ func GetChannelByAddress(ctx context.Context, rt *runtime.Runtime, addr ChannelA
 		return nil, ErrChannelNotFound
 	}
 	return channel, err
+}
+
+// GetChannel returns the channel with the passed in type and UUID. It reads through the channel cache created by
+// Start, which is why - unlike the rest of this package - it doesn't take a runtime.
+func GetChannel(ctx context.Context, typ ChannelType, uuid ChannelUUID) (*Channel, error) {
+	timeout, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
+
+	ch, err := channelsByUUID.GetOrFetch(timeout, uuid)
+	if err != nil {
+		return nil, err
+	}
+
+	if typ != AnyChannelType && ch.ChannelType() != typ {
+		return nil, ErrChannelWrongType
+	}
+
+	return ch, nil
+}
+
+// GetChannelByAddress returns the channel with the passed in type and address. Like GetChannel it reads through the
+// cache created by Start rather than taking a runtime.
+func GetChannelByAddress(ctx context.Context, typ ChannelType, address ChannelAddress) (*Channel, error) {
+	timeout, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
+
+	ch, err := channelsByAddr.GetOrFetch(timeout, address)
+	if err != nil {
+		return nil, err
+	}
+
+	if typ != AnyChannelType && ch.ChannelType() != typ {
+		return nil, ErrChannelWrongType
+	}
+
+	return ch, nil
+}
+
+// FlushChannelCache clears the channel caches - used in tests after channels are modified in the database. It's a
+// no-op if the caches haven't been created, i.e. Start hasn't been called.
+func FlushChannelCache() {
+	if channelsByUUID != nil {
+		channelsByUUID.Clear()
+	}
+	if channelsByAddr != nil {
+		channelsByAddr.Clear()
+	}
 }

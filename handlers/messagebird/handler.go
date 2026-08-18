@@ -18,7 +18,7 @@ import (
 
 	"github.com/buger/jsonparser"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/jsonx"
@@ -77,7 +77,7 @@ type formMessage struct {
 }
 
 func init() {
-	courier.RegisterHandler(newHandler("MBD", "Messagebird", true))
+	channels.RegisterHandler(newHandler("MBD", "Messagebird", true))
 }
 
 type handler struct {
@@ -85,20 +85,19 @@ type handler struct {
 	validateSignatures bool
 }
 
-func newHandler(channelType models.ChannelType, name string, validateSignatures bool) courier.ChannelHandler {
+func newHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("MBD"), "Messagebird"), validateSignatures}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, h.receiveMessage)
-	s.AddHandlerRoute(h, http.MethodGet, "status", courier.ChannelLogTypeMsgStatus, h.receiveStatus)
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
+	r.Add(h, http.MethodGet, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
 
 	return nil
 }
 
-func (h *handler) receiveStatus(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 
 	// get our params
 	receivedStatus := &ReceivedStatus{}
@@ -113,19 +112,21 @@ func (h *handler) receiveStatus(ctx context.Context, channel courier.Channel, w 
 	}
 
 	// if the message id was passed explicitely, use that
-	var status courier.StatusUpdate
+	var status *models.StatusUpdate
 	if receivedStatus.Reference != "" {
 		if !uuids.Is(receivedStatus.Reference) {
 			slog.Error("error converting Messagebird status reference to UUID", "error", err, "uuid", receivedStatus.Reference)
 		} else {
-			status = h.Backend().NewStatusUpdate(channel, models.MsgUUID(receivedStatus.Reference), msgStatus, clog)
+			status = models.NewStatusUpdate(channel, models.MsgUUID(receivedStatus.Reference), msgStatus, clog)
 		}
 	}
 
 	// if we have no status, then build it from the external (messagebird) id
 	if status == nil {
-		status = h.Backend().NewStatusUpdateByExternalID(channel, receivedStatus.ID, msgStatus, clog)
+		status = models.NewStatusUpdateByExternalID(channel, receivedStatus.ID, msgStatus, clog)
 	}
+
+	var stopEvent *models.ChannelEvent
 
 	if receivedStatus.StatusErrorCode == errorStopped {
 		urn, err := urns.ParsePhone(receivedStatus.Recipient, "", true, false)
@@ -133,18 +134,22 @@ func (h *handler) receiveStatus(ctx context.Context, channel courier.Channel, w 
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
 		}
 		// create a stop channel event
-		channelEvent := h.Backend().NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
-		err = h.Backend().WriteChannelEvent(ctx, channelEvent, clog)
+		stopEvent = models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
+		err = models.WriteChannelEvent(ctx, h.Runtime(), stopEvent, clog)
 		if err != nil {
 			return nil, err
 		}
-		clog.Error(courier.ErrorExternal(fmt.Sprint(receivedStatus.StatusErrorCode), "Contact has sent 'stop'"))
+		clog.Error(models.ErrorExternal(fmt.Sprint(receivedStatus.StatusErrorCode), "Contact has sent 'stop'"))
 	}
 
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	events, err := handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	if stopEvent != nil {
+		events = append(events, stopEvent)
+	}
+	return events, err
 }
 
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	err := h.validateSignature(channel, r)
 	if err != nil {
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
@@ -190,7 +195,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 	}
 
 	// build our msg
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, messageID, clog).WithReceivedOn(date.UTC())
+	msg := models.NewIncomingMsg(channel, urn, text, messageID, clog).WithReceivedOn(date.UTC())
 
 	// process any attached media
 	if len(payload.MediaURLs) > 0 {
@@ -199,13 +204,13 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 		}
 	}
 	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	authToken := msg.Channel().StringConfigForKey(models.ConfigAuthToken, "")
 	if authToken == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	user := msg.URN().Path()
@@ -243,15 +248,13 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	req.Header.Set("Authorization", bearer)
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
-	if err != nil || resp.StatusCode/100 == 5 {
-		return courier.ErrConnectionFailed
-	} else if resp.StatusCode/100 != 2 {
-		return courier.ErrResponseStatus
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
 	}
 
 	externalID, err := jsonparser.GetString(respBody, "id")
 	if err != nil {
-		clog.Error(courier.ErrorResponseValueMissing("id"))
+		clog.Error(models.ErrorResponseValueMissing("id"))
 	} else {
 		res.AddExternalID(externalID)
 	}
@@ -290,7 +293,7 @@ func calculateSignature(body []byte) string {
 	return hex.EncodeToString(preHashSignature[:])
 }
 
-func (h *handler) validateSignature(c courier.Channel, r *http.Request) error {
+func (h *handler) validateSignature(c *models.Channel, r *http.Request) error {
 	if !h.validateSignatures {
 		return nil
 	}
@@ -332,7 +335,7 @@ func (h *handler) validateSignature(c courier.Channel, r *http.Request) error {
 }
 
 // WriteMsgSuccessResponse writes a success response for the messages, MB expects an 'OK' body in our response
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []courier.MsgIn) error {
+func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.Header().Add("Content-type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, err := w.Write([]byte("OK"))

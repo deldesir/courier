@@ -4,17 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/gomodule/redigo/redis"
 	_ "github.com/lib/pq" // postgres driver
 	"github.com/nyaruka/gocommon/aws/cwatch"
-	"github.com/nyaruka/gocommon/aws/dynamo"
 	"github.com/nyaruka/gocommon/aws/s3x"
 	"github.com/nyaruka/gocommon/centrifugo"
-	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/vkutil"
 	"github.com/vinovest/sqlx"
 )
@@ -22,20 +17,14 @@ import (
 type Runtime struct {
 	Config     *Config
 	DB         *sqlx.DB
-	Dynamo     *dynamodb.Client
+	Dynamo     *Dynamo
 	VK         *redis.Pool
 	S3         *s3x.Service
 	CW         *cwatch.Service
 	Centrifugo *centrifugo.Service
 
-	HTTP *http.Client
-
-	// HTTPProxied is the HTTP client used by handlers that send to user-configured URLs. When
-	// SendProxyURL is set, it routes through that forward proxy. Otherwise it's the same as HTTP.
-	HTTPProxied *http.Client
-
-	Writers *Writers
-	Spool   *dynamo.Spool
+	HTTP  *HTTP
+	Stats *StatsCollector
 }
 
 func NewRuntime(cfg *Config) (*Runtime, error) {
@@ -52,17 +41,11 @@ func NewRuntime(cfg *Config) (*Runtime, error) {
 
 	ctx := context.Background()
 
-	// DynamoDB: optional — skip if no table prefix configured (nanoRP mode).
-	// The AWS constructors resolve credentials and region from the SDK
-	// default chain, so on nanoRP boxes (no AWS at all) creating the client
-	// would probe EC2 IMDS; skipping keeps startup clean.
-	if cfg.DynamoTablePrefix != "" {
-		rt.Dynamo, err = dynamo.NewClient(ctx, cfg.DynamoEndpoint)
-		if err != nil {
-			return nil, fmt.Errorf("error creating DynamoDB client: %w", err)
-		}
-	} else {
-		slog.Info("DynamoDB disabled (COURIER_DYNAMO_TABLE_PREFIX is empty)")
+	// the AWS service constructors resolve credentials and region from the SDK default chain (env
+	// vars, instance/task IAM role, shared config/credentials files, etc.)
+	rt.Dynamo, err = newDynamo(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	rt.VK, err = vkutil.NewPool(cfg.Valkey, vkutil.WithMaxActive(cfg.MaxWorkers*2))
@@ -87,79 +70,31 @@ func NewRuntime(cfg *Config) (*Runtime, error) {
 
 	rt.Centrifugo = centrifugo.NewService(centrifugo.NewClient(cfg.CentrifugoEndpoint, cfg.CentrifugoKey), rt.VK)
 
-	// parse the SSRF blocklist up front so it can be baked into each HTTP client's transport via
-	// httpx.WithAccessControl, rather than passed to every request.
-	disallowedIPs, disallowedNets, err := cfg.ParseDisallowedNetworks()
-	if err != nil {
-		return nil, fmt.Errorf("error parsing disallowed networks: %w", err)
-	}
-	httpAccess := httpx.NewAccessConfig(10*time.Second, disallowedIPs, disallowedNets)
-
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConns = 64
-	transport.MaxIdleConnsPerHost = 8
-	transport.IdleConnTimeout = 15 * time.Second
-	rt.HTTP = &http.Client{Transport: httpx.WithAccessControl(transport, httpAccess), Timeout: 30 * time.Second}
-
-	// build a proxied variant when SendProxyURL is configured; otherwise reuse the regular client
-	// so handlers can always go through HTTPProxied without behavior change.
-	//
-	// Note on the SSRF blocklist: the access control wrapped into each transport resolves the
-	// destination URL's host and rejects the request if it maps to a disallowed IP. This check runs
-	// regardless of the proxy; when the proxy is set the request still dials the proxy rather than the
-	// destination, so the proxy's own egress rules govern the actual connection to the destination.
-	proxyURL, err := cfg.ParseSendProxyURL()
-	if err != nil {
-		return nil, fmt.Errorf("error parsing send proxy URL: %w", err)
-	}
-	rt.HTTPProxied = rt.HTTP
-	if proxyURL != nil {
-		proxiedTransport := transport.Clone()
-		proxiedTransport.Proxy = http.ProxyURL(proxyURL)
-		rt.HTTPProxied = &http.Client{Transport: httpx.WithAccessControl(proxiedTransport, httpAccess), Timeout: 30 * time.Second}
-	}
-
-	// DynamoDB spool: only create if DynamoDB is enabled (nanorp mode)
-	if rt.Dynamo != nil {
-		rt.Spool = dynamo.NewSpool(rt.Dynamo, rt.Config.SpoolDir+"/dynamo", 30*time.Second)
-	}
-	rt.Writers = newWriters(cfg, rt.Dynamo, rt.Spool)
+	rt.HTTP = newHTTP(cfg)
+	rt.Stats = NewStatsCollector()
 
 	return rt, nil
 }
 
 // NewTestRuntime returns a minimal Runtime wrapping the given config, suitable for tests that need a
-// Runtime but don't bring up real backing services. It populates HTTP (shared by HTTPProxied) with a
-// dedicated client so code paths that issue outbound HTTP requests work against test servers, and so
-// tests can install a mocking transport via httpx.WithMocks without mutating http.DefaultClient.
+// Runtime but don't bring up real backing services. It populates HTTP with dedicated clients so code paths
+// that issue outbound HTTP requests work against test servers, and so tests can install a mocking transport
+// via httpx.WithMocks without mutating http.DefaultClient.
 func NewTestRuntime(cfg *Config) *Runtime {
-	// give the client a timeout matching the production clients so a test that accidentally lets a
-	// request escape its mocking transport fails fast instead of hanging
-	client := &http.Client{Timeout: 30 * time.Second}
 	return &Runtime{
-		Config:      cfg,
-		HTTP:        client,
-		HTTPProxied: client,
+		Config: cfg,
+		HTTP:   newTestHTTP(),
 		// note the nil valkey pool: publishing requires a subscriber presence lookup, so tests that
 		// exercise a publish path need a runtime with a real pool (i.e. testsuite.Runtime)
 		Centrifugo: centrifugo.NewService(centrifugo.NewMockClient(), nil),
+		Stats:      NewStatsCollector(),
 	}
 }
 
 func (r *Runtime) Start() error {
-	if r.Spool != nil {
-		if err := r.Spool.Start(); err != nil {
-			return fmt.Errorf("error starting dynamo spool: %w", err)
-		}
-	}
-
-	r.Writers.start()
-	return nil
+	return r.Dynamo.start()
 }
 
 func (r *Runtime) Stop() {
-	r.Writers.stop()
-	if r.Spool != nil {
-		r.Spool.Stop()
-	}
+	r.Dynamo.stop()
 }

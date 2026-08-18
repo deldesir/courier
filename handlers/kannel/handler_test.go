@@ -5,19 +5,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "KN", "2020", "US", []string{urns.Phone.Prefix}, nil),
 }
 
-var ignoreChannels = []courier.Channel{
+var ignoreChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "KN", "2020", "US", []string{urns.Phone.Prefix}, map[string]any{"ignore_sent": true}),
 }
 
@@ -75,10 +76,17 @@ var handleTestCases = []IncomingTestCase{
 		ExpectedRespStatus:   400,
 		ExpectedBodyContains: "field 'status' required"},
 	{
-		Label:                "Status Invalid Status",
+		Label:                "Status Unknown",
 		URL:                  "/c/kn/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status/?uuid=019a06fa-467d-7786-b9cb-5b42177cd53f&status=66",
+		ExpectedRespStatus:   200,
+		ExpectedBodyContains: "ignoring unknown status '66'",
+		ExpectedErrors:       []*svclogs.Error{models.ErrorExternal("dlr:66", "unknown delivery report status '66'")},
+	},
+	{
+		Label:                "Status Zero",
+		URL:                  "/c/kn/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status/?uuid=019a06fa-467d-7786-b9cb-5b42177cd53f&status=0",
 		ExpectedRespStatus:   400,
-		ExpectedBodyContains: "unknown status '66', must be one of 1,2,4,8,16",
+		ExpectedBodyContains: "field 'status' required",
 	},
 	{
 		Label:                "Status Valid by UUID",
@@ -241,7 +249,30 @@ var defaultSendTestCases = []OutgoingTestCase{
 				"password": {"Password"},
 			},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:           "Throttled",
+		MsgText:         "Not Routable",
+		MsgURN:          "tel:+250788383383",
+		MsgHighPriority: false,
+		MockResponses: map[string][]*httpx.MockResponse{
+			"http://example.com/send*": {
+				httpx.NewMockResponse(429, nil, []byte(`Not routable. Do not try again.`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Params: url.Values{
+				"text":     {"Not Routable"},
+				"to":       {"+250788383383"},
+				"from":     {"2020"},
+				"dlr-mask": {"27"},
+				"dlr-url":  {"https://localhost/c/kn/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/status?uuid=0191e180-7d60-7000-aded-7d8b151cbd5b&status=%d"},
+				"username": {"Username"},
+				"password": {"Password"},
+			},
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:           "Error Sending",
@@ -264,7 +295,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 				"password": {"Password"},
 			},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 
 	{

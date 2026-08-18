@@ -4,9 +4,9 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
@@ -111,7 +111,7 @@ var incomingCases = []IncomingTestCase{
 }
 
 func TestIncoming(t *testing.T) {
-	chs := []courier.Channel{
+	chs := []*models.Channel{
 		test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "MT", "2020", "FR", []string{urns.Phone.Prefix}, nil),
 	}
 
@@ -171,7 +171,18 @@ var outgoingCases = []OutgoingTestCase{
 				httpx.NewMockResponse(403, nil, []byte(`{"results":[{"code": "3", "reason": "FAILED", "ticket": "null"}]}`)),
 			},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Sending",
+		MsgURN:  "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api-public.mtarget.fr/api-sms.json*": {
+				httpx.NewMockResponse(429, nil, []byte(`{"results":[{"code": "3", "reason": "FAILED", "ticket": "null"}]}`)),
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Error Response",
@@ -182,7 +193,7 @@ var outgoingCases = []OutgoingTestCase{
 				httpx.NewMockResponse(200, nil, []byte(`{"results":[{"code": "3", "reason": "FAILED", "ticket": "null"}]}`)),
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("3", "FAILED"),
+		ExpectedError: channels.ErrFailedWithReason("3", "FAILED"),
 	},
 }
 

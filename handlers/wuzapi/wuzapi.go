@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/utils"
@@ -28,7 +28,7 @@ import (
 )
 
 func init() {
-	courier.RegisterHandler(NewHandler())
+	channels.RegisterHandler(NewHandler())
 }
 
 // WuzapiHandler is the handler for Wuzapi
@@ -119,9 +119,7 @@ type WuzapiMediaMessage struct {
 	FileLength    uint64 `json:"fileLength"`
 }
 
-// ... NewHandler, Initialize, handleWebhook, verifySignature remain same ...
-
-func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel courier.Channel, payload *WuzapiPayload, clog *courier.ChannelLog, w http.ResponseWriter, r *http.Request) ([]courier.Event, error) {
+func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *models.Channel, payload *WuzapiPayload, clog *models.ChannelLog, w http.ResponseWriter, r *http.Request) ([]channels.Event, error) {
 	// Try parsing "Event" first (Standard Wuzapi)
 	var event WuzapiEvent
 	if len(payload.Event) > 0 {
@@ -140,9 +138,6 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 		return nil, nil // Return 200 to clear queue
 	}
 
-	// Extract Sender
-	// Extract Sender & Chat
-	// Extract Sender & Chat
 	// Extract Sender & Chat
 	senderStr, _ := event.Info.Sender.(string)
 	senderAltStr, _ := event.Info.SenderAlt.(string)
@@ -317,12 +312,12 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 				if idx := strings.LastIndex(ext, "/"); idx >= 0 {
 					ext = ext[idx+1:]
 				}
-				savedURL, saveErr := h.Backend().SaveAttachment(ctx, channel, payload.MimeType, raw, ext)
+				savedURL, saveErr := models.SaveAttachment(ctx, h.Runtime(), channel, payload.MimeType, raw, ext)
 				if saveErr == nil {
 					mediaURL = savedURL
 					log.Printf("Wuzapi DEBUG: Saved base64 attachment: %s (%s)", payload.FileName, payload.MimeType)
 				} else {
-					clog.Error(courier.ErrorExternal("save_failed", fmt.Sprintf("failed to save base64 attachment: %s", saveErr)))
+					clog.Error(models.ErrorExternal("save_failed", fmt.Sprintf("failed to save base64 attachment: %s", saveErr)))
 				}
 			} else {
 				log.Printf("Wuzapi DEBUG: base64 decode failed: %s, falling back to URL download", decErr)
@@ -341,19 +336,19 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 				FileLength:    mediaMsg.FileLength,
 			}
 
-			raw, mimeType, err := h.downloadMedia(ctx, channel, mediaData)
+			raw, mimeType, err := h.downloadMedia(ctx, channel, mediaData, clog)
 			if err == nil {
 				// Extract safe file extension from MIME type (e.g. "application/zip" -> "zip")
 				ext := mimeType
 				if idx := strings.LastIndex(ext, "/"); idx >= 0 {
 					ext = ext[idx+1:]
 				}
-				savedURL, err := h.Backend().SaveAttachment(ctx, channel, mimeType, raw, ext)
+				savedURL, err := models.SaveAttachment(ctx, h.Runtime(), channel, mimeType, raw, ext)
 				if err == nil {
 					mediaURL = savedURL
 				}
 			} else {
-				clog.Error(courier.ErrorExternal("download_failed", fmt.Sprintf("failed to download media: %s", err)))
+				clog.Error(models.ErrorExternal("download_failed", fmt.Sprintf("failed to download media: %s", err)))
 			}
 		}
 	}
@@ -364,7 +359,7 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 		return nil, nil
 	}
 
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, event.Info.ID, clog).
+	msg := models.NewIncomingMsg(channel, urn, text, event.Info.ID, clog).
 		WithContactName(event.Info.PushName)
 
 	if mediaURL != "" {
@@ -379,26 +374,24 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel couri
 		msg.WithAttachment(fmt.Sprintf("%s:%s", mimePrefix, mediaURL))
 	}
 
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 }
 
 // NewHandler creates a new handler
-func NewHandler() courier.ChannelHandler {
+func NewHandler() channels.Handler {
 	return &WuzapiHandler{
-		handlers.NewBaseHandler("WZ", "Wuzapi", handlers.WithRedactConfigKeys("wuzapi_token", "hmac_key")),
+		handlers.NewBaseHandler(models.ChannelType("WZ"), "Wuzapi", handlers.WithRedactConfigKeys("wuzapi_token", "hmac_key")),
 	}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *WuzapiHandler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, h.handleWebhook)
+func (h *WuzapiHandler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.handleWebhook)
 	return nil
 }
 
 // handleWebhook is our HTTP handler function for incoming messages
-func (h *WuzapiHandler) handleWebhook(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
-	// 1. HMAC Verification
+func (h *WuzapiHandler) handleWebhook(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	// 1. HMAC Verification - TEMPORARILY DISABLED due to Key Rotation Issue
 	// hmacKey := channel.StringConfigForKey("hmac_key", "")
 	// if hmacKey != "" {
@@ -484,7 +477,7 @@ type WuzapiMediaData struct {
 	FileLength    uint64
 }
 
-func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel courier.Channel, data *WuzapiMediaData) ([]byte, string, error) {
+func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel *models.Channel, data *WuzapiMediaData, clog *models.ChannelLog) ([]byte, string, error) {
 
 	wuzapiURL := channel.StringConfigForKey("wuzapi_url", "")
 	token := channel.StringConfigForKey("wuzapi_token", "")
@@ -501,8 +494,6 @@ func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel courier.Chann
 
 	// WhatsApp CDN always serves encrypted media — never fetch directly.
 	// Only the Wuzapi /chat/download* API can decrypt it.
-
-	// Fallback to Wuzapi Custom API
 	reqData := map[string]interface{}{
 		"Url":           data.Url,
 		"DirectPath":    data.DirectPath,
@@ -518,11 +509,11 @@ func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel courier.Chann
 	req.Header.Set("Authorization", token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := h.Runtime().HTTP.Do(req)
+	// WuzAPI runs on localhost, which the SSRF-controlled clients reject — use the unsafe client
+	resp, respBody, err := h.requestHTTPUnsafe(req, clog)
 	if err != nil {
 		return nil, "", err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		return nil, "", fmt.Errorf("status %d", resp.StatusCode)
@@ -533,7 +524,7 @@ func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel courier.Chann
 		Mimetype string `json:"Mimetype"`
 	}{}
 
-	if err := json.NewDecoder(resp.Body).Decode(&respDec); err != nil {
+	if err := json.Unmarshal(respBody, &respDec); err != nil {
 		return nil, "", err
 	}
 
@@ -546,7 +537,7 @@ func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel courier.Chann
 	return raw, respDec.Mimetype, err
 }
 
-func (h *WuzapiHandler) handleReceiptInternal(ctx context.Context, channel courier.Channel, payload *WuzapiPayload, clog *courier.ChannelLog, w http.ResponseWriter, r *http.Request) ([]courier.Event, error) {
+func (h *WuzapiHandler) handleReceiptInternal(ctx context.Context, channel *models.Channel, payload *WuzapiPayload, clog *models.ChannelLog, w http.ResponseWriter, r *http.Request) ([]channels.Event, error) {
 	// Map Status
 	var status models.MsgStatus
 
@@ -575,12 +566,12 @@ func (h *WuzapiHandler) handleReceiptInternal(ctx context.Context, channel couri
 		return nil, nil // No ID
 	}
 
-	event := h.Backend().NewStatusUpdateByExternalID(channel, id, status, clog)
+	event := models.NewStatusUpdateByExternalID(channel, id, status, clog)
 	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, event, w, r)
 }
 
-// Send implements the ChannelHandler interface
-func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, log *courier.ChannelLog) error {
+// Send implements the channels.Handler interface
+func (h *WuzapiHandler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	// JITTER: Sleep for 1.5 - 3.5 seconds to mimic human typing behavior
 	// This helps avoid triggering anti-spam mechanisms
 	ms := 1500 + rand.Intn(2000)
@@ -717,10 +708,10 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg courier.MsgOut, res *couri
 	}
 
 	url := fmt.Sprintf("%s/chat/send/%s", wuzapiURL, endpointType)
-	return h.doRequest(url, token, jsonBody, res, log)
+	return h.doRequest(url, token, jsonBody, res, clog)
 }
 
-func (h *WuzapiHandler) doRequest(url string, token string, body []byte, res *courier.SendResult, log *courier.ChannelLog) error {
+func (h *WuzapiHandler) doRequest(url string, token string, body []byte, res *channels.SendResult, clog *models.ChannelLog) error {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
 	if err != nil {
 		return err
@@ -731,7 +722,7 @@ func (h *WuzapiHandler) doRequest(url string, token string, body []byte, res *co
 	req.Header.Set("Content-Type", "application/json")
 
 	// Use requestHTTPUnsafe to allow localhost connections
-	resp, respBody, err := h.requestHTTPUnsafe(req, log)
+	resp, respBody, err := h.requestHTTPUnsafe(req, clog)
 	if err != nil {
 		return err
 	}
@@ -759,10 +750,10 @@ func (h *WuzapiHandler) doRequest(url string, token string, body []byte, res *co
 	return nil
 }
 
-// requestHTTPUnsafe bypasses the runtime's SSRF access-control client so the handler can reach the
+// requestHTTPUnsafe bypasses the runtime's SSRF access-control clients so the handler can reach the
 // WuzAPI service on localhost (which the default DisallowedNetworks blocklist rejects). It uses a
-// plain client with no access control; utils.TraceHTTP still records the trace for channel logging.
-func (h *WuzapiHandler) requestHTTPUnsafe(req *http.Request, clog *courier.ChannelLog) (*http.Response, []byte, error) {
+// plain client with no access control; utils.DoTraced still records the trace for channel logging.
+func (h *WuzapiHandler) requestHTTPUnsafe(req *http.Request, clog *models.ChannelLog) (*http.Response, []byte, error) {
 	req.Header.Set("User-Agent", fmt.Sprintf("Courier/%s", h.Runtime().Config.Version))
 
 	client := &http.Client{
@@ -770,7 +761,7 @@ func (h *WuzapiHandler) requestHTTPUnsafe(req *http.Request, clog *courier.Chann
 		Timeout:   30 * time.Second,
 	}
 
-	trace, resp, err := utils.TraceHTTP(client, req, 0)
+	trace, resp, err := utils.DoTraced(client, req)
 	var body []byte
 	if trace != nil {
 		clog.HTTP(trace)

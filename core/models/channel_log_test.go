@@ -1,0 +1,142 @@
+package models_test
+
+import (
+	"errors"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/gocommon/dates"
+	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
+	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/gocommon/uuids"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestChannelLog(t *testing.T) {
+	httpClient := &http.Client{Transport: httpx.WithTraces(httpx.WithMocks(nil, map[string][]*httpx.MockResponse{
+		"https://api.messages.com/send.json": {
+			httpx.NewMockResponse(200, nil, []byte(`{"status":"success"}`)),
+			httpx.MockConnectionError,
+		},
+	}))}
+
+	uuids.SetGenerator(uuids.NewSeededGenerator(1234, dates.NewSequentialNow(time.Date(2024, 9, 11, 14, 33, 0, 0, time.UTC), time.Second)))
+	defer uuids.SetGenerator(uuids.DefaultGenerator)
+
+	channel := test.NewMockChannel("fef91e9b-a6ed-44fb-b6ce-feed8af585a8", "NX", "1234", "US", []string{urns.Phone.Prefix}, nil)
+	clog := models.NewChannelLog(models.ChannelLogTypeTokenRefresh, channel, nil, nil)
+
+	// make a request that will have a response
+	req, _ := http.NewRequest("POST", "https://api.messages.com/send.json", nil)
+	trace, _, err := utils.DoTraced(httpClient, req)
+	assert.NoError(t, err)
+
+	clog.HTTP(trace)
+
+	// make a request that has no response (connection error); the client wraps the transport's error
+	req, _ = http.NewRequest("POST", "https://api.messages.com/send.json", nil)
+	trace, _, err = utils.DoTraced(httpClient, req)
+	assert.ErrorContains(t, err, "unable to connect to server")
+
+	clog.HTTP(trace)
+	clog.Error(&svclogs.Error{Code: "not_right", Message: "Something not right"})
+	clog.RawError(errors.New("this is an error"))
+	clog.End()
+
+	assert.Equal(t, svclogs.UUID("0191e180-7d60-7000-8e0f-6b2abe4360d8"), clog.UUID)
+	assert.Equal(t, models.ChannelLogTypeTokenRefresh, clog.Type)
+	assert.Equal(t, channel.UUID(), clog.ChannelUUID)
+	assert.Equal(t, channel.OrgID(), clog.OrgID)
+	assert.Equal(t, 2, len(clog.HttpLogs))
+	assert.Equal(t, 2, len(clog.Errors))
+	assert.False(t, clog.CreatedOn.IsZero())
+	assert.Greater(t, clog.Elapsed, time.Duration(0))
+
+	hlog1 := clog.HttpLogs[0]
+	assert.Equal(t, "https://api.messages.com/send.json", hlog1.URL)
+	assert.Equal(t, 200, hlog1.StatusCode)
+	assert.Equal(t, "POST /send.json HTTP/1.1\r\nHost: api.messages.com\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 0\r\nAccept-Encoding: gzip\r\n\r\n", hlog1.Request)
+	assert.Equal(t, "HTTP/1.0 200 OK\r\nContent-Length: 20\r\n\r\n{\"status\":\"success\"}", hlog1.Response)
+
+	hlog2 := clog.HttpLogs[1]
+	assert.Equal(t, 0, hlog2.StatusCode)
+	assert.Equal(t, "POST /send.json HTTP/1.1\r\nHost: api.messages.com\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: 0\r\nAccept-Encoding: gzip\r\n\r\n", hlog2.Request)
+	assert.Equal(t, "", hlog2.Response)
+
+	err1 := clog.Errors[0]
+	assert.Equal(t, "not_right", err1.Code)
+	assert.Equal(t, "", err1.ExtCode)
+	assert.Equal(t, "Something not right", err1.Message)
+
+	err2 := clog.Errors[1]
+	assert.Equal(t, "this is an error", err2.Message)
+	assert.Equal(t, "", err2.Code)
+}
+
+func TestChannelErrors(t *testing.T) {
+	tcs := []struct {
+		err             *svclogs.Error
+		expectedCode    string
+		expectedExtCode string
+		expectedMessage string
+	}{
+		{
+			err:             models.ErrorResponseStatusCode(),
+			expectedCode:    "response_status_code",
+			expectedMessage: "Unexpected response status code.",
+		},
+		{
+			err:             models.ErrorResponseUnparseable("FOO"),
+			expectedCode:    "response_unparseable",
+			expectedMessage: "Unable to parse response as FOO.",
+		},
+		{
+			err:             models.ErrorResponseUnexpected("all good!"),
+			expectedCode:    "response_unexpected",
+			expectedMessage: "Expected response to be 'all good!'.",
+		},
+		{
+			err:             models.ErrorResponseValueMissing("id"),
+			expectedCode:    "response_value_missing",
+			expectedMessage: "Unable to find 'id' response.",
+		},
+		{
+			err:             models.ErrorMediaUnsupported("image/tiff"),
+			expectedCode:    "media_unsupported",
+			expectedMessage: "Unsupported attachment media type: image/tiff.",
+		},
+		{
+			err:             models.ErrorMediaUnresolveable("image/jpeg"),
+			expectedCode:    "media_unresolveable",
+			expectedMessage: "Unable to find version of image/jpeg attachment compatible with channel.",
+		},
+		{
+			err:             models.ErrorAttachmentNotDecodable(),
+			expectedCode:    "attachment_not_decodable",
+			expectedMessage: "Unable to decode embedded attachment data.",
+		},
+		{
+			err:             models.ErrorExternal("20002", "Invalid FriendlyName."),
+			expectedCode:    "external",
+			expectedExtCode: "20002",
+			expectedMessage: "Invalid FriendlyName.",
+		},
+		{
+			err:             models.ErrorExternal("20003", ""),
+			expectedCode:    "external",
+			expectedExtCode: "20003",
+			expectedMessage: "Service specific error: 20003.",
+		},
+	}
+
+	for _, tc := range tcs {
+		assert.Equal(t, tc.expectedCode, tc.err.Code)
+		assert.Equal(t, tc.expectedExtCode, tc.err.ExtCode)
+		assert.Equal(t, tc.expectedMessage, tc.err.Message)
+	}
+}

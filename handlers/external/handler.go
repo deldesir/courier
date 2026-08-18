@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/antchfx/xmlquery"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/gsm7"
@@ -54,37 +54,36 @@ var contentTypeMappings = map[string]string{
 }
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("EX"), "External")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, h.receiveMessage)
-	s.AddHandlerRoute(h, http.MethodGet, "receive", courier.ChannelLogTypeMsgReceive, h.receiveMessage)
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
+	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
 
 	sentHandler := h.buildStatusHandler("sent")
-	s.AddHandlerRoute(h, http.MethodGet, "sent", courier.ChannelLogTypeMsgStatus, sentHandler)
-	s.AddHandlerRoute(h, http.MethodPost, "sent", courier.ChannelLogTypeMsgStatus, sentHandler)
+	r.Add(h, http.MethodGet, "sent", models.ChannelLogTypeMsgStatus, sentHandler)
+	r.Add(h, http.MethodPost, "sent", models.ChannelLogTypeMsgStatus, sentHandler)
 
 	deliveredHandler := h.buildStatusHandler("delivered")
-	s.AddHandlerRoute(h, http.MethodGet, "delivered", courier.ChannelLogTypeMsgStatus, deliveredHandler)
-	s.AddHandlerRoute(h, http.MethodPost, "delivered", courier.ChannelLogTypeMsgStatus, deliveredHandler)
+	r.Add(h, http.MethodGet, "delivered", models.ChannelLogTypeMsgStatus, deliveredHandler)
+	r.Add(h, http.MethodPost, "delivered", models.ChannelLogTypeMsgStatus, deliveredHandler)
 
 	failedHandler := h.buildStatusHandler("failed")
-	s.AddHandlerRoute(h, http.MethodGet, "failed", courier.ChannelLogTypeMsgStatus, failedHandler)
-	s.AddHandlerRoute(h, http.MethodPost, "failed", courier.ChannelLogTypeMsgStatus, failedHandler)
+	r.Add(h, http.MethodGet, "failed", models.ChannelLogTypeMsgStatus, failedHandler)
+	r.Add(h, http.MethodPost, "failed", models.ChannelLogTypeMsgStatus, failedHandler)
 
-	s.AddHandlerRoute(h, http.MethodPost, "stopped", courier.ChannelLogTypeEventReceive, h.receiveStopContact)
-	s.AddHandlerRoute(h, http.MethodGet, "stopped", courier.ChannelLogTypeEventReceive, h.receiveStopContact)
+	r.Add(h, http.MethodPost, "stopped", models.ChannelLogTypeEventReceive, h.receiveStopContact)
+	r.Add(h, http.MethodGet, "stopped", models.ChannelLogTypeEventReceive, h.receiveStopContact)
 
 	return nil
 }
@@ -93,7 +92,7 @@ type stopContactForm struct {
 	From string `name:"from" validate:"required"`
 }
 
-func (h *handler) receiveStopContact(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveStopContact(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	form := &stopContactForm{}
 	err := handlers.DecodeAndValidateForm(form, r)
 	if err != nil {
@@ -112,12 +111,12 @@ func (h *handler) receiveStopContact(ctx context.Context, channel courier.Channe
 	}
 
 	// create a stop channel event
-	channelEvent := h.Backend().NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
-	err = h.Backend().WriteChannelEvent(ctx, channelEvent, clog)
+	channelEvent := models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
+	err = models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
 	if err != nil {
 		return nil, err
 	}
-	return []courier.Event{channelEvent}, courier.WriteChannelEventSuccess(w, channelEvent)
+	return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
 }
 
 // utility function to grab the form value for either the passed in name (if non-empty) or the first set
@@ -141,7 +140,7 @@ func getFormField(form url.Values, defaultNames []string, name string) string {
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	var err error
 
 	var from, dateString, text string
@@ -213,17 +212,17 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 	}
 
 	// build our msg
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, "", clog).WithReceivedOn(date)
+	msg := models.NewIncomingMsg(channel, urn, text, "", clog).WithReceivedOn(date)
 
 	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 }
 
 // WriteMsgSuccessResponse writes our response in TWIML format
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []courier.MsgIn) error {
+func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	moResponse := msgs[0].Channel().StringConfigForKey(configMOResponse, "")
 	if moResponse == "" {
-		return courier.WriteMsgSuccess(w, msgs)
+		return channels.WriteMsgSuccess(w, msgs)
 	}
 	moResponseContentType := msgs[0].Channel().StringConfigForKey(configMOResponseContentType, "")
 	if moResponseContentType != "" {
@@ -235,8 +234,8 @@ func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWr
 }
 
 // buildStatusHandler deals with building a handler that takes what status is received in the URL
-func (h *handler) buildStatusHandler(status string) courier.ChannelHandleFunc {
-	return func(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) buildStatusHandler(status string) channels.HandleFunc {
+	return func(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 		return h.receiveStatus(ctx, status, channel, w, r, clog)
 	}
 }
@@ -253,7 +252,7 @@ var statusMappings = map[string]models.MsgStatus{
 }
 
 // receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, statusString string, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveStatus(ctx context.Context, statusString string, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	form := &statusForm{}
 	err := handlers.DecodeAndValidateForm(form, r)
 	if err != nil {
@@ -280,16 +279,16 @@ func (h *handler) receiveStatus(ctx context.Context, statusString string, channe
 	}
 
 	// write our status
-	status := h.Backend().NewStatusUpdate(channel, models.MsgUUID(msgUUID), msgStatus, clog)
+	status := models.NewStatusUpdate(channel, models.MsgUUID(msgUUID), msgStatus, clog)
 	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	channel := msg.Channel()
 
 	sendURL := channel.StringConfigForKey(models.ConfigSendURL, "")
 	if sendURL == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	// figure out what encoding to tell kannel to send as
@@ -380,14 +379,12 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		}
 
 		resp, respBody, err := h.RequestHTTPProxied(req, clog)
-		if err != nil || resp.StatusCode/100 == 5 {
-			return courier.ErrConnectionFailed
-		} else if resp.StatusCode/100 != 2 {
-			return courier.ErrResponseStatus
+		if err := handlers.ErrorFromResponse(resp, err); err != nil {
+			return err
 		}
 
 		if responseCheck != "" && !strings.Contains(string(respBody), responseCheck) {
-			return courier.ErrResponseContent
+			return channels.ErrResponseContent
 		}
 	}
 
@@ -404,7 +401,7 @@ func buildQuickRepliesResponse(quickReplies []models.QuickReply, sendMethod stri
 		quickReplies = []models.QuickReply{}
 	}
 
-	quickReplies = handlers.FilterQuickRepliesByType(quickReplies, "text")
+	quickReplies = handlers.FilterQuickRepliesByType(quickReplies, models.QuickReplyTypeText)
 
 	if (sendMethod == http.MethodPost || sendMethod == http.MethodPut) && contentType == contentJSON {
 		return string(jsonx.MustMarshal(handlers.TextOnlyQuickReplies(quickReplies)))

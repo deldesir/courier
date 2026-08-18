@@ -4,15 +4,15 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var daTestChannels = []courier.Channel{
+var daTestChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "DA", "2020", "ID", []string{urns.Phone.Prefix}, nil),
 }
 
@@ -147,7 +147,21 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{
 			{Params: url.Values{"message": {"Error Message"}, "sendto": {"250788383383"}, "original": {"2020"}, "userid": {"Username"}, "password": {"Password"}, "dcs": {"0"}, "udhl": {"0"}, "messageid": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}}},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Message",
+		MsgURN:  "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"http://202.43.169.11/APIhttpU/receive2waysms.php*": {
+				httpx.NewMockResponse(429, nil, []byte(`Error`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{Params: url.Values{"message": {"Error Message"}, "sendto": {"250788383383"}, "original": {"2020"}, "userid": {"Username"}, "password": {"Password"}, "dcs": {"0"}, "udhl": {"0"}, "messageid": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}}},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Authentication Error",
@@ -161,7 +175,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{
 			{Params: url.Values{"message": {"Simple Message"}, "sendto": {"250788383383"}, "original": {"2020"}, "userid": {"Username"}, "password": {"Password"}, "dcs": {"0"}, "udhl": {"0"}, "messageid": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}}},
 		},
-		ExpectedError: courier.ErrFailedWithReason("001", "Authentication error."),
+		ExpectedError: channels.ErrFailedWithReason("001", "Authentication error."),
 	},
 	{
 		Label:   "Account Expired",
@@ -175,7 +189,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{
 			{Params: url.Values{"message": {"Simple Message"}, "sendto": {"250788383383"}, "original": {"2020"}, "userid": {"Username"}, "password": {"Password"}, "dcs": {"0"}, "udhl": {"0"}, "messageid": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}}},
 		},
-		ExpectedError: courier.ErrFailedWithReason("101", "Account expired or invalid parameters."),
+		ExpectedError: channels.ErrFailedWithReason("101", "Account expired or invalid parameters."),
 	},
 }
 

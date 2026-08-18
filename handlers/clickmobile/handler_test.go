@@ -4,8 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
-	. "github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/core/channels"
+	"github.com/nyaruka/courier/v26/core/models"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/httpx"
@@ -132,7 +133,7 @@ var incomingCases = []IncomingTestCase{
 }
 
 func TestIncoming(t *testing.T) {
-	chs := []courier.Channel{
+	chs := []*models.Channel{
 		test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "CM", "2020", "MW", []string{urns.Phone.Prefix}, nil),
 	}
 
@@ -187,7 +188,24 @@ var outgoingCases = []OutgoingTestCase{
 				Body:    `{"app_id":"001-app","org_id":"001-org","user_id":"Username","timestamp":"20180411182430","auth_key":"3e1347ddb444d13aa23d11e097602be0","operation":"send","reference":"0191e180-7d60-7000-aded-7d8b151cbd5b","message_type":"1","src_address":"2020","dst_address":"+250788383383","message":"Error Message"}`,
 			},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Message",
+		MsgURN:  "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"http://example.com/send": {
+				httpx.NewMockResponse(429, nil, []byte(`{"code":"001","desc":"Database SQL Error"}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Headers: map[string]string{"Content-Type": "application/json"},
+				Body:    `{"app_id":"001-app","org_id":"001-org","user_id":"Username","timestamp":"20180411182430","auth_key":"3e1347ddb444d13aa23d11e097602be0","operation":"send","reference":"0191e180-7d60-7000-aded-7d8b151cbd5b","message_type":"1","src_address":"2020","dst_address":"+250788383383","message":"Error Message"}`,
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:          "Send Attachment",
@@ -221,7 +239,7 @@ var outgoingCases = []OutgoingTestCase{
 				Body:    `{"app_id":"001-app","org_id":"001-org","user_id":"Username","timestamp":"20180411182430","auth_key":"3e1347ddb444d13aa23d11e097602be0","operation":"send","reference":"0191e180-7d60-7000-aded-7d8b151cbd5b","message_type":"1","src_address":"2020","dst_address":"+250788383383","message":"Simple Message"}`,
 			},
 		},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 }
 

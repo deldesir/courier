@@ -6,12 +6,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/testsuite"
+	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -250,7 +257,7 @@ var noEvent = `{
 	"events": []
 }`
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "LN", "2020", "US",
 		[]string{urns.Line.Prefix},
 		map[string]any{
@@ -421,13 +428,13 @@ var defaultSendTestCases = []OutgoingTestCase{
 		Label:          "Send Audio Attachment",
 		MsgText:        "My Audio!",
 		MsgURN:         "line:uabcdefghij",
-		MsgAttachments: []string{"audio/mp3:http://mock.com/3456/test.mp3"},
+		MsgAttachments: []string{"audio/mp3:http://mock.com/media/9a4c4415-a06c-4edd-ad5b-33ed0be6b306/test.mp3"},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
 		},
 		ExpectedRequests: []ExpectedRequest{
 			{
-				Body: `{"to":"uabcdefghij","messages":[{"type":"audio","originalContentUrl":"http://mock.com/2345/test.m4a","duration":200},{"type":"text","text":"My Audio!"}]}`,
+				Body: `{"to":"uabcdefghij","messages":[{"type":"audio","originalContentUrl":"http://mock.com/media/d8f6d8bb-9dd0-4b34-98b8-f2e9e857f2b6/test.m4a","duration":200},{"type":"text","text":"My Audio!"}]}`,
 			},
 		},
 	},
@@ -435,13 +442,13 @@ var defaultSendTestCases = []OutgoingTestCase{
 		Label:          "Send Video Attachment",
 		MsgText:        "My Video!",
 		MsgURN:         "line:uabcdefghij",
-		MsgAttachments: []string{"video/mp4:http://mock.com/5678/test.mp4"},
+		MsgAttachments: []string{"video/mp4:http://mock.com/media/55be7386-6851-406f-9c02-2b17bd05eb45/test.mp4"},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
 		},
 		ExpectedRequests: []ExpectedRequest{
 			{
-				Body: `{"to":"uabcdefghij","messages":[{"type":"video","originalContentUrl":"http://mock.com/5678/test.mp4","previewImageUrl":"http://mock.com/4567/test.jpg"},{"type":"text","text":"My Video!"}]}`,
+				Body: `{"to":"uabcdefghij","messages":[{"type":"video","originalContentUrl":"http://mock.com/media/55be7386-6851-406f-9c02-2b17bd05eb45/test.mp4","previewImageUrl":"http://mock.com/media/2f8db4b2-e21c-4fe4-a049-4dbcecf83cf6/test.jpg"},{"type":"text","text":"My Video!"}]}`,
 			},
 		},
 	},
@@ -449,13 +456,13 @@ var defaultSendTestCases = []OutgoingTestCase{
 		Label:          "Send Image Attachment",
 		MsgText:        "My pic!",
 		MsgURN:         "line:uabcdefghij",
-		MsgAttachments: []string{"image/jpeg:http://mock.com/1234/test.jpg"},
+		MsgAttachments: []string{"image/jpeg:http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg"},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
 		},
 		ExpectedRequests: []ExpectedRequest{
 			{
-				Body: `{"to":"uabcdefghij","messages":[{"type":"image","originalContentUrl":"http://mock.com/1234/test.jpg","previewImageUrl":"http://mock.com/1234/test.jpg"},{"type":"text","text":"My pic!"}]}`,
+				Body: `{"to":"uabcdefghij","messages":[{"type":"image","originalContentUrl":"http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg","previewImageUrl":"http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg"},{"type":"text","text":"My pic!"}]}`,
 			},
 		},
 	},
@@ -463,13 +470,13 @@ var defaultSendTestCases = []OutgoingTestCase{
 		Label:          "Send Other Attachment",
 		MsgText:        "My doc!",
 		MsgURN:         "line:uabcdefghij",
-		MsgAttachments: []string{"application/pdf:http://mock.com/7890/test.pdf"},
+		MsgAttachments: []string{"application/pdf:http://mock.com/media/4b3a4a4e-2b4f-4bb1-9e0f-e19d17f0d0ea/test.pdf"},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
 		},
 		ExpectedRequests: []ExpectedRequest{
 			{
-				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"http://mock.com/7890/test.pdf"},{"type":"text","text":"My doc!"}]}`,
+				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"http://mock.com/media/4b3a4a4e-2b4f-4bb1-9e0f-e19d17f0d0ea/test.pdf"},{"type":"text","text":"My doc!"}]}`,
 			},
 		},
 	},
@@ -516,17 +523,65 @@ var defaultSendTestCases = []OutgoingTestCase{
 		},
 	},
 	{
+		Label:           "URI Action Quick Reply",
+		MsgText:         "Read more?",
+		MsgURN:          "line:uabcdefghij",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit", Extra: "http://example.com"}, {Type: "text", Text: "No"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"Read more?","quickReply":{"items":[{"type":"action","action":{"type":"uri","label":"Visit","uri":"http://example.com"}},{"type":"action","action":{"type":"message","label":"No","text":"No"}}]}}]}`,
+			},
+		},
+	},
+	{
+		Label:           "Quick Reply, URI Action without a URL is dropped",
+		MsgText:         "Read more?",
+		MsgURN:          "line:uabcdefghij",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit"}, {Type: "text", Text: "No"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"Read more?","quickReply":{"items":[{"type":"action","action":{"type":"message","label":"No","text":"No"}}]}}]}`,
+			},
+		},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type url is missing its extra value and can't be sent"},
+		},
+	},
+	{
+		Label:           "Quick Reply, unsupported types ignored",
+		MsgText:         "Are you happy?",
+		MsgURN:          "line:uabcdefghij",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Extra: "1234"}, {Type: "text", Text: "Yes"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"Are you happy?","quickReply":{"items":[{"type":"action","action":{"type":"message","label":"Yes","text":"Yes"}}]}}]}`,
+			},
+		},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type form isn't supported by this channel and can't be sent"},
+		},
+	},
+	{
 		Label:           "Quick Reply Combined and Attachment",
 		MsgText:         "Are you happy?",
 		MsgURN:          "line:uabcdefghij",
-		MsgAttachments:  []string{"image/jpeg:http://mock.com/1234/test.jpg"},
+		MsgAttachments:  []string{"image/jpeg:http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg"},
 		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
 		},
 		ExpectedRequests: []ExpectedRequest{
 			{
-				Body: `{"to":"uabcdefghij","messages":[{"type":"image","originalContentUrl":"http://mock.com/1234/test.jpg","previewImageUrl":"http://mock.com/1234/test.jpg"},{"type":"text","text":"Are you happy?","quickReply":{"items":[{"type":"action","action":{"type":"message","label":"Yes","text":"Yes"}},{"type":"action","action":{"type":"message","label":"No","text":"No"}}]}}]}`,
+				Body: `{"to":"uabcdefghij","messages":[{"type":"image","originalContentUrl":"http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg","previewImageUrl":"http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg"},{"type":"text","text":"Are you happy?","quickReply":{"items":[{"type":"action","action":{"type":"message","label":"Yes","text":"Yes"}},{"type":"action","action":{"type":"message","label":"No","text":"No"}}]}}]}`,
 			},
 		},
 	},
@@ -535,14 +590,14 @@ var defaultSendTestCases = []OutgoingTestCase{
 		MsgText:                 "This is a longer message than 160 characters and will cause us to split it into two separate parts, isn't that right but it is even longer than before I say, I need to keep adding more things to make it work",
 		MsgURN:                  "line:uabcdefghij",
 		MsgResponseToExternalID: "nHuyWiB7yP5Zw52FIkcQobQuGDXCTA",
-		MsgAttachments:          []string{"image/jpeg:http://mock.com/1234/test.jpg"},
+		MsgAttachments:          []string{"image/jpeg:http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg"},
 		MsgQuickReplies:         []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"https://api.line.me/v2/bot/message/reply": {httpx.NewMockResponse(200, nil, []byte(`{}`))},
 		},
 		ExpectedRequests: []ExpectedRequest{
 			{
-				Body: `{"replyToken":"nHuyWiB7yP5Zw52FIkcQobQuGDXCTA","messages":[{"type":"image","originalContentUrl":"http://mock.com/1234/test.jpg","previewImageUrl":"http://mock.com/1234/test.jpg"},{"type":"text","text":"This is a longer message than 160 characters and will cause us to split it into two separate parts, isn't that right but it is even longer than before I say,"},{"type":"text","text":"I need to keep adding more things to make it work","quickReply":{"items":[{"type":"action","action":{"type":"message","label":"Yes","text":"Yes"}},{"type":"action","action":{"type":"message","label":"No","text":"No"}}]}}]}`,
+				Body: `{"replyToken":"nHuyWiB7yP5Zw52FIkcQobQuGDXCTA","messages":[{"type":"image","originalContentUrl":"http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg","previewImageUrl":"http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg"},{"type":"text","text":"This is a longer message than 160 characters and will cause us to split it into two separate parts, isn't that right but it is even longer than before I say,"},{"type":"text","text":"I need to keep adding more things to make it work","quickReply":{"items":[{"type":"action","action":{"type":"message","label":"Yes","text":"Yes"}},{"type":"action","action":{"type":"message","label":"No","text":"No"}}]}}]}`,
 			},
 		},
 	},
@@ -572,7 +627,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"Error Sending"}]}`,
 			},
 		},
-		ExpectedError: courier.ErrResponseUnparseable,
+		ExpectedError: channels.ErrResponseUnparseable,
 	},
 	{
 		Label:   "Error Sending",
@@ -586,29 +641,59 @@ var defaultSendTestCases = []OutgoingTestCase{
 				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"Error Sending"}]}`,
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("403", "Failed to send messages"),
+		ExpectedError: channels.ErrFailedWithReason("403", "Failed to send messages"),
+	},
+	{
+		Label:   "Connection Error",
+		MsgText: "Error Sending",
+		MsgURN:  "line:uabcdefghij",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(503, nil, []byte(`{"message": "Service unavailable"}`))},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"Error Sending"}]}`,
+			},
+		},
+		ExpectedError: channels.ErrConnectionFailed,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Sending",
+		MsgURN:  "line:uabcdefghij",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.line.me/v2/bot/message/push": {httpx.NewMockResponse(429, nil, []byte(`{"message": "You have reached your monthly limit."}`))},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Body: `{"to":"uabcdefghij","messages":[{"type":"text","text":"Error Sending"}]}`,
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 }
 
-// setupMedia takes care of having the media files needed to our test server host
-func setupMedia(mb *test.MockBackend) {
-	imageJPG := test.NewMockMedia("test.jpg", "image/jpeg", "http://mock.com/1234/test.jpg", 1024*1024, 640, 480, 0, nil)
+// setupMedia takes care of having the media needed by our test cases in the test database
+func setupMedia(t *testing.T, rt *runtime.Runtime) {
+	rt.Config.MediaDomain = "mock.com"
 
-	audioM4A := test.NewMockMedia("test.m4a", "audio/mp4", "http://mock.com/2345/test.m4a", 1024*1024, 0, 0, 200, nil)
-	audioMP3 := test.NewMockMedia("test.mp3", "audio/mp3", "http://mock.com/3456/test.mp3", 1024*1024, 0, 0, 200, []*models.Media{audioM4A})
+	imageJPG := test.NewMockMedia("ec6972be-809c-4c8d-be59-ba9dbd74c977", "test.jpg", "image/jpeg", "http://mock.com/media/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg", 1024*1024, 640, 480, 0, nil)
 
-	thumbJPG := test.NewMockMedia("test.jpg", "image/jpeg", "http://mock.com/4567/test.jpg", 1024*1024, 640, 480, 0, nil)
-	videoMP4 := test.NewMockMedia("test.mp4", "video/mp4", "http://mock.com/5678/test.mp4", 1024*1024, 0, 0, 1000, []*models.Media{thumbJPG})
+	audioM4A := test.NewMockMedia("d8f6d8bb-9dd0-4b34-98b8-f2e9e857f2b6", "test.m4a", "audio/mp4", "http://mock.com/media/d8f6d8bb-9dd0-4b34-98b8-f2e9e857f2b6/test.m4a", 1024*1024, 0, 0, 200, nil)
+	audioMP3 := test.NewMockMedia("9a4c4415-a06c-4edd-ad5b-33ed0be6b306", "test.mp3", "audio/mp3", "http://mock.com/media/9a4c4415-a06c-4edd-ad5b-33ed0be6b306/test.mp3", 1024*1024, 0, 0, 200, []*models.Media{audioM4A})
 
-	videoMOV := test.NewMockMedia("test.mov", "video/quicktime", "http://mock.com/6789/test.mov", 100*1024*1024, 0, 0, 2000, nil)
+	thumbJPG := test.NewMockMedia("2f8db4b2-e21c-4fe4-a049-4dbcecf83cf6", "test.jpg", "image/jpeg", "http://mock.com/media/2f8db4b2-e21c-4fe4-a049-4dbcecf83cf6/test.jpg", 1024*1024, 640, 480, 0, nil)
+	videoMP4 := test.NewMockMedia("55be7386-6851-406f-9c02-2b17bd05eb45", "test.mp4", "video/mp4", "http://mock.com/media/55be7386-6851-406f-9c02-2b17bd05eb45/test.mp4", 1024*1024, 0, 0, 1000, []*models.Media{thumbJPG})
 
-	filePDF := test.NewMockMedia("test.pdf", "application/pdf", "http://mock.com/7890/test.pdf", 100*1024*1024, 0, 0, 0, nil)
+	videoMOV := test.NewMockMedia("1a1a5b81-6f4f-4bf9-9dfc-e0e13c8b0d47", "test.mov", "video/quicktime", "http://mock.com/media/1a1a5b81-6f4f-4bf9-9dfc-e0e13c8b0d47/test.mov", 100*1024*1024, 0, 0, 2000, nil)
 
-	mb.MockMedia(imageJPG)
-	mb.MockMedia(audioMP3)
-	mb.MockMedia(videoMP4)
-	mb.MockMedia(videoMOV)
-	mb.MockMedia(filePDF)
+	filePDF := test.NewMockMedia("4b3a4a4e-2b4f-4bb1-9e0f-e19d17f0d0ea", "test.pdf", "application/pdf", "http://mock.com/media/4b3a4a4e-2b4f-4bb1-9e0f-e19d17f0d0ea/test.pdf", 100*1024*1024, 0, 0, 0, nil)
+
+	testsuite.InsertMedia(t, rt, imageJPG)
+	testsuite.InsertMedia(t, rt, audioMP3)
+	testsuite.InsertMedia(t, rt, videoMP4)
+	testsuite.InsertMedia(t, rt, videoMOV)
+	testsuite.InsertMedia(t, rt, filePDF)
 }
 
 func TestOutgoing(t *testing.T) {
@@ -623,4 +708,51 @@ func TestBuildAttachmentRequest(t *testing.T) {
 	req, _ := lnHandler.BuildAttachmentRequest(context.Background(), testChannels[0], "https://example.org/v1/media/41", nil)
 	assert.Equal(t, "https://example.org/v1/media/41", req.URL.String())
 	assert.Equal(t, "Bearer the-auth-token", req.Header.Get("Authorization"))
+}
+
+func TestSendEvent(t *testing.T) {
+	ch := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "LN", "2020", "US", []string{urns.Line.Prefix}, map[string]any{"auth_token": "AccessToken"})
+
+	s := web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()))
+	h := newHandler().(*handler)
+	s.MountHandler(h)
+
+	s.Runtime().HTTP.Default.Transport = test.MockTransport(map[string][]*httpx.MockResponse{
+		"https://api.line.me/v2/bot/chat/loading/start": {
+			httpx.NewMockResponse(202, nil, []byte(`{}`)),
+			httpx.NewMockResponse(400, nil, []byte(`{"message": "The property, 'chatId', in the request body is invalid"}`)),
+			httpx.MockConnectionError,
+		},
+	})
+
+	// typing indicators are supported but there's no explicit stop
+	assert.Equal(t, map[string]time.Duration{events.TypeTypingStarted: 15 * time.Second}, h.SendableEvents(ch))
+
+	channelRef := assets.NewChannelReference("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "LINE")
+	typing := events.NewTypingStarted(events.DirectionOutgoing, channelRef, "line:uabcdefghij", "")
+
+	// a typing started event is sent as a loading indicator
+	clog := models.NewChannelLogForEventSend(ch, nil)
+	err := h.SendEvent(context.Background(), ch, typing, clog)
+	assert.NoError(t, err)
+	assert.Len(t, clog.HttpLogs, 1)
+	assert.Equal(t, "https://api.line.me/v2/bot/chat/loading/start", clog.HttpLogs[0].URL)
+	assert.Contains(t, clog.HttpLogs[0].Request, `{"chatId":"uabcdefghij","loadingSeconds":20}`)
+
+	// an error response is a response error
+	err = h.SendEvent(context.Background(), ch, typing, clog)
+	assert.Equal(t, channels.ErrResponseStatus, err)
+
+	// as is a connection error
+	err = h.SendEvent(context.Background(), ch, typing, clog)
+	assert.Equal(t, channels.ErrConnectionFailed, err)
+
+	// a channel without an auth token config can't send
+	noAuth := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "LN", "2020", "US", []string{urns.Line.Prefix}, nil)
+	err = h.SendEvent(context.Background(), noAuth, typing, clog)
+	assert.Equal(t, channels.ErrChannelConfig, err)
+
+	// nor can an event type the handler doesn't declare support for
+	err = h.SendEvent(context.Background(), ch, events.NewTypingStopped(events.DirectionOutgoing, channelRef, "line:uabcdefghij", ""), clog)
+	assert.ErrorContains(t, err, "unsupported event type: typing_stopped")
 }

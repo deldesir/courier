@@ -3,8 +3,9 @@ package clicksend
 import (
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
-	. "github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/core/channels"
+	"github.com/nyaruka/courier/v26/core/models"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
@@ -36,7 +37,7 @@ var incomingCases = []IncomingTestCase{
 }
 
 func TestIncoming(t *testing.T) {
-	chs := []courier.Channel{
+	chs := []*models.Channel{
 		test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "CS", "2020", "US", []string{urns.Phone.Prefix}, nil),
 	}
 
@@ -198,7 +199,24 @@ var outgoingCases = []OutgoingTestCase{
 				Body:    `{"messages":[{"to":"+250788383383","from":"2020","body":"Error Sending","source":"courier"}]}`,
 			},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Sending",
+		MsgURN:  "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://rest.clicksend.com/v3/sms/send": {
+				httpx.NewMockResponse(429, nil, []byte(`[{"Response": "101"}]`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Headers: map[string]string{"Authorization": "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="},
+				Body:    `{"messages":[{"to":"+250788383383","from":"2020","body":"Error Sending","source":"courier"}]}`,
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Failure Response",
@@ -215,7 +233,7 @@ var outgoingCases = []OutgoingTestCase{
 				Body:    `{"messages":[{"to":"+250788383383","from":"2020","body":"Error Sending","source":"courier"}]}`,
 			},
 		},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 	{
 		Label:   "Failure Response",
@@ -232,7 +250,7 @@ var outgoingCases = []OutgoingTestCase{
 				Body:    `{"messages":[{"to":"+250788383383","from":"2020","body":"Error Sending","source":"courier"}]}`,
 			},
 		},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 }
 

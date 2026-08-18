@@ -17,7 +17,7 @@ import (
 
 	"github.com/buger/jsonparser"
 	"github.com/gomodule/redigo/redis"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/utils"
@@ -36,7 +36,7 @@ const (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
@@ -45,7 +45,7 @@ type handler struct {
 	fetchTokenMutex sync.Mutex
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{
 		BaseHandler:     handlers.NewBaseHandler(models.ChannelType("JC"), "Jiochat"),
 		fetchTokenMutex: sync.Mutex{},
@@ -53,12 +53,11 @@ func newHandler() courier.ChannelHandler {
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodGet, "", courier.ChannelLogTypeWebhookVerify, h.VerifyURL)
-	s.AddHandlerRoute(h, http.MethodPost, "rcv/msg/message", courier.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	s.AddHandlerRoute(h, http.MethodPost, "rcv/event/menu", courier.ChannelLogTypeEventReceive, handlers.JSONPayload(h, h.receiveMessage))
-	s.AddHandlerRoute(h, http.MethodPost, "rcv/event/follow", courier.ChannelLogTypeEventReceive, handlers.JSONPayload(h, h.receiveMessage))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodGet, "", models.ChannelLogTypeWebhookVerify, h.VerifyURL)
+	r.Add(h, http.MethodPost, "rcv/msg/message", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
+	r.Add(h, http.MethodPost, "rcv/event/menu", models.ChannelLogTypeEventReceive, handlers.JSONPayload(h, h.receiveMessage))
+	r.Add(h, http.MethodPost, "rcv/event/follow", models.ChannelLogTypeEventReceive, handlers.JSONPayload(h, h.receiveMessage))
 	return nil
 }
 
@@ -70,7 +69,7 @@ type verifyForm struct {
 }
 
 // VerifyURL is our HTTP handler function for Jiochat config URL verification callbacks
-func (h *handler) VerifyURL(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) VerifyURL(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	form := &verifyForm{}
 	err := handlers.DecodeAndValidateForm(form, r)
 	if err != nil {
@@ -111,7 +110,7 @@ type moPayload struct {
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	if payload.MsgID == "" && payload.Event == "" {
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing parameters, must have either 'MsgId' or 'Event'"))
 	}
@@ -124,14 +123,14 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 
 	// subscribe event, trigger a new conversation
 	if payload.MsgType == "event" && payload.Event == "subscribe" {
-		channelEvent := h.Backend().NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog)
+		channelEvent := models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog)
 
-		err := h.Backend().WriteChannelEvent(ctx, channelEvent, clog)
+		err := models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
 		if err != nil {
 			return nil, err
 		}
 
-		return []courier.Event{channelEvent}, courier.WriteChannelEventSuccess(w, channelEvent)
+		return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
 	}
 
 	// unknown event type (we only deal with subscribe)
@@ -140,14 +139,14 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 	}
 
 	// create our message
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, payload.Content, payload.MsgID, clog).WithReceivedOn(date)
+	msg := models.NewIncomingMsg(channel, urn, payload.Content, payload.MsgID, clog).WithReceivedOn(date)
 	if payload.MsgType == "image" || payload.MsgType == "video" || payload.MsgType == "voice" {
 		mediaURL := buildMediaURL(payload.MediaID)
 		msg.WithAttachment(mediaURL)
 	}
 
 	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 }
 
 func buildMediaURL(mediaID string) string {
@@ -164,10 +163,10 @@ type mtPayload struct {
 	} `json:"text"`
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	accessToken, err := h.getAccessToken(msg.Channel(), clog)
 	if err != nil {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	parts := handlers.SplitMsgByChannel(msg.Channel(), handlers.GetTextAndAttachments(msg), maxMsgLength)
@@ -187,10 +186,8 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 
 		resp, _, err := h.RequestHTTP(req, clog)
-		if err != nil || resp.StatusCode/100 == 5 {
-			return courier.ErrConnectionFailed
-		} else if resp.StatusCode/100 != 2 {
-			return courier.ErrResponseStatus
+		if err := handlers.ErrorFromResponse(resp, err); err != nil {
+			return err
 		}
 
 	}
@@ -199,7 +196,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 }
 
 // DescribeURN handles Jiochat contact details
-func (h *handler) DescribeURN(ctx context.Context, channel courier.Channel, urn urns.URN, clog *courier.ChannelLog) (map[string]string, error) {
+func (h *handler) DescribeURN(ctx context.Context, channel *models.Channel, urn urns.URN, clog *models.ChannelLog) (map[string]string, error) {
 	accessToken, err := h.getAccessToken(channel, clog)
 	if err != nil {
 		return nil, err
@@ -226,14 +223,14 @@ func (h *handler) DescribeURN(ctx context.Context, channel courier.Channel, urn 
 	return map[string]string{"name": nickname}, nil
 }
 
-func (h *handler) RedactValues(ch courier.Channel) []string {
+func (h *handler) RedactValues(ch *models.Channel) []string {
 	return []string{
 		ch.StringConfigForKey(configAppSecret, ""),
 	}
 }
 
 // BuildAttachmentRequest download media for message attachment
-func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Channel, attachmentURL string, clog *courier.ChannelLog) (*http.Request, error) {
+func (h *handler) BuildAttachmentRequest(ctx context.Context, channel *models.Channel, attachmentURL string, clog *models.ChannelLog) (*http.Request, error) {
 	parsedURL, err := url.Parse(attachmentURL)
 	if err != nil {
 		return nil, err
@@ -250,9 +247,9 @@ func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Ch
 	return req, nil
 }
 
-var _ courier.AttachmentRequestBuilder = (*handler)(nil)
+var _ channels.AttachmentRequestBuilder = (*handler)(nil)
 
-func (h *handler) getAccessToken(channel courier.Channel, clog *courier.ChannelLog) (string, error) {
+func (h *handler) getAccessToken(channel *models.Channel, clog *models.ChannelLog) (string, error) {
 	tokenKey := fmt.Sprintf("channel-token:%s", channel.UUID())
 
 	h.fetchTokenMutex.Lock()
@@ -295,7 +292,7 @@ type fetchPayload struct {
 }
 
 // fetchAccessToken tries to fetch a new token for our channel
-func (h *handler) fetchAccessToken(channel courier.Channel, clog *courier.ChannelLog) (string, time.Duration, error) {
+func (h *handler) fetchAccessToken(channel *models.Channel, clog *models.ChannelLog) (string, time.Duration, error) {
 	tokenURL, _ := url.Parse(fmt.Sprintf("%s/%s", sendURL, "auth/token.action"))
 	payload := &fetchPayload{
 		GrantType:    "client_credentials",
@@ -317,7 +314,7 @@ func (h *handler) fetchAccessToken(channel courier.Channel, clog *courier.Channe
 
 	token, err := jsonparser.GetString(respBody, "access_token")
 	if err != nil {
-		clog.Error(courier.ErrorResponseValueMissing("access_token"))
+		clog.Error(models.ErrorResponseValueMissing("access_token"))
 		return "", 0, err
 	}
 

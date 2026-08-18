@@ -1,13 +1,14 @@
 package whatsapp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/gocommon/urns"
 )
@@ -44,10 +45,13 @@ type WAError struct {
 	Title string `json:"title"`
 }
 
-func (e WAError) ErrorChannelLog(clog *courier.ChannelLog) {
-	clog.Error(courier.ErrorExternal(strconv.Itoa(e.Code), e.Title))
+func (e WAError) ErrorChannelLog(clog *models.ChannelLog) {
+	clog.Error(models.ErrorExternal(strconv.Itoa(e.Code), e.Title))
 }
 
+// note that we deliberately don't read the parent_user_id / from_parent_user_id fields that accompany the BSUID
+// fields below - a parent BSUID identifies the user across a business's portfolios rather than to this channel, and
+// isn't an address we can send to, so it isn't a messaging identity we have any use for
 type WAContact struct {
 	Profile struct {
 		Name string `json:"name"`
@@ -97,11 +101,27 @@ type WAMessage struct {
 			ID    string `json:"id"`
 			Title string `json:"title"`
 		} `json:"list_reply,omitempty"`
+		NFMReply struct {
+			Name         string `json:"name"`
+			Body         string `json:"body"`
+			ResponseJSON string `json:"response_json"`
+		} `json:"nfm_reply,omitempty"`
 	} `json:"interactive,omitempty"`
 	Errors []WAError `json:"errors"`
 }
 
-func (m WAMessage) ExtractData(clog *courier.ChannelLog) (time.Time, urns.URN, string, string, string, error, error) {
+// Identifier returns the identifier of the sender of this message. Normally that's their phone number, but a user
+// who has adopted a WhatsApp username has their phone number omitted from the webhook entirely unless the business
+// meets one of the phone number retention conditions, and is identified only by their business-scoped user ID.
+// See https://developers.facebook.com/documentation/business-messaging/whatsapp/business-scoped-user-ids/
+func (m WAMessage) Identifier() string {
+	if m.From != "" {
+		return m.From
+	}
+	return m.FromUserID
+}
+
+func (m WAMessage) ExtractData(clog *models.ChannelLog) (time.Time, urns.URN, string, string, string, error, error) {
 	var err error
 	var finalErr error
 	var date time.Time
@@ -118,7 +138,7 @@ func (m WAMessage) ExtractData(clog *courier.ChannelLog) (time.Time, urns.URN, s
 	}
 	date = parseTimestamp(ts)
 
-	urn, err = urns.New(urns.WhatsApp, m.From)
+	urn, err = urns.New(urns.WhatsApp, m.Identifier())
 	if err != nil {
 		finalErr = errors.New("invalid whatsapp id")
 		return date, urn, text, mediaURL, mediaID, err, finalErr
@@ -173,6 +193,8 @@ func (m WAMessage) ExtractTextAndMedia() (string, string, string, error) {
 		text = m.Interactive.ButtonReply.Title
 	} else if m.Type == "interactive" && m.Interactive.Type == "list_reply" {
 		text = m.Interactive.ListReply.Title
+	} else if m.Type == "interactive" && m.Interactive.Type == "nfm_reply" {
+		text = m.Interactive.NFMReply.Body
 	} else {
 		// we received a message type we do not support.
 		err = fmt.Errorf("unsupported message type %s", m.Type)
@@ -180,6 +202,18 @@ func (m WAMessage) ExtractTextAndMedia() (string, string, string, error) {
 
 	return text, mediaURL, mediaID, err
 
+}
+
+// ExtractPayload returns the structured payload of this message if it has one - i.e. for a flow (nfm) reply, the
+// response JSON if it's a valid JSON object - or nil if it doesn't.
+func (m WAMessage) ExtractPayload() json.RawMessage {
+	if m.Type == "interactive" && m.Interactive.Type == "nfm_reply" {
+		raw := strings.TrimSpace(m.Interactive.NFMReply.ResponseJSON)
+		if strings.HasPrefix(raw, "{") && json.Valid([]byte(raw)) {
+			return json.RawMessage(raw)
+		}
+	}
+	return nil
 }
 
 type WAStatus struct {
@@ -287,29 +321,44 @@ type Template struct {
 	Components []*Component `json:"components,omitempty"`
 }
 
+// parameters for flow actions (https://developers.facebook.com/docs/whatsapp/flows/gettingstarted/sendingaflow)
+// and cta_url actions (https://developers.facebook.com/docs/whatsapp/cloud-api/messages/interactive-cta-url-messages)
+type ActionParameters struct {
+	FlowMessageVersion string `json:"flow_message_version,omitempty"`
+	FlowID             string `json:"flow_id,omitempty"`
+	FlowCTA            string `json:"flow_cta,omitempty"`
+	DisplayText        string `json:"display_text,omitempty"`
+	URL                string `json:"url,omitempty"`
+}
+
+type Header struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Video    *Media `json:"video,omitempty"`
+	Image    *Media `json:"image,omitempty"`
+	Document *Media `json:"document,omitempty"`
+}
+
+type Action struct {
+	Name       string            `json:"name,omitempty"`
+	Button     string            `json:"button,omitempty"`
+	Sections   []Section         `json:"sections,omitempty"`
+	Buttons    []Button          `json:"buttons,omitempty"`
+	Parameters *ActionParameters `json:"parameters,omitempty"`
+}
+
 // see https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#interactive-object
 // e.g. https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#interactive-messages
 type Interactive struct {
-	Type   string `json:"type"`
-	Header *struct {
-		Type     string `json:"type"`
-		Text     string `json:"text,omitempty"`
-		Video    *Media `json:"video,omitempty"`
-		Image    *Media `json:"image,omitempty"`
-		Document *Media `json:"document,omitempty"`
-	} `json:"header,omitempty"`
-	Body struct {
+	Type   string  `json:"type"`
+	Header *Header `json:"header,omitempty"`
+	Body   struct {
 		Text string `json:"text"`
 	} `json:"body" validate:"required"`
 	Footer *struct {
 		Text string `json:"text"`
 	} `json:"footer,omitempty"`
-	Action *struct {
-		Name     string    `json:"name,omitempty"`
-		Button   string    `json:"button,omitempty"`
-		Sections []Section `json:"sections,omitempty"`
-		Buttons  []Button  `json:"buttons,omitempty"`
-	} `json:"action,omitempty"`
+	Action *Action `json:"action,omitempty"`
 }
 
 // see https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages#request-syntax
@@ -347,6 +396,24 @@ type SendResponse struct {
 		Message string `json:"message"`
 		Code    int    `json:"code"`
 	} `json:"error"`
+}
+
+// A request to mark an incoming message as read and show a typing indicator, which lasts until a reply
+// is sent or 25 seconds pass. See https://developers.facebook.com/docs/whatsapp/cloud-api/typing-indicators
+type TypingRequest struct {
+	MessagingProduct string `json:"messaging_product"`
+	Status           string `json:"status"`
+	MessageID        string `json:"message_id"`
+	TypingIndicator  struct {
+		Type string `json:"type"`
+	} `json:"typing_indicator"`
+}
+
+// NewTypingRequest creates a typing indicator request referencing the given incoming message
+func NewTypingRequest(msgID string) *TypingRequest {
+	r := &TypingRequest{MessagingProduct: "whatsapp", Status: "read", MessageID: msgID}
+	r.TypingIndicator.Type = "text"
+	return r
 }
 
 // UserID returns the user_id from the first contact in the response if present.

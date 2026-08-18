@@ -6,16 +6,17 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
-	"github.com/nyaruka/courier/v26/utils/clogs"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "MBD", "18005551212", "US", []string{urns.Phone.Prefix}, map[string]any{
 		"secret":     "my_super_secret", // secret key to sign for sig
 		"auth_token": "authtoken",       //API bearer token
@@ -183,7 +184,7 @@ var defaultReceiveTestCases = []IncomingTestCase{
 		ExpectedEvents: []ExpectedEvent{
 			{Type: models.EventTypeStopContact, URN: "tel:+18885551515"},
 		},
-		ExpectedErrors: []*clogs.Error{courier.ErrorExternal("103", "Contact has sent 'stop'")},
+		ExpectedErrors: []*svclogs.Error{models.ErrorExternal("103", "Contact has sent 'stop'")},
 	},
 	{
 		Label:                "Receive Invalid Status",
@@ -302,7 +303,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "application/json", "Authorization": "AccessKey authtoken"},
 			Body:    `{"recipients":["188885551515"],"reference":"0191e180-7d60-7000-aded-7d8b151cbd5b","originator":"18005551212","body":"Simple Message ☺"}`,
 		}},
-		ExpectedError: courier.ErrConnectionFailed,
+		ExpectedError: channels.ErrConnectionFailed,
 	},
 	{
 		Label:   "404 on Send",
@@ -317,7 +318,22 @@ var defaultSendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "application/json", "Authorization": "AccessKey authtoken"},
 			Body:    `{"recipients":["188885551515"],"reference":"0191e180-7d60-7000-aded-7d8b151cbd5b","originator":"18005551212","body":"Simple Message ☺"}`,
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Simple Message ☺",
+		MsgURN:  "tel:188885551515",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://rest.messagebird.com/messages": {
+				httpx.NewMockResponse(429, nil, []byte(validResponse)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{"Content-Type": "application/json", "Authorization": "AccessKey authtoken"},
+			Body:    `{"recipients":["188885551515"],"reference":"0191e180-7d60-7000-aded-7d8b151cbd5b","originator":"18005551212","body":"Simple Message ☺"}`,
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 }
 

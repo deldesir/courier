@@ -15,12 +15,13 @@ import (
 	"time"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/core/events"
 )
 
 var (
@@ -51,6 +52,10 @@ var (
 	actionGetUser = "/users.get.json"
 	paramUserIds  = "user_ids"
 
+	// set activity
+	actionSetActivity = "/messages.setActivity.json"
+	paramType         = "type"
+
 	// send message
 	actionSendMessage = "/messages.send.json"
 	paramUserId       = "user_id"
@@ -77,20 +82,19 @@ var (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("VK"), "VK")}
 }
 
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
 	return nil
 }
 
@@ -193,7 +197,7 @@ type mediaUploadInfoPayload struct {
 }
 
 // receiveEvent handles request event type
-func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	// check shared secret key before proceeding
 	secret := channel.StringConfigForKey(models.ConfigSecret, "")
 
@@ -203,12 +207,12 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 	// check event type and decode body to correspondent struct
 	switch payload.Type {
 	case eventTypeServerVerification:
-		clog.Type = courier.ChannelLogTypeWebhookVerify
+		clog.Type = models.ChannelLogTypeWebhookVerify
 
 		return h.verifyServer(channel, w)
 
 	case eventTypeNewMessage:
-		clog.Type = courier.ChannelLogTypeMsgReceive
+		clog.Type = models.ChannelLogTypeMsgReceive
 
 		newMessage := &moNewMessagePayload{}
 
@@ -223,7 +227,7 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 }
 
 // verifyServer handles VK's callback verification
-func (h *handler) verifyServer(channel courier.Channel, w http.ResponseWriter) ([]courier.Event, error) {
+func (h *handler) verifyServer(channel *models.Channel, w http.ResponseWriter) ([]channels.Event, error) {
 	verificationString := channel.StringConfigForKey(configServerVerificationString, "")
 	// write required response
 	_, err := fmt.Fprint(w, verificationString)
@@ -232,7 +236,7 @@ func (h *handler) verifyServer(channel courier.Channel, w http.ResponseWriter) (
 }
 
 // receiveMessage handles new message event
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moNewMessagePayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moNewMessagePayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	userId := payload.Object.Message.UserId
 	urn, err := urns.New(urns.VK, strconv.FormatInt(userId, 10))
 
@@ -242,7 +246,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 	date := time.Unix(payload.Object.Message.Date, 0).UTC()
 	text := payload.Object.Message.Text
 	externalId := strconv.FormatInt(payload.Object.Message.Id, 10)
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, externalId, clog).WithReceivedOn(date)
+	msg := models.NewIncomingMsg(channel, urn, text, externalId, clog).WithReceivedOn(date)
 
 	if attachment := takeFirstAttachmentUrl(*payload); attachment != "" {
 		msg.WithAttachment(attachment)
@@ -252,17 +256,17 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("no text or attachment"))
 	}
 	// save message to our backend
-	if err := h.Backend().WriteMsg(ctx, msg, clog); err != nil {
+	if err := models.WriteMsg(ctx, h.Runtime(), msg, clog); err != nil {
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
 	}
 	// write required response
 	_, err = fmt.Fprint(w, responseIncomingMessage)
 
-	return []courier.Event{msg}, err
+	return []channels.Event{msg}, err
 }
 
 // DescribeURN handles VK contact details
-func (h *handler) DescribeURN(ctx context.Context, channel courier.Channel, urn urns.URN, clog *courier.ChannelLog) (map[string]string, error) {
+func (h *handler) DescribeURN(ctx context.Context, channel *models.Channel, urn urns.URN, clog *models.ChannelLog) (map[string]string, error) {
 	req, err := http.NewRequest(http.MethodPost, apiBaseURL+actionGetUser, nil)
 	if err != nil {
 		return nil, err
@@ -298,7 +302,7 @@ func (h *handler) DescribeURN(ctx context.Context, channel courier.Channel, urn 
 }
 
 // buildApiBaseParams builds required params to VK API requests
-func buildApiBaseParams(channel courier.Channel) url.Values {
+func buildApiBaseParams(channel *models.Channel) url.Values {
 	return url.Values{
 		paramApiVersion:  []string{apiVersion},
 		paramAccessToken: []string{channel.StringConfigForKey(models.ConfigAuthToken, "")},
@@ -375,7 +379,50 @@ func takeFirstAttachmentUrl(payload moNewMessagePayload) string {
 	return ""
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+// VK displays typing activity for up to 10 seconds or until a message is sent
+var sendableEvents = map[string]time.Duration{events.TypeTypingStarted: 8 * time.Second}
+
+// SendableEvents declares support for typing indicators
+func (h *handler) SendableEvents(*models.Channel) map[string]time.Duration {
+	return sendableEvents
+}
+
+// SendEvent sends a typing started event to the contact as a typing activity, see
+// https://dev.vk.com/en/method/messages.setActivity
+func (h *handler) SendEvent(ctx context.Context, ch *models.Channel, event events.Event, clog *models.ChannelLog) error {
+	typing, ok := event.(*events.TypingStarted)
+	if !ok {
+		return fmt.Errorf("unsupported event type: %s", event.Type())
+	}
+
+	if ch.StringConfigForKey(models.ConfigAuthToken, "") == "" {
+		return channels.ErrChannelConfig
+	}
+
+	params := buildApiBaseParams(ch)
+	params.Set(paramUserId, typing.URN.Path())
+	params.Set(paramType, "typing")
+
+	req, err := http.NewRequest(http.MethodPost, apiBaseURL+actionSetActivity, nil)
+	if err != nil {
+		return err
+	}
+	req.URL.RawQuery = params.Encode()
+
+	resp, respBody, err := h.RequestHTTP(req, clog)
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
+	}
+
+	// VK reports errors in a 200 response, success is {"response": 1}
+	if _, err := jsonparser.GetInt(respBody, responseOutgoingMessageKey); err != nil {
+		return channels.ErrResponseStatus
+	}
+
+	return nil
+}
+
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	params := buildApiBaseParams(msg.Channel())
 	params.Set(paramUserId, msg.URN().Path())
 	params.Set(paramRandomId, string(msg.UUID()))
@@ -384,7 +431,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	params.Set(paramMessage, text)
 	params.Set(paramAttachments, attachments)
 
-	qrs := msg.QuickReplies()
+	qrs := handlers.FilterSupportedQuickReplies(msg.QuickReplies(), clog, models.QuickReplyTypeText, models.QuickReplyTypeLocation, models.QuickReplyTypeURL)
 	if len(qrs) != 0 {
 		keyboard := NewKeyboardFromReplies(qrs)
 
@@ -399,15 +446,13 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	req.URL.RawQuery = params.Encode()
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
-	if err != nil || resp.StatusCode/100 == 5 {
-		return courier.ErrConnectionFailed
-	} else if resp.StatusCode/100 != 2 {
-		return courier.ErrResponseStatus
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
 	}
 
 	externalMsgId, err := jsonparser.GetInt(respBody, responseOutgoingMessageKey)
 	if err != nil {
-		return courier.ErrResponseContent
+		return channels.ErrResponseContent
 	}
 
 	res.AddExternalID(strconv.FormatInt(externalMsgId, 10))
@@ -416,7 +461,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 }
 
 // builds msg text with attachment links (if needed) and attachments list param, also returns the errors that occurred
-func (h *handler) buildTextAndAttachmentParams(msg courier.MsgOut, clog *courier.ChannelLog) (string, string) {
+func (h *handler) buildTextAndAttachmentParams(msg *models.MsgOut, clog *models.ChannelLog) (string, string) {
 	var msgAttachments []string
 
 	textBuf := bytes.Buffer{}
@@ -449,7 +494,7 @@ func (h *handler) buildTextAndAttachmentParams(msg courier.MsgOut, clog *courier
 }
 
 // handles media downloading, uploading, saving information and returns the attachment string
-func (h *handler) handleMediaUploadAndGetAttachment(channel courier.Channel, mediaType, mediaExt, mediaURL string, clog *courier.ChannelLog) (string, error) {
+func (h *handler) handleMediaUploadAndGetAttachment(channel *models.Channel, mediaType, mediaExt, mediaURL string, clog *models.ChannelLog) (string, error) {
 	switch mediaType {
 	case mediaTypeImage:
 		uploadKey := "photo"
@@ -491,7 +536,7 @@ func (h *handler) handleMediaUploadAndGetAttachment(channel courier.Channel, med
 }
 
 // getUploadServerURL gets VK's media upload server
-func (h *handler) getUploadServerURL(channel courier.Channel, sendURL string, clog *courier.ChannelLog) (string, error) {
+func (h *handler) getUploadServerURL(channel *models.Channel, sendURL string, clog *models.ChannelLog) (string, error) {
 	req, err := http.NewRequest(http.MethodPost, sendURL, nil)
 
 	if err != nil {
@@ -522,7 +567,7 @@ func (h *handler) downloadMedia(mediaURL string) (io.Reader, error) {
 	}
 
 	// access control is enforced by the client's transport
-	if res, err := h.Runtime().HTTP.Do(req); err == nil {
+	if res, err := h.Runtime().HTTP.Default.Do(req); err == nil {
 		return res.Body, nil
 	} else {
 		return nil, err
@@ -530,7 +575,7 @@ func (h *handler) downloadMedia(mediaURL string) (io.Reader, error) {
 }
 
 // uploadMedia multiform request that passes file key as uploadKey and file value as media to upload server
-func (h *handler) uploadMedia(serverURL, uploadKey, mediaExt string, media io.Reader, clog *courier.ChannelLog) ([]byte, error) {
+func (h *handler) uploadMedia(serverURL, uploadKey, mediaExt string, media io.Reader, clog *models.ChannelLog) ([]byte, error) {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	fileName := fmt.Sprintf("%s.%s", uploadKey, mediaExt)
@@ -565,7 +610,7 @@ func (h *handler) uploadMedia(serverURL, uploadKey, mediaExt string, media io.Re
 }
 
 // saveUploadedMediaInfo saves uploaded media info and returns an object containing media/owner id
-func (h *handler) saveUploadedMediaInfo(channel courier.Channel, sendURL, serverId, hash, mediaKey, mediaValue string, clog *courier.ChannelLog) (*mediaUploadInfoPayload, error) {
+func (h *handler) saveUploadedMediaInfo(channel *models.Channel, sendURL, serverId, hash, mediaKey, mediaValue string, clog *models.ChannelLog) (*mediaUploadInfoPayload, error) {
 	params := buildApiBaseParams(channel)
 	params.Set(paramServerId, serverId)
 	params.Set(paramHash, hash)

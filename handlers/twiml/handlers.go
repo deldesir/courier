@@ -11,6 +11,7 @@ import (
 	"crypto/sha1"
 	_ "embed"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,18 +19,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/utils"
-	"github.com/nyaruka/courier/v26/utils/clogs"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
 	"github.com/nyaruka/gocommon/jsonx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
+	"github.com/nyaruka/goflow/core/events"
 )
 
 const (
@@ -47,6 +50,8 @@ const (
 var (
 	maxMsgLength  = 1600
 	twilioBaseURL = "https://api.twilio.com"
+
+	typingIndicatorURL = "https://messaging.twilio.com/v3/Indicators/Typing.json"
 
 	//go:embed errors.json
 	errorCodes []byte
@@ -69,23 +74,22 @@ type handler struct {
 	validateSignatures bool
 }
 
-func newTWIMLHandler(channelType models.ChannelType, name string, validateSignatures bool) courier.ChannelHandler {
+func newTWIMLHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.Handler {
 	return &handler{handlers.NewBaseHandler(channelType, name), validateSignatures}
 }
 
 func init() {
-	courier.RegisterHandler(newTWIMLHandler("TW", "TWIML API", true))
-	courier.RegisterHandler(newTWIMLHandler("T", "Twilio", true))
-	courier.RegisterHandler(newTWIMLHandler("TMS", "Twilio Messaging Service", true))
-	courier.RegisterHandler(newTWIMLHandler("TWA", "Twilio Whatsapp", true))
-	courier.RegisterHandler(newTWIMLHandler("SW", "SignalWire", false))
+	channels.RegisterHandler(newTWIMLHandler("TW", "TWIML API", true))
+	channels.RegisterHandler(newTWIMLHandler("T", "Twilio", true))
+	channels.RegisterHandler(newTWIMLHandler("TMS", "Twilio Messaging Service", true))
+	channels.RegisterHandler(newTWIMLHandler("TWA", "Twilio Whatsapp", true))
+	channels.RegisterHandler(newTWIMLHandler("SW", "SignalWire", false))
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, h.receiveMessage)
-	s.AddHandlerRoute(h, http.MethodPost, "status", courier.ChannelLogTypeMsgStatus, h.receiveStatus)
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
+	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
 	return nil
 }
 
@@ -119,7 +123,7 @@ var statusMapping = map[string]models.MsgStatus{
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	err := h.validateSignature(channel, r)
 	if err != nil {
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
@@ -148,13 +152,15 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 	}
 
 	// build our msg
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, form.MessageSID, clog)
+	msg := models.NewIncomingMsg(channel, urn, text, form.MessageSID, clog)
 
 	if form.ExternalUserId != "" && channel.IsScheme(urns.WhatsApp) {
 		userIDURN, urnErr := h.parseURN(channel, form.ExternalUserId, i18n.Country(form.FromCountry))
 
 		if urnErr == nil {
-			msg.WithNewURN(userIDURN, models.NewURNAppend)
+			if userIDURN != urn {
+				msg.WithNewURN(userIDURN, models.NewURNAppend)
+			}
 		} else {
 			slog.Warn("ignoring invalid ExternalUserId for message", "ExternalUserId", form.ExternalUserId, "MessageSID", form.MessageSID, "Error", urnErr.Error())
 
@@ -166,11 +172,11 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 		mediaURL := r.PostForm.Get(fmt.Sprintf("MediaUrl%d", i))
 		msg.WithAttachment(mediaURL)
 	}
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 }
 
 // receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	err := h.validateSignature(channel, r)
 	if err != nil {
 		return nil, err
@@ -193,13 +199,15 @@ func (h *handler) receiveStatus(ctx context.Context, channel courier.Channel, w 
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring non error delivery report")
 	}
 
-	var status courier.StatusUpdate
+	var status *models.StatusUpdate
 	if uuidString := r.URL.Query().Get("uuid"); uuids.Is(uuidString) {
 		// if the message UUID was passed explicitely, use that
-		status = h.Backend().NewStatusUpdate(channel, models.MsgUUID(uuidString), msgStatus, clog)
+		status = models.NewStatusUpdate(channel, models.MsgUUID(uuidString), msgStatus, clog)
 	} else {
-		status = h.Backend().NewStatusUpdateByExternalID(channel, form.MessageSID, msgStatus, clog)
+		status = models.NewStatusUpdateByExternalID(channel, form.MessageSID, msgStatus, clog)
 	}
+
+	var stopEvent *models.ChannelEvent
 
 	errorCode, _ := strconv.ParseInt(form.ErrorCode, 10, 64)
 	if errorCode != 0 {
@@ -210,22 +218,26 @@ func (h *handler) receiveStatus(ctx context.Context, channel courier.Channel, w 
 			}
 
 			// create a stop channel event
-			channelEvent := h.Backend().NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
-			err = h.Backend().WriteChannelEvent(ctx, channelEvent, clog)
+			stopEvent = models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
+			err = models.WriteChannelEvent(ctx, h.Runtime(), stopEvent, clog)
 			if err != nil {
 				return nil, err
 			}
 		}
 		clog.Error(twilioError(errorCode))
 		if errorCode == errorThrottled {
-			status = h.Backend().NewStatusUpdateByExternalID(channel, form.MessageSID, models.MsgStatusErrored, clog)
+			status = models.NewStatusUpdateByExternalID(channel, form.MessageSID, models.MsgStatusErrored, clog)
 		}
 	}
 
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	events, err := handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	if stopEvent != nil {
+		events = append(events, stopEvent)
+	}
+	return events, err
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	// build our callback URL
 	callbackDomain := msg.Channel().CallbackDomain(h.Runtime().Config.Domain)
 	callbackURL := fmt.Sprintf("https://%s/c/%s/%s/status?uuid=%s&action=callback", callbackDomain, strings.ToLower(string(h.ChannelType())), msg.Channel().UUID(), msg.UUID())
@@ -233,12 +245,12 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	accountSID := msg.Channel().StringConfigForKey(configAccountSID, "")
 	accountToken := msg.Channel().StringConfigForKey(models.ConfigAuthToken, "")
 	if accountSID == "" || accountToken == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	channel := msg.Channel()
 
-	attachments, err := handlers.ResolveAttachments(ctx, h.Backend(), msg.Attachments(), mediaSupport, true, clog)
+	attachments, err := handlers.ResolveAttachments(ctx, h.Runtime(), msg.Attachments(), mediaSupport, true, clog)
 	if err != nil {
 		return err
 	}
@@ -246,11 +258,11 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	// do we have a template and support whatsapp scheme?
 	if msg.Templating() != nil && channel.IsScheme(urns.WhatsApp) {
 		if msg.Templating().ExternalID == "" {
-			return courier.ErrMessageInvalid
+			return channels.ErrMessageInvalid
 		}
 
 		form := url.Values{
-			"To":             []string{fmt.Sprintf("%s:+%s", urns.WhatsApp.Prefix, msg.URN().Path())},
+			"To":             []string{whatsAppAddress(msg.URN())},
 			"StatusCallback": []string{callbackURL},
 			"ContentSid":     []string{msg.Templating().ExternalID},
 		}
@@ -286,7 +298,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		// build our URL
 		baseURL := h.baseURL(channel)
 		if baseURL == "" {
-			return courier.ErrChannelConfig
+			return channels.ErrChannelConfig
 		}
 
 		sendURL, err := utils.AddURLPath(baseURL, "2010-04-01", "Accounts", accountSID, "Messages.json")
@@ -304,7 +316,11 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 
 		resp, respBody, err := h.RequestHTTP(req, clog)
 		if err != nil || resp.StatusCode/100 == 5 {
-			return courier.ErrConnectionFailed
+			return channels.ErrConnectionFailed
+		}
+		// Twilio rate limits with a 429 (error 20429) and those requests aren't processed, so retry
+		if handlers.IsThrottled(resp) {
+			return channels.ErrConnectionThrottled
 		}
 
 		// see if we can parse the error if we have one
@@ -312,23 +328,23 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 			errorCode, _ := jsonparser.GetInt(respBody, "code")
 			if errorCode != 0 {
 				if errorCode == errorStopped {
-					return courier.ErrContactStopped
+					return channels.ErrContactStopped
 				}
 				codeAsStr := strconv.Itoa(int(errorCode))
 				errMsg, err := jsonparser.GetString(errorCodes, codeAsStr)
 				if err != nil {
 					errMsg = fmt.Sprintf("Service specific error: %s.", codeAsStr)
 				}
-				return courier.ErrFailedWithReason(codeAsStr, errMsg)
+				return channels.ErrFailedWithReason(codeAsStr, errMsg)
 			}
 
-			return courier.ErrResponseStatus
+			return channels.ErrResponseStatus
 		}
 
 		// grab the external id
 		externalID, err := jsonparser.GetString(respBody, "sid")
 		if err != nil {
-			clog.Error(courier.ErrorResponseValueMissing("sid"))
+			clog.Error(models.ErrorResponseValueMissing("sid"))
 		} else {
 			res.AddExternalID(externalID)
 		}
@@ -368,14 +384,14 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 
 			// for whatsapp channels, we have to prepend whatsapp to the To and From
 			if channel.IsScheme(urns.WhatsApp) {
-				form["To"][0] = fmt.Sprintf("%s:+%s", urns.WhatsApp.Prefix, form["To"][0])
+				form["To"][0] = whatsAppAddress(msg.URN())
 				form["From"][0] = fmt.Sprintf("%s:%s", urns.WhatsApp.Prefix, form["From"][0])
 			}
 
 			// build our URL
 			baseURL := h.baseURL(channel)
 			if baseURL == "" {
-				return courier.ErrChannelConfig
+				return channels.ErrChannelConfig
 			}
 
 			sendURL, err := utils.AddURLPath(baseURL, "2010-04-01", "Accounts", accountSID, "Messages.json")
@@ -393,7 +409,11 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 
 			resp, respBody, err := h.RequestHTTP(req, clog)
 			if err != nil || resp.StatusCode/100 == 5 {
-				return courier.ErrConnectionFailed
+				return channels.ErrConnectionFailed
+			}
+			// Twilio rate limits with a 429 (error 20429) and those requests aren't processed, so retry
+			if handlers.IsThrottled(resp) {
+				return channels.ErrConnectionThrottled
 			}
 
 			// see if we can parse the error if we have one
@@ -401,23 +421,23 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 				errorCode, _ := jsonparser.GetInt(respBody, "code")
 				if errorCode != 0 {
 					if errorCode == errorStopped {
-						return courier.ErrContactStopped
+						return channels.ErrContactStopped
 					}
 					codeAsStr := strconv.Itoa(int(errorCode))
 					errMsg, err := jsonparser.GetString(errorCodes, codeAsStr)
 					if err != nil {
 						errMsg = fmt.Sprintf("Service specific error: %s.", codeAsStr)
 					}
-					return courier.ErrFailedWithReason(codeAsStr, errMsg)
+					return channels.ErrFailedWithReason(codeAsStr, errMsg)
 				}
 
-				return courier.ErrResponseStatus
+				return channels.ErrResponseStatus
 			}
 
 			// grab the external id
 			externalID, err := jsonparser.GetString(respBody, "sid")
 			if err != nil {
-				clog.Error(courier.ErrorResponseValueMissing("sid"))
+				clog.Error(models.ErrorResponseValueMissing("sid"))
 			} else {
 				res.AddExternalID(externalID)
 			}
@@ -428,8 +448,69 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	return nil
 }
 
+// WhatsApp displays typing indicators for up to 25 seconds or until a reply is sent - other channel
+// types have no typing indicator support
+var sendableEvents = map[models.ChannelType]map[string]time.Duration{
+	"TWA": {events.TypeTypingStarted: 20 * time.Second},
+}
+
+// SendableEvents declares support for typing indicators on WhatsApp channels
+func (h *handler) SendableEvents(*models.Channel) map[string]time.Duration {
+	return sendableEvents[h.ChannelType()]
+}
+
+// SendEvent sends a typing started event as a typing indicator, which Twilio implements as marking the
+// referenced incoming message as read and displaying an indicator until a reply is sent.
+// See https://www.twilio.com/docs/whatsapp/api/typing-indicators-resource
+func (h *handler) SendEvent(ctx context.Context, ch *models.Channel, event events.Event, clog *models.ChannelLog) error {
+	typing, ok := event.(*events.TypingStarted)
+	if !ok {
+		return fmt.Errorf("unsupported event type: %s", event.Type())
+	}
+	if typing.MsgExternalID == "" {
+		return fmt.Errorf("%s event requires msg_external_id", event.Type())
+	}
+
+	accountSID := ch.StringConfigForKey(configAccountSID, "")
+	accountToken := ch.StringConfigForKey(models.ConfigAuthToken, "")
+	if accountSID == "" || accountToken == "" {
+		return channels.ErrChannelConfig
+	}
+
+	payload := &struct {
+		Channel   string `json:"channel"`
+		MessageID string `json:"messageId"`
+	}{Channel: "WHATSAPP", MessageID: typing.MsgExternalID}
+
+	req, err := http.NewRequest(http.MethodPost, typingIndicatorURL, bytes.NewReader(jsonx.MustMarshal(payload)))
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(accountSID, accountToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, respBody, err := h.RequestHTTP(req, clog)
+	if err != nil || resp.StatusCode/100 == 5 {
+		return channels.ErrConnectionFailed
+	}
+
+	if handlers.IsThrottled(resp) {
+		return channels.ErrConnectionThrottled
+	}
+
+	response := &struct {
+		Success bool `json:"success"`
+	}{}
+	if err := json.Unmarshal(respBody, response); err != nil || resp.StatusCode/100 != 2 || !response.Success {
+		return channels.ErrResponseStatus
+	}
+
+	return nil
+}
+
 // BuildAttachmentRequest to download media for message attachment with Basic auth set
-func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Channel, attachmentURL string, clog *courier.ChannelLog) (*http.Request, error) {
+func (h *handler) BuildAttachmentRequest(ctx context.Context, channel *models.Channel, attachmentURL string, clog *models.ChannelLog) (*http.Request, error) {
 	accountSID := channel.StringConfigForKey(configAccountSID, "")
 	if accountSID == "" {
 		return nil, fmt.Errorf("missing account sid for %s channel", h.ChannelName())
@@ -449,13 +530,13 @@ func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Ch
 	return req, nil
 }
 
-func (h *handler) RedactValues(ch courier.Channel) []string {
+func (h *handler) RedactValues(ch *models.Channel) []string {
 	return []string{
 		httpx.BasicAuth(ch.StringConfigForKey(configAccountSID, ""), ch.StringConfigForKey(models.ConfigAuthToken, "")),
 	}
 }
 
-func (h *handler) parseURN(channel courier.Channel, text string, country i18n.Country) (urns.URN, error) {
+func (h *handler) parseURN(channel *models.Channel, text string, country i18n.Country) (urns.URN, error) {
 	if channel.IsScheme(urns.WhatsApp) {
 		// Twilio Whatsapp from is in the form: whatsapp:+12211414154 or +12211414154
 		var fromTel string
@@ -467,8 +548,8 @@ func (h *handler) parseURN(channel courier.Channel, text string, country i18n.Co
 		}
 
 		if dot := strings.Index(fromTel, "."); dot >= 0 && dot < len(fromTel)-1 {
-			// if we have a BSUID, use that as the URN
-			return urns.New(urns.BSUID, fromTel)
+			// a business-scoped user ID becomes a whatsapp URN
+			return urns.New(urns.WhatsApp, fromTel)
 		}
 
 		// trim off left +, official whatsapp IDs dont have that
@@ -478,7 +559,16 @@ func (h *handler) parseURN(channel courier.Channel, text string, country i18n.Co
 	return urns.ParsePhone(text, country, true, true)
 }
 
-func (h *handler) baseURL(c courier.Channel) string {
+// whatsAppAddress formats the given URN as a Twilio WhatsApp address: whatsapp:+<digits> for a phone number
+// or whatsapp:<CC.xxx> for a business-scoped user ID, which takes no leading +
+func whatsAppAddress(urn urns.URN) string {
+	if urn.Scheme() == urns.BSUID.Prefix || urns.IsWhatsAppBSUID(urn) {
+		return fmt.Sprintf("%s:%s", urns.WhatsApp.Prefix, urn.Path())
+	}
+	return fmt.Sprintf("%s:+%s", urns.WhatsApp.Prefix, urn.Path())
+}
+
+func (h *handler) baseURL(c *models.Channel) string {
 	// Twilio channels use the Twili base URL
 	if c.ChannelType() == "T" || c.ChannelType() == "TMS" || c.ChannelType() == "TWA" {
 		return twilioBaseURL
@@ -488,7 +578,7 @@ func (h *handler) baseURL(c courier.Channel) string {
 }
 
 // see https://www.twilio.com/docs/api/security
-func (h *handler) validateSignature(c courier.Channel, r *http.Request) error {
+func (h *handler) validateSignature(c *models.Channel, r *http.Request) error {
 	if !h.validateSignatures {
 		return nil
 	}
@@ -559,7 +649,7 @@ func twCalculateSignature(url string, form url.Values, authToken string) ([]byte
 }
 
 // WriteMsgSuccessResponse writes our response in TWIML format
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []courier.MsgIn) error {
+func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.Header().Set("Content-Type", "text/xml")
 	w.WriteHeader(200)
 	_, err := fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><Response/>`)
@@ -575,8 +665,8 @@ func (h *handler) WriteRequestIgnored(ctx context.Context, w http.ResponseWriter
 }
 
 // https://www.twilio.com/docs/api/errors
-func twilioError(code int64) *clogs.Error {
+func twilioError(code int64) *svclogs.Error {
 	codeAsStr := strconv.Itoa(int(code))
 	errMsg, _ := jsonparser.GetString(errorCodes, codeAsStr)
-	return courier.ErrorExternal(codeAsStr, errMsg)
+	return models.ErrorExternal(codeAsStr, errMsg)
 }

@@ -5,18 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/jsonx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/core/events"
 )
 
 var apiURL = "https://api.telegram.org"
@@ -30,26 +35,25 @@ var mediaSupport = map[handlers.MediaType]handlers.MediaTypeSupport{
 }
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("TG"), "Telegram")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
 	return nil
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	// no message? ignore this
 	if payload.Message.MessageID == 0 {
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "Ignoring request, no message")
@@ -72,12 +76,12 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 
 	// this is a start command, trigger a new conversation
 	if text == "/start" {
-		event := h.Backend().NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(name).WithOccurredOn(date)
-		err = h.Backend().WriteChannelEvent(ctx, event, clog)
+		event := models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(name).WithOccurredOn(date)
+		err = models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
 		if err != nil {
 			return nil, err
 		}
-		return []courier.Event{event}, courier.WriteChannelEventSuccess(w, event)
+		return []channels.Event{event}, channels.WriteChannelEventSuccess(w, event)
 	}
 
 	// normal message of some kind
@@ -87,6 +91,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 
 	// deal with attachments
 	mediaURL := ""
+	var webAppPayload json.RawMessage
 	if len(payload.Message.Photo) > 0 {
 		// grab the largest photo less than 100k
 		photo := payload.Message.Photo[0]
@@ -117,6 +122,17 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 			phone = fmt.Sprintf("(%s)", payload.Message.Contact.PhoneNumber)
 		}
 		text = utils.JoinNonEmpty(" ", payload.Message.Contact.FirstName, payload.Message.Contact.LastName, phone)
+	} else if payload.Message.WebAppData != nil {
+		// data sent back from a Mini App opened by a form quick reply.. which we require to be a JSON object that
+		// becomes our structured payload, falling back to treating it as plain text if it isn't
+		raw := strings.TrimSpace(payload.Message.WebAppData.Data)
+		if strings.HasPrefix(raw, "{") && json.Valid([]byte(raw)) {
+			text = payload.Message.WebAppData.ButtonText
+			webAppPayload = json.RawMessage(raw)
+		} else {
+			text = payload.Message.WebAppData.Data
+			clog.Error(&svclogs.Error{Message: "web_app_data data is not a valid JSON object"})
+		}
 	}
 
 	// we had an error downloading media
@@ -125,13 +141,37 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 	}
 
 	// build our msg
-	msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, fmt.Sprintf("%d", payload.Message.MessageID), clog).WithReceivedOn(date).WithContactName(name)
+	msg := models.NewIncomingMsg(channel, urn, text, fmt.Sprintf("%d", payload.Message.MessageID), clog).WithReceivedOn(date).WithContactName(name)
 
 	if mediaURL != "" {
 		msg.WithAttachment(mediaURL)
 	}
+	if webAppPayload != nil {
+		msg.WithPayload(webAppPayload)
+	}
+
 	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+}
+
+// isValidButtonURL approximates Telegram's validation of inline keyboard button URLs, which accepts HTTP(S) and
+// tg:// URLs, rejects whitespace, and requires HTTP(S) hostnames to have a TLD (or be an IP address)
+func isValidButtonURL(s string) bool {
+	if strings.ContainsFunc(s, unicode.IsSpace) {
+		return false
+	}
+
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "tg" {
+		return true
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return strings.Contains(u.Hostname(), ".") || net.ParseIP(u.Hostname()) != nil
 }
 
 type mtResponse struct {
@@ -143,7 +183,7 @@ type mtResponse struct {
 	} `json:"result"`
 }
 
-func (h *handler) sendMsgPart(msg courier.MsgOut, token, path string, form url.Values, keyboard *ReplyKeyboardMarkup, clog *courier.ChannelLog) (string, error) {
+func (h *handler) sendMsgPart(msg *models.MsgOut, token, path string, form url.Values, keyboard Markup, clog *models.ChannelLog) (string, error) {
 	// either include or remove our keyboard
 	form.Add("parse_mode", "Markdown")
 	if keyboard == nil {
@@ -161,7 +201,11 @@ func (h *handler) sendMsgPart(msg courier.MsgOut, token, path string, form url.V
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
 	if err != nil || resp.StatusCode/100 == 5 {
-		return "", courier.ErrConnectionFailed
+		return "", channels.ErrConnectionFailed
+	}
+	// Telegram rate limits with a 429 and a retry_after parameter, so retry rather than failing
+	if handlers.IsThrottled(resp) {
+		return "", channels.ErrConnectionThrottled
 	}
 
 	response := &mtResponse{}
@@ -169,27 +213,27 @@ func (h *handler) sendMsgPart(msg courier.MsgOut, token, path string, form url.V
 
 	if err != nil || resp.StatusCode/100 != 2 || !response.Ok {
 		if response.ErrorCode == 403 && (response.Description == "Forbidden: bot was blocked by the user" || response.Description == "Forbidden: user is deactivated") {
-			return "", courier.ErrContactStopped
+			return "", channels.ErrContactStopped
 		} else if response.ErrorCode > 0 {
-			return "", courier.ErrFailedWithReason(strconv.Itoa(response.ErrorCode), response.Description)
+			return "", channels.ErrFailedWithReason(strconv.Itoa(response.ErrorCode), response.Description)
 		}
 
-		return "", courier.ErrResponseStatus
+		return "", channels.ErrResponseStatus
 	}
 
 	if response.Result.MessageID > 0 {
 		return strconv.FormatInt(response.Result.MessageID, 10), nil
 	}
-	return "", courier.ErrResponseContent
+	return "", channels.ErrResponseContent
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	authToken := msg.Channel().StringConfigForKey(models.ConfigAuthToken, "")
 	if authToken == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
-	attachments, err := handlers.ResolveAttachments(ctx, h.Backend(), msg.Attachments(), mediaSupport, true, clog)
+	attachments, err := handlers.ResolveAttachments(ctx, h.Runtime(), msg.Attachments(), mediaSupport, true, clog)
 	if err != nil {
 		return fmt.Errorf("error resolving attachments: %w", err)
 	}
@@ -200,16 +244,40 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		caption = msg.Text()
 	}
 
-	// figure out whether we have a keyboard to send as well
-	qrs := msg.QuickReplies()
-	var keyboard *ReplyKeyboardMarkup
-	if len(qrs) > 0 {
-		keyboard = NewKeyboardFromReplies(qrs)
+	// figure out whether we have a keyboard to send as well - text, location and form replies can all appear on the
+	// same reply keyboard, with form replies as buttons that open the URL in Extra as a Mini App. URL replies can
+	// only be rendered as inline keyboard link buttons, and Telegram only allows one keyboard type per message, so
+	// they're only supported when they're the only type on the message, and dropped with a logged error otherwise.
+	urlsOnly := !slices.ContainsFunc(msg.QuickReplies(), func(q models.QuickReply) bool {
+		return q.Type != models.QuickReplyTypeURL
+	})
+
+	var keyboard Markup
+	if urlsOnly {
+		qrs := handlers.FilterSupportedQuickReplies(msg.QuickReplies(), clog, models.QuickReplyTypeURL)
+
+		// Telegram rejects the entire message if a button URL isn't valid, so drop invalid ones with a logged error
+		// instead of failing the send
+		qrs = slices.DeleteFunc(qrs, func(q models.QuickReply) bool {
+			if !isValidButtonURL(q.Extra) {
+				clog.Error(&svclogs.Error{Message: fmt.Sprintf("quick reply of type url has an invalid URL and can't be sent: %s", q.Extra)})
+				return true
+			}
+			return false
+		})
+
+		if len(qrs) > 0 {
+			keyboard = NewInlineKeyboardFromReplies(qrs)
+		}
+	} else {
+		if qrs := handlers.FilterSupportedQuickReplies(msg.QuickReplies(), clog, models.QuickReplyTypeText, models.QuickReplyTypeLocation, models.QuickReplyTypeForm); len(qrs) > 0 {
+			keyboard = NewKeyboardFromReplies(qrs)
+		}
 	}
 
 	// if we have text, send that if we aren't sending it as a caption
 	if msg.Text() != "" && caption == "" {
-		var msgKeyBoard *ReplyKeyboardMarkup
+		var msgKeyBoard Markup
 		if len(attachments) == 0 {
 			msgKeyBoard = keyboard
 		}
@@ -226,8 +294,8 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 
 	// send each attachment
 	for i, attachment := range attachments {
-		var attachmentKeyBoard *ReplyKeyboardMarkup
-		if i == len(msg.Attachments())-1 {
+		var attachmentKeyBoard Markup
+		if i == len(attachments)-1 {
 			attachmentKeyBoard = keyboard
 		}
 
@@ -281,11 +349,60 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 			res.AddExternalID(externalID)
 
 		default:
-			clog.Error(courier.ErrorMediaUnsupported(attachment.ContentType))
+			clog.Error(models.ErrorMediaUnsupported(attachment.ContentType))
 		}
 	}
 
 	return nil
+}
+
+// SendEvent sends a typing started event to the contact as a typing chat action, see
+// https://core.telegram.org/bots/api#sendchataction
+func (h *handler) SendEvent(ctx context.Context, ch *models.Channel, event events.Event, clog *models.ChannelLog) error {
+	typing, ok := event.(*events.TypingStarted)
+	if !ok {
+		return fmt.Errorf("unsupported event type: %s", event.Type())
+	}
+
+	authToken := ch.StringConfigForKey(models.ConfigAuthToken, "")
+	if authToken == "" {
+		return channels.ErrChannelConfig
+	}
+
+	form := url.Values{"chat_id": []string{typing.URN.Path()}, "action": []string{"typing"}}
+
+	sendURL := fmt.Sprintf("%s/bot%s/sendChatAction", apiURL, authToken)
+	req, err := http.NewRequest(http.MethodPost, sendURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, respBody, err := h.RequestHTTP(req, clog)
+	if err != nil || resp.StatusCode/100 == 5 {
+		return channels.ErrConnectionFailed
+	}
+	if handlers.IsThrottled(resp) {
+		return channels.ErrConnectionThrottled
+	}
+
+	response := &struct {
+		Ok bool `json:"ok"`
+	}{}
+	if err := json.Unmarshal(respBody, response); err != nil || resp.StatusCode/100 != 2 || !response.Ok {
+		return channels.ErrResponseStatus
+	}
+
+	return nil
+}
+
+// Telegram displays typing indicators for 5 seconds or until the bot sends a message, so they need
+// resending more often than that to sustain
+var sendableEvents = map[string]time.Duration{events.TypeTypingStarted: 4 * time.Second}
+
+// SendableEvents declares support for typing indicators
+func (h *handler) SendableEvents(*models.Channel) map[string]time.Duration {
+	return sendableEvents
 }
 
 type fileResponse struct {
@@ -297,7 +414,7 @@ type fileResponse struct {
 	} `json:"result"`
 }
 
-func (h *handler) resolveFileID(ctx context.Context, channel courier.Channel, fileID string, clog *courier.ChannelLog) (string, error) {
+func (h *handler) resolveFileID(ctx context.Context, channel *models.Channel, fileID string, clog *models.ChannelLog) (string, error) {
 	confAuth := channel.ConfigForKey(models.ConfigAuthToken, "")
 	authToken, isStr := confAuth.(string)
 	if !isStr || authToken == "" {
@@ -313,7 +430,7 @@ func (h *handler) resolveFileID(ctx context.Context, channel courier.Channel, fi
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 	if err != nil {
-		courier.LogRequestError(req, channel, err)
+		channels.LogRequestError(req, channel, err)
 	}
 
 	resp, respBody, _ := h.RequestHTTP(req, clog)
@@ -321,12 +438,12 @@ func (h *handler) resolveFileID(ctx context.Context, channel courier.Channel, fi
 	respPayload := &fileResponse{}
 	err = json.Unmarshal(respBody, respPayload)
 	if err != nil {
-		clog.Error(courier.ErrorResponseUnparseable("JSON"))
+		clog.Error(models.ErrorResponseUnparseable("JSON"))
 		return "", errors.New("unable to resolve file")
 	}
 
 	if resp.StatusCode/100 != 2 || respPayload.ErrorCode != 0 {
-		clog.Error(courier.ErrorExternal(strconv.Itoa(respPayload.ErrorCode), respPayload.Description))
+		clog.Error(models.ErrorExternal(strconv.Itoa(respPayload.ErrorCode), respPayload.Description))
 		return "", errors.New("unable to resolve file")
 	}
 
@@ -403,5 +520,9 @@ type moPayload struct {
 			FirstName   string `json:"first_name"`
 			LastName    string `json:"last_name"`
 		}
+		WebAppData *struct {
+			Data       string `json:"data"`
+			ButtonText string `json:"button_text"`
+		} `json:"web_app_data"`
 	} `json:"message"`
 }

@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/utils"
-	"github.com/nyaruka/courier/v26/utils/clogs"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 )
 
@@ -35,24 +35,23 @@ var (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("SL"), "Slack", handlers.WithRedactConfigKeys(configBotToken, configUserToken, configValidationToken))}
 }
 
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
 	return nil
 }
 
-func handleURLVerification(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload) ([]courier.Event, error) {
+func handleURLVerification(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload) ([]channels.Event, error) {
 	validationToken := channel.StringConfigForKey(configValidationToken, "")
 	if !utils.SecretEqual(payload.Token, validationToken) {
 		w.WriteHeader(http.StatusForbidden)
@@ -64,16 +63,16 @@ func handleURLVerification(ctx context.Context, channel courier.Channel, w http.
 	return nil, nil
 }
 
-func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	if payload.Type == "url_verification" {
-		clog.Type = courier.ChannelLogTypeWebhookVerify
+		clog.Type = models.ChannelLogTypeWebhookVerify
 
 		return handleURLVerification(ctx, channel, w, r, payload)
 	}
 
 	// if event is not a message or is from the bot ignore it
 	if payload.Event.Type == "message" && payload.Event.BotID == "" && payload.Event.ChannelType == "im" {
-		clog.Type = courier.ChannelLogTypeMsgReceive
+		clog.Type = models.ChannelLogTypeMsgReceive
 
 		date := time.Unix(int64(payload.EventTime), 0)
 
@@ -86,25 +85,25 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 		for _, file := range payload.Event.Files {
 			fileURL, err := h.resolveFile(ctx, channel, file, clog)
 			if err != nil {
-				courier.LogRequestError(r, channel, err)
+				channels.LogRequestError(r, channel, err)
 			} else {
 				attachmentURLs = append(attachmentURLs, fileURL)
 			}
 		}
 
 		text := payload.Event.Text
-		msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, payload.EventID, clog).WithReceivedOn(date)
+		msg := models.NewIncomingMsg(channel, urn, text, payload.EventID, clog).WithReceivedOn(date)
 
 		for _, attURL := range attachmentURLs {
 			msg.WithAttachment(attURL)
 		}
 
-		return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+		return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 	}
 	return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "Ignoring request, no message")
 }
 
-func (h *handler) resolveFile(ctx context.Context, channel courier.Channel, file File, clog *courier.ChannelLog) (string, error) {
+func (h *handler) resolveFile(ctx context.Context, channel *models.Channel, file File, clog *models.ChannelLog) (string, error) {
 	userToken := channel.StringConfigForKey(configUserToken, "")
 
 	fileApiURL := apiURL + "/files.sharedPublicURL"
@@ -112,7 +111,7 @@ func (h *handler) resolveFile(ctx context.Context, channel courier.Channel, file
 	data := strings.NewReader(fmt.Sprintf(`{"file":"%s"}`, file.ID))
 	req, err := http.NewRequest(http.MethodPost, fileApiURL, data)
 	if err != nil {
-		courier.LogRequestError(req, channel, err)
+		channels.LogRequestError(req, channel, err)
 		return "", err
 	}
 	req.Header.Add("Content-Type", "application/json; charset=utf-8")
@@ -147,10 +146,10 @@ func (h *handler) resolveFile(ctx context.Context, channel courier.Channel, file
 	return filePath, nil
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	botToken := msg.Channel().StringConfigForKey(configBotToken, "")
 	if botToken == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	for _, attachment := range msg.Attachments() {
@@ -177,7 +176,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	return nil
 }
 
-func (h *handler) sendTextMsgPart(msg courier.MsgOut, token string, clog *courier.ChannelLog) error {
+func (h *handler) sendTextMsgPart(msg *models.MsgOut, token string, clog *models.ChannelLog) error {
 	sendURL := apiURL + "/chat.postMessage"
 
 	msgPayload := &mtPayload{
@@ -198,29 +197,27 @@ func (h *handler) sendTextMsgPart(msg courier.MsgOut, token string, clog *courie
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
-	if err != nil || resp.StatusCode/100 != 2 {
-		return courier.ErrConnectionFailed
-	} else if resp.StatusCode/100 != 2 {
-		return courier.ErrResponseStatus
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
 	}
 
 	ok, err := jsonparser.GetBoolean(respBody, "ok")
 	if err != nil {
-		return courier.ErrResponseContent
+		return channels.ErrResponseContent
 	}
 
 	if !ok {
 		errDescription, err := jsonparser.GetString(respBody, "error")
 		if err != nil {
-			return courier.ErrResponseContent
+			return channels.ErrResponseContent
 		}
-		clog.Error(&clogs.Error{Message: errDescription})
-		return courier.ErrFailedWithReason("", errDescription)
+		clog.Error(&svclogs.Error{Message: errDescription})
+		return channels.ErrFailedWithReason("", errDescription)
 	}
 	return nil
 }
 
-func (h *handler) parseAttachmentToFileParams(msg courier.MsgOut, attachment string, clog *courier.ChannelLog) (*FileParams, error) {
+func (h *handler) parseAttachmentToFileParams(msg *models.MsgOut, attachment string, clog *models.ChannelLog) (*FileParams, error) {
 	_, attURL := handlers.SplitAttachment(attachment)
 
 	req, err := http.NewRequest(http.MethodGet, attURL, nil)
@@ -240,7 +237,7 @@ func (h *handler) parseAttachmentToFileParams(msg courier.MsgOut, attachment str
 	return &FileParams{File: respBody, FileName: filename, Channels: msg.URN().Path()}, nil
 }
 
-func (h *handler) sendFilePart(msg courier.MsgOut, token string, fileParams *FileParams, clog *courier.ChannelLog) error {
+func (h *handler) sendFilePart(msg *models.MsgOut, token string, fileParams *FileParams, clog *models.ChannelLog) error {
 	uploadURL := apiURL + "/files.upload"
 
 	body := &bytes.Buffer{}
@@ -273,26 +270,24 @@ func (h *handler) sendFilePart(msg courier.MsgOut, token string, fileParams *Fil
 	req.Header.Add("Content-Type", writer.FormDataContentType())
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
-	if err != nil || resp.StatusCode/100 != 2 {
-		return courier.ErrConnectionFailed
-	} else if resp.StatusCode/100 != 2 {
-		return courier.ErrResponseStatus
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
 	}
 
 	var fr FileResponse
 	if err := json.Unmarshal(respBody, &fr); err != nil {
-		return courier.ErrResponseUnparseable
+		return channels.ErrResponseUnparseable
 	}
 
 	if !fr.OK {
-		return courier.ErrResponseContent
+		return channels.ErrResponseContent
 	}
 
 	return nil
 }
 
 // DescribeURN handles Slack user details
-func (h *handler) DescribeURN(ctx context.Context, channel courier.Channel, urn urns.URN, clog *courier.ChannelLog) (map[string]string, error) {
+func (h *handler) DescribeURN(ctx context.Context, channel *models.Channel, urn urns.URN, clog *models.ChannelLog) (map[string]string, error) {
 	resource := "/users.info"
 	urlStr := apiURL + resource
 

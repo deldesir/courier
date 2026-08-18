@@ -3,34 +3,49 @@ package handlers_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
-	"github.com/nyaruka/courier/v26"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
-	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/testsuite"
+	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestRequestHTTP(t *testing.T) {
-	mb := test.NewMockBackend()
+	_, rt := testsuite.Runtime(t)
+
 	mc := test.NewMockChannel("7a8ff1d4-f211-4492-9d05-e1905f6da8c8", "NX", "1234", "EC", []string{urns.Phone.Prefix}, nil)
 	cf := &models.ContactReference{ID: 100, UUID: "a984069d-0008-4d8c-a772-b14a8a6acccc"}
-	mm := mb.NewOutgoingMsg(mc, "019a06fa-467d-7fc8-a11e-3ad2d019fd20", cf, urns.URN("tel:+1234"), "Hello World", false, nil, "", models.MsgOriginChat)
-	clog := courier.NewChannelLogForSend(mm, nil)
+	mm := &models.MsgOut{
+		OrgID_:       mc.OrgID(),
+		UUID_:        "019a06fa-467d-7fc8-a11e-3ad2d019fd20",
+		Contact_:     cf,
+		URN_:         urns.URN("tel:+1234"),
+		Text_:        "Hello World",
+		Origin_:      models.MsgOriginChat,
+		ChannelUUID_: mc.UUID(),
+		Channel_:     mc,
+	}
+	clog := models.NewChannelLogForSend(mm, nil)
 
-	server := courier.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()), mb)
-	server.Runtime().HTTP.Transport = httpx.WithMocks(nil, map[string][]*httpx.MockResponse{
+	// use a plain client so we can install a mocking transport
+	rt.HTTP.Default = &http.Client{Transport: httpx.WithTraces(nil), Timeout: 30 * time.Second}
+	rt.HTTP.Proxied = rt.HTTP.Default
+	rt.HTTP.Default.Transport = httpx.WithTraces(httpx.WithMocks(nil, map[string][]*httpx.MockResponse{
 		"https://api.messages.com/send.json": {
 			httpx.NewMockResponse(200, nil, []byte(`{"status":"success"}`)),
 			httpx.NewMockResponse(400, nil, []byte(`{"status":"error"}`)),
 		},
-	})
+	}))
+
+	server := web.NewServer(rt)
 
 	h := handlers.NewBaseHandler("NX", "Test")
-	h.SetServer(server)
+	h.SetRuntime(server.Runtime())
 
 	req, _ := http.NewRequest("POST", "https://api.messages.com/send.json", nil)
 	resp, respBody, err := h.RequestHTTP(req, clog)
