@@ -3,9 +3,9 @@ package kaleyra
 import (
 	"testing"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
@@ -47,7 +47,6 @@ var incomingCases = []IncomingTestCase{
 	{
 		Label:                "Receive Invalid CreatedAt",
 		URL:                  receiveMsgURL + "?created_at=nottimestamp&type=text&from=14133881111&name=John%20Cruz&body=Hi",
-		ExpectedContactName:  Sp("John Cruz"),
 		ExpectedRespStatus:   400,
 		ExpectedBodyContains: "invalid created_at",
 	},
@@ -60,7 +59,6 @@ var incomingCases = []IncomingTestCase{
 	{
 		Label:                "Receive Invalid From",
 		URL:                  receiveMsgURL + "?created_at=1603914166&type=text&from=notnumber&name=John%20Cruz&body=Hi",
-		ExpectedContactName:  Sp("John Cruz"),
 		ExpectedRespStatus:   400,
 		ExpectedBodyContains: "invalid whatsapp id",
 	},
@@ -92,7 +90,7 @@ var incomingCases = []IncomingTestCase{
 }
 
 func TestIncoming(t *testing.T) {
-	chs := []courier.Channel{
+	chs := []*models.Channel{
 		test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c568c", "KWA", "250788383383", "",
 			[]string{urns.WhatsApp.Prefix},
 			map[string]any{configAccountSID: "SID", configApiKey: "123456"},
@@ -146,7 +144,22 @@ var sendTestCases = []OutgoingTestCase{
 				Body:    "api-key=123456&body=Error&callback_url=https%3A%2F%2Flocalhost%2Fc%2Fkwa%2F8eb23e93-5ecb-45ba-b726-3b064e0c568c%2Fstatus&channel=WhatsApp&from=250788383383&to=14133881112&type=text",
 			},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error",
+		MsgURN:  "whatsapp:14133881112",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.kaleyra.io/v1/SID/messages": {httpx.NewMockResponse(429, nil, []byte(`{"error":{"to":"invalid number"}}`))},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Headers: map[string]string{"Content-type": "application/x-www-form-urlencoded"},
+				Body:    "api-key=123456&body=Error&callback_url=https%3A%2F%2Flocalhost%2Fc%2Fkwa%2F8eb23e93-5ecb-45ba-b726-3b064e0c568c%2Fstatus&channel=WhatsApp&from=250788383383&to=14133881112&type=text",
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:          "Medias Send",
@@ -196,7 +209,7 @@ var sendTestCases = []OutgoingTestCase{
 			{},
 			{BodyContains: "video bytes"},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 }
 

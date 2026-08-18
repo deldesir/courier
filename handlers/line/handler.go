@@ -16,15 +16,18 @@ import (
 
 	"errors"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/core/events"
 )
 
 var (
 	replySendURL = "https://api.line.me/v2/bot/message/reply"
 	pushSendURL  = "https://api.line.me/v2/bot/message/push"
+	loadingURL   = "https://api.line.me/v2/bot/chat/loading/start"
 	mediaDataURL = "https://api-data.line.me/v2/bot/message"
 	maxMsgLength = 2000
 	maxMsgSend   = 5
@@ -41,21 +44,20 @@ var mediaSupport = map[handlers.MediaType]handlers.MediaTypeSupport{
 }
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("LN"), "Line")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
 	return nil
 }
 
@@ -112,13 +114,13 @@ type moPayload struct {
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	err := h.validateSignature(channel, r)
 	if err != nil {
 		return nil, err
 	}
 
-	msgs := []courier.MsgIn{}
+	msgs := []*models.MsgIn{}
 
 	for _, lineEvent := range payload.Events {
 		if lineEvent.ReplyToken == "" || (lineEvent.Source.Type == "" && lineEvent.Source.UserID == "") || (lineEvent.Message.Type == "" && lineEvent.Message.ID == "") {
@@ -155,7 +157,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid line id"))
 		}
 
-		msg := h.Backend().NewIncomingMsg(ctx, channel, urn, text, lineEvent.ReplyToken, clog).WithReceivedOn(date)
+		msg := models.NewIncomingMsg(channel, urn, text, lineEvent.ReplyToken, clog).WithReceivedOn(date)
 
 		if mediaURL != "" {
 			msg.WithAttachment(mediaURL)
@@ -178,7 +180,7 @@ func buildMediaURL(mediaID string) string {
 }
 
 // BuildAttachmentRequest to download media for message attachment with Bearer token set
-func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Channel, attachmentURL string, clog *courier.ChannelLog) (*http.Request, error) {
+func (h *handler) BuildAttachmentRequest(ctx context.Context, channel *models.Channel, attachmentURL string, clog *models.ChannelLog) (*http.Request, error) {
 	token := channel.StringConfigForKey(models.ConfigAuthToken, "")
 	if token == "" {
 		return nil, fmt.Errorf("missing token for LN channel")
@@ -190,9 +192,9 @@ func (h *handler) BuildAttachmentRequest(ctx context.Context, channel courier.Ch
 	return req, nil
 }
 
-var _ courier.AttachmentRequestBuilder = (*handler)(nil)
+var _ channels.AttachmentRequestBuilder = (*handler)(nil)
 
-func (h *handler) validateSignature(channel courier.Channel, r *http.Request) error {
+func (h *handler) validateSignature(channel *models.Channel, r *http.Request) error {
 	actual := r.Header.Get(signatureHeader)
 	if actual == "" {
 		return fmt.Errorf("missing request signature")
@@ -253,6 +255,7 @@ type QuickReplyItem struct {
 		Type  string `json:"type"`
 		Label string `json:"label"`
 		Text  string `json:"text,omitempty"`
+		URI   string `json:"uri,omitempty"`
 	} `json:"action"`
 }
 
@@ -284,18 +287,61 @@ type mtResponse struct {
 	Message string `json:"message"`
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+// LINE displays its loading indicator for the requested number of seconds or until a reply is sent,
+// and only supports it in 1:1 chats
+var sendableEvents = map[string]time.Duration{events.TypeTypingStarted: 15 * time.Second}
+
+// SendableEvents declares support for typing indicators
+func (h *handler) SendableEvents(*models.Channel) map[string]time.Duration {
+	return sendableEvents
+}
+
+// SendEvent sends a typing started event to the contact as a loading indicator, see
+// https://developers.line.biz/en/docs/messaging-api/use-loading-indicator/
+func (h *handler) SendEvent(ctx context.Context, ch *models.Channel, event events.Event, clog *models.ChannelLog) error {
+	typing, ok := event.(*events.TypingStarted)
+	if !ok {
+		return fmt.Errorf("unsupported event type: %s", event.Type())
+	}
+
+	authToken := ch.StringConfigForKey(models.ConfigAuthToken, "")
+	if authToken == "" {
+		return channels.ErrChannelConfig
+	}
+
+	payload := &struct {
+		ChatID         string `json:"chatId"`
+		LoadingSeconds int    `json:"loadingSeconds"`
+	}{ChatID: typing.URN.Path(), LoadingSeconds: 20}
+
+	req, err := http.NewRequest(http.MethodPost, loadingURL, bytes.NewReader(jsonx.MustMarshal(payload)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
+
+	resp, _, err := h.RequestHTTP(req, clog)
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	authToken := msg.Channel().StringConfigForKey(models.ConfigAuthToken, "")
 	if authToken == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	// all msg parts in JSON
 	var jsonMsgs []string
 	parts := handlers.SplitMsgByChannel(msg.Channel(), msg.Text(), maxMsgLength)
-	qrs := msg.QuickReplies()
+	qrs := handlers.FilterSupportedQuickReplies(msg.QuickReplies(), clog, models.QuickReplyTypeText, models.QuickReplyTypeLocation, models.QuickReplyTypeURL)
 
-	attachments, err := handlers.ResolveAttachments(ctx, h.Backend(), msg.Attachments(), mediaSupport, false, clog)
+	attachments, err := handlers.ResolveAttachments(ctx, h.Runtime(), msg.Attachments(), mediaSupport, false, clog)
 	if err != nil {
 		return fmt.Errorf("error resolving attachments: %w", err)
 	}
@@ -336,14 +382,19 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 			for _, qr := range qrs {
 				item := QuickReplyItem{Type: "action"}
 				switch qr.Type {
-				case "location":
+				case models.QuickReplyTypeLocation:
 					item.Action.Type = "location"
 					item.Action.Label = qr.GetText()
 					items = append(items, item)
-				case "text":
+				case models.QuickReplyTypeText:
 					item.Action.Type = "message"
 					item.Action.Label = qr.GetText()
 					item.Action.Text = qr.GetText()
+					items = append(items, item)
+				case models.QuickReplyTypeURL:
+					item.Action.Type = "uri"
+					item.Action.Label = qr.GetText()
+					item.Action.URI = qr.Extra
 					items = append(items, item)
 				}
 
@@ -379,10 +430,18 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 				continue
 			}
 
+			if err != nil || resp.StatusCode/100 == 5 {
+				return channels.ErrConnectionFailed
+			}
+			// LINE rate limits per endpoint per channel with a 429, so retry rather than failing
+			if handlers.IsThrottled(resp) {
+				return channels.ErrConnectionThrottled
+			}
+
 			respPayload := &mtResponse{}
 			err = json.Unmarshal(respBody, respPayload)
 			if err != nil {
-				return courier.ErrResponseUnparseable
+				return channels.ErrResponseUnparseable
 			}
 
 			errMsg := respPayload.Message
@@ -394,17 +453,21 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 
 				resp, respBody, _ := h.RequestHTTP(req, clog)
 
+				if handlers.IsThrottled(resp) {
+					return channels.ErrConnectionThrottled
+				}
+
 				respPayload := &mtResponse{}
 				err = json.Unmarshal(respBody, respPayload)
 				if err != nil {
-					return courier.ErrResponseUnparseable
+					return channels.ErrResponseUnparseable
 				}
 
 				if resp.StatusCode/100 != 2 {
-					return courier.ErrFailedWithReason(strconv.Itoa(resp.StatusCode), respPayload.Message)
+					return channels.ErrFailedWithReason(strconv.Itoa(resp.StatusCode), respPayload.Message)
 				}
 			} else {
-				return courier.ErrFailedWithReason(strconv.Itoa(resp.StatusCode), respPayload.Message)
+				return channels.ErrFailedWithReason(strconv.Itoa(resp.StatusCode), respPayload.Message)
 			}
 		}
 	}

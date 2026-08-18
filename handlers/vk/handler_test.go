@@ -11,13 +11,17 @@ import (
 
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/web"
+	"github.com/nyaruka/gocommon/svclogs"
 )
 
 const (
@@ -25,7 +29,7 @@ const (
 	receiveURL  = "/c/vk/" + channelUUID + "/receive"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel(
 		channelUUID,
 		"VK",
@@ -218,6 +222,12 @@ const msgKeyboard = `{
 
 const keyboardJson = `{"one_time":true,"buttons":[[{"action":{"type":"text","label":"A","payload":"\"A\""},"color":"primary"},{"action":{"type":"text","label":"B","payload":"\"B\""},"color":"primary"},{"action":{"type":"text","label":"C","payload":"\"C\""},"color":"primary"},{"action":{"type":"text","label":"D","payload":"\"D\""},"color":"primary"},{"action":{"type":"text","label":"E","payload":"\"E\""},"color":"primary"}]],"inline":false}`
 
+const singleButtonKeyboardJson = `{"one_time":true,"buttons":[[{"action":{"type":"text","label":"A","payload":"\"A\""},"color":"primary"}]],"inline":false}`
+
+const locationAndURLKeyboardJson = `{"one_time":true,"buttons":[[{"action":{"type":"location","payload":"\"Send Location\""}}],[{"action":{"type":"open_link","label":"Visit","link":"http://example.com","payload":"\"Visit\""},"color":"primary"}]],"inline":false}`
+
+const locationSplitsRowKeyboardJson = `{"one_time":true,"buttons":[[{"action":{"type":"text","label":"A","payload":"\"A\""},"color":"primary"}],[{"action":{"type":"location","payload":"\"Send Location\""}}],[{"action":{"type":"text","label":"B","payload":"\"B\""},"color":"primary"}]],"inline":false}`
+
 var testCases = []IncomingTestCase{
 	{
 		Label:                "Receive Message",
@@ -348,11 +358,16 @@ var testCases = []IncomingTestCase{
 }
 
 func TestIncoming(t *testing.T) {
+	// creating a contact for an incoming message looks up their name via the API, so point that at a mock
+	defer func(u string) { apiBaseURL = u }(apiBaseURL)
+	server := buildMockVKService()
+	defer server.Close()
+
 	RunIncomingTestCases(t, testChannels, newHandler(), testCases)
 }
 
-func buildMockVKService(testCases []IncomingTestCase) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func buildMockVKService() *httptest.Server {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, actionGetUser) {
 			userId := r.URL.Query()["user_ids"][0]
 
@@ -363,23 +378,24 @@ func buildMockVKService(testCases []IncomingTestCase) *httptest.Server {
 			_, _ = w.Write([]byte(`{"response": []}`))
 		}
 	}))
+
+	apiBaseURL = server.URL
+
+	return server
 }
 
 func TestDescribeURN(t *testing.T) {
-	server := buildMockVKService([]IncomingTestCase{})
+	defer func(u string) { apiBaseURL = u }(apiBaseURL)
+	server := buildMockVKService()
 	defer server.Close()
 
-	realAPIUrl := apiBaseURL
-	apiBaseURL = server.URL
-	defer func() { apiBaseURL = realAPIUrl }()
-
 	handler := newHandler()
-	handler.Initialize(courier.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()), test.NewMockBackend()))
-	clog := courier.NewChannelLog(courier.ChannelLogTypeUnknown, testChannels[0], handler.RedactValues(testChannels[0]))
+	web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig())).MountHandler(handler)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, testChannels[0], nil, handler.RedactValues(testChannels[0]))
 	urn, _ := urns.New(urns.VK, "123456789")
 	data := map[string]string{"name": "John Doe"}
 
-	describe, err := handler.(courier.URNDescriber).DescribeURN(context.Background(), testChannels[0], urn, clog)
+	describe, err := handler.(models.URNDescriber).DescribeURN(context.Background(), testChannels[0], urn, clog)
 	assert.Nil(t, err)
 	assert.Equal(t, data, describe)
 
@@ -489,6 +505,100 @@ var outgoingCases = []OutgoingTestCase{
 		ExpectedExtIDs: []string{"1"},
 	},
 	{
+		Label:           "Send keyboard, unsupported types ignored",
+		MsgText:         "Send keyboard",
+		MsgURN:          "vk:123456789",
+		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "A"}, {Type: "form", Extra: "1234"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.vk.com/method/messages.send.json?*": {
+				httpx.NewMockResponse(200, nil, []byte(`{"response": 1}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "keyboard": {singleButtonKeyboardJson}, "message": {"Send keyboard"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
+			},
+		},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type form isn't supported by this channel and can't be sent"},
+		},
+		ExpectedExtIDs: []string{"1"},
+	},
+	{
+		Label:           "Send keyboard, location and URL types",
+		MsgText:         "Send keyboard",
+		MsgURN:          "vk:123456789",
+		MsgQuickReplies: []models.QuickReply{{Type: "location"}, {Type: "url", Text: "Visit", Extra: "http://example.com"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.vk.com/method/messages.send.json?*": {
+				httpx.NewMockResponse(200, nil, []byte(`{"response": 1}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "keyboard": {locationAndURLKeyboardJson}, "message": {"Send keyboard"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
+			},
+		},
+		ExpectedExtIDs: []string{"1"},
+	},
+	{
+		Label:           "Send keyboard, location type takes a row of its own",
+		MsgText:         "Send keyboard",
+		MsgURN:          "vk:123456789",
+		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "A"}, {Type: "location"}, {Type: "text", Text: "B"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.vk.com/method/messages.send.json?*": {
+				httpx.NewMockResponse(200, nil, []byte(`{"response": 1}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "keyboard": {locationSplitsRowKeyboardJson}, "message": {"Send keyboard"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
+			},
+		},
+		ExpectedExtIDs: []string{"1"},
+	},
+	{
+		Label:           "Send keyboard, URL type without a URL is dropped",
+		MsgText:         "Send keyboard",
+		MsgURN:          "vk:123456789",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit"}, {Type: "text", Text: "A"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.vk.com/method/messages.send.json?*": {
+				httpx.NewMockResponse(200, nil, []byte(`{"response": 1}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "keyboard": {singleButtonKeyboardJson}, "message": {"Send keyboard"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
+			},
+		},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type url is missing its extra value and can't be sent"},
+		},
+		ExpectedExtIDs: []string{"1"},
+	},
+	{
+		Label:           "Send keyboard, only unsupported types means no keyboard",
+		MsgText:         "Send keyboard",
+		MsgURN:          "vk:123456789",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Extra: "1234"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.vk.com/method/messages.send.json?*": {
+				httpx.NewMockResponse(200, nil, []byte(`{"response": 1}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "message": {"Send keyboard"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
+			},
+		},
+		ExpectedLogErrors: []*svclogs.Error{
+			{Message: "quick reply of type form isn't supported by this channel and can't be sent"},
+		},
+		ExpectedExtIDs: []string{"1"},
+	},
+	{
 		Label:   "Connection Error",
 		MsgText: "Simple message",
 		MsgURN:  "vk:123456789",
@@ -502,7 +612,23 @@ var outgoingCases = []OutgoingTestCase{
 				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "message": {"Simple message"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
 			},
 		},
-		ExpectedError: courier.ErrConnectionFailed,
+		ExpectedError: channels.ErrConnectionFailed,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Simple message",
+		MsgURN:  "vk:123456789",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://api.vk.com/method/messages.send.json?*": {
+				httpx.NewMockResponse(429, nil, []byte(`Bad Gateway`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "message": {"Simple message"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Response unexpected",
@@ -518,10 +644,63 @@ var outgoingCases = []OutgoingTestCase{
 				Params: url.Values{"access_token": {"token123xyz"}, "attachment": {""}, "message": {"Simple message"}, "random_id": {"0191e180-7d60-7000-aded-7d8b151cbd5b"}, "user_id": {"123456789"}, "v": {"5.103"}},
 			},
 		},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 }
 
 func TestOutgoing(t *testing.T) {
 	RunOutgoingTestCases(t, testChannels[0], newHandler(), outgoingCases, []string{"token123xyz", "abc123xyz"}, nil)
+}
+
+func TestSendEvent(t *testing.T) {
+	ch := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "VK", "2020", "US", []string{urns.VK.Prefix}, map[string]any{models.ConfigAuthToken: "token123xyz"})
+
+	s := web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()))
+	h := newHandler().(*handler)
+	s.MountHandler(h)
+
+	s.Runtime().HTTP.Default.Transport = test.MockTransport(map[string][]*httpx.MockResponse{
+		"https://api.vk.com/method/messages.setActivity.json*": {
+			httpx.NewMockResponse(200, nil, []byte(`{"response": 1}`)),
+			httpx.NewMockResponse(200, nil, []byte(`{"error": {"error_code": 5, "error_msg": "User authorization failed"}}`)),
+			httpx.NewMockResponse(400, nil, []byte(`bad request`)),
+			httpx.MockConnectionError,
+		},
+	})
+
+	// typing indicators are supported but there's no explicit stop
+	assert.Equal(t, map[string]time.Duration{events.TypeTypingStarted: 8 * time.Second}, h.SendableEvents(ch))
+
+	channelRef := assets.NewChannelReference("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "VK")
+	typing := events.NewTypingStarted(events.DirectionOutgoing, channelRef, "vk:123456789", "")
+
+	// a typing started event is sent as a typing activity
+	clog := models.NewChannelLogForEventSend(ch, nil)
+	err := h.SendEvent(context.Background(), ch, typing, clog)
+	assert.NoError(t, err)
+	assert.Len(t, clog.HttpLogs, 1)
+	assert.Contains(t, clog.HttpLogs[0].URL, "https://api.vk.com/method/messages.setActivity.json")
+	assert.Contains(t, clog.HttpLogs[0].URL, "type=typing")
+	assert.Contains(t, clog.HttpLogs[0].URL, "user_id=123456789")
+
+	// a VK error in a 200 response is a response error
+	err = h.SendEvent(context.Background(), ch, typing, clog)
+	assert.Equal(t, channels.ErrResponseStatus, err)
+
+	// as is a non-2XX response
+	err = h.SendEvent(context.Background(), ch, typing, clog)
+	assert.Equal(t, channels.ErrResponseStatus, err)
+
+	// and a connection error is a connection error
+	err = h.SendEvent(context.Background(), ch, typing, clog)
+	assert.Equal(t, channels.ErrConnectionFailed, err)
+
+	// a channel without an auth token config can't send
+	noAuth := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "VK", "2020", "US", []string{urns.VK.Prefix}, nil)
+	err = h.SendEvent(context.Background(), noAuth, typing, clog)
+	assert.Equal(t, channels.ErrChannelConfig, err)
+
+	// nor can an event type the handler doesn't declare support for
+	err = h.SendEvent(context.Background(), ch, events.NewTypingStopped(events.DirectionOutgoing, channelRef, "vk:123456789", ""), clog)
+	assert.ErrorContains(t, err, "unsupported event type: typing_stopped")
 }

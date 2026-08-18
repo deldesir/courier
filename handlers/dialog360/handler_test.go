@@ -9,17 +9,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
-	"github.com/nyaruka/courier/v26/utils/clogs"
+	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
 	"github.com/stretchr/testify/assert"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel(
 		"8eb23e93-5ecb-45ba-b726-3b064e0c568c",
 		"D3C",
@@ -43,7 +48,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/hello.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Hello World"),
 		ExpectedURN:           "whatsapp:5678",
@@ -56,13 +60,58 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/hello_user_id.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Hello World"),
 		ExpectedURN:           "whatsapp:5678",
 		ExpectedExternalID:    "external_id",
 		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
-		ExpectedNewURN:        &models.NewURNSpec{Value: "bsuid:US.1234", Action: models.NewURNAppend},
+		ExpectedNewURN:        &models.NewURNSpec{Value: "whatsapp:US.1234", Action: models.NewURNAppend},
+	},
+	{
+		Label:                 "Receive Message WAC with invalid user_id, no new URN added",
+		URL:                   d3CReceiveURL,
+		Data:                  string(test.ReadFile("../meta/testdata/wac/hello_invalid_user_id.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Hello World"),
+		ExpectedURN:           "whatsapp:5678",
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+		ExpectedNewURN:        nil,
+	},
+	{
+		Label:                 "Receive Message WAC from BSUID with no phone",
+		URL:                   d3CReceiveURL,
+		Data:                  string(test.ReadFile("../meta/testdata/wac/hello_from_bsuid.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Hello World"),
+		ExpectedURN:           "whatsapp:US.1234",
+		ExpectedContactName:   Sp("Kerry Fisher"),
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+	},
+	{
+		Label:                 "Receive Message WAC with BSUID in from",
+		URL:                   d3CReceiveURL,
+		Data:                  string(test.ReadFile("../meta/testdata/wac/hello_bsuid_in_from.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Hello World"),
+		ExpectedURN:           "whatsapp:US.1234",
+		ExpectedContactName:   Sp("Kerry Fisher"),
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+	},
+	{
+		Label:                "Receive Message WAC with no from or from_user_id",
+		URL:                  d3CReceiveURL,
+		Data:                 string(test.ReadFile("../meta/testdata/wac/no_from.json")),
+		ExpectedRespStatus:   200,
+		ExpectedBodyContains: "invalid whatsapp id",
 	},
 	{
 		Label:                 "Receive Duplicate Valid Message",
@@ -70,7 +119,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/duplicate.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Hello World"),
 		ExpectedURN:           "whatsapp:5678",
@@ -83,7 +131,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/voice.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp(""),
 		ExpectedURN:           "whatsapp:5678",
@@ -97,7 +144,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/button.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("No"),
 		ExpectedURN:           "whatsapp:5678",
@@ -110,7 +156,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/document.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("80skaraokesonglistartist"),
 		ExpectedURN:           "whatsapp:5678",
@@ -124,7 +169,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/image.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Check out my new phone!"),
 		ExpectedURN:           "whatsapp:5678",
@@ -138,7 +182,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/video.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Check out my new phone!"),
 		ExpectedURN:           "whatsapp:5678",
@@ -152,7 +195,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/audio.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Check out my new phone!"),
 		ExpectedURN:           "whatsapp:5678",
@@ -206,7 +248,7 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/error_msg.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		ExpectedErrors:        []*clogs.Error{courier.ErrorExternal("131051", "Unsupported message type")},
+		ExpectedErrors:        []*svclogs.Error{models.ErrorExternal("131051", "Unsupported message type")},
 		NoInvalidChannelCheck: true,
 	},
 	{
@@ -215,7 +257,7 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/error_errors.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		ExpectedErrors:        []*clogs.Error{courier.ErrorExternal("0", "We were unable to authenticate the app user")},
+		ExpectedErrors:        []*svclogs.Error{models.ErrorExternal("0", "We were unable to authenticate the app user")},
 		NoInvalidChannelCheck: true,
 	},
 	{
@@ -233,7 +275,7 @@ var testCasesD3C = []IncomingTestCase{
 		ExpectedRespStatus:   200,
 		ExpectedBodyContains: `"type":"status"`,
 		ExpectedStatuses:     []ExpectedStatus{{ExternalID: "external_id", Status: models.MsgStatusFailed}},
-		ExpectedErrors:       []*clogs.Error{courier.ErrorExternal("131014", "Request for url https://URL.jpg failed with error: 404 (Not Found)")},
+		ExpectedErrors:       []*svclogs.Error{models.ErrorExternal("131014", "Request for url https://URL.jpg failed with error: 404 (Not Found)")},
 	},
 	{
 		Label:                "Receive Invalid Status",
@@ -255,7 +297,6 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/button_reply.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Yes"),
 		ExpectedURN:           "whatsapp:5678",
@@ -268,16 +309,28 @@ var testCasesD3C = []IncomingTestCase{
 		Data:                  string(test.ReadFile("../meta/testdata/wac/list_reply.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Yes"),
 		ExpectedURN:           "whatsapp:5678",
 		ExpectedExternalID:    "external_id",
 		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
 	},
+	{
+		Label:                 "Receive Valid Interactive Flow Reply Message",
+		URL:                   d3CReceiveURL,
+		Data:                  string(test.ReadFile("../meta/testdata/wac/nfm_reply.json")),
+		ExpectedRespStatus:    200,
+		ExpectedBodyContains:  "Handled",
+		NoInvalidChannelCheck: true,
+		ExpectedMsgText:       Sp("Sent"),
+		ExpectedPayload:       `{"flow_token": "fl0w+t0k3n", "first_name": "Bob", "age": "32"}`,
+		ExpectedURN:           "whatsapp:5678",
+		ExpectedExternalID:    "external_id",
+		ExpectedDate:          time.Date(2016, 1, 30, 1, 57, 9, 0, time.UTC),
+	},
 }
 
-func buildMockD3MediaService(testChannels []courier.Channel, testCases []IncomingTestCase) *httptest.Server {
+func buildMockD3MediaService(testChannels []*models.Channel, testCases []IncomingTestCase) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fileURL := ""
 
@@ -300,7 +353,7 @@ func buildMockD3MediaService(testChannels []courier.Channel, testCases []Incomin
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(fmt.Sprintf(`{ "url": "%s" }`, fileURL)))
 	}))
-	testChannels[0].(*test.MockChannel).SetConfig("base_url", server.URL)
+	test.SetChannelConfig(testChannels[0], "base_url", server.URL)
 
 	// update our tests media urls
 	for _, tc := range testCases {
@@ -366,6 +419,23 @@ var SendTestCasesD3C = []OutgoingTestCase{
 		ExpectedExtIDs: []string{"157b5e14568e8"},
 	},
 	{
+		Label:   "Plain Send with BSUID as whatsapp URN",
+		MsgText: "Simple Message",
+		MsgURN:  "whatsapp:US.1234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://waba-v2.360dialog.io/messages": {
+				httpx.NewMockResponse(200, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{
+			{
+				Path: "/messages",
+				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","recipient":"US.1234","type":"text","text":{"body":"Simple Message","preview_url":false}}`,
+			},
+		},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
+	},
+	{
 		Label:   "Plain Send with user_id in response",
 		MsgText: "Simple Message",
 		MsgURN:  "whatsapp:250788123123",
@@ -375,16 +445,24 @@ var SendTestCasesD3C = []OutgoingTestCase{
 			},
 		},
 		ExpectedExtIDs: []string{"157b5e14568e8"},
-		ExpectedContactURNs: map[string]bool{
-			"whatsapp:250788123123": true,
-			"bsuid:US.1234":         true,
+		ExpectedNewURN: "whatsapp:US.1234",
+	},
+	{
+		Label:   "Send to BSUID with same user_id in response",
+		MsgText: "Simple Message",
+		MsgURN:  "whatsapp:US.1234",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://waba-v2.360dialog.io/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "contacts": [{"input": "US.1234", "user_id": "US.1234"}], "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
 		},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
 	},
 	{
 		Label:               "Plain Send with user_id already on contact",
 		MsgText:             "Simple Message",
 		MsgURN:              "whatsapp:250788123123",
-		MsgContactOtherURNs: []urns.URN{"bsuid:US.1234"},
+		MsgContactOtherURNs: []urns.URN{"whatsapp:US.1234"},
 		MockResponses: map[string][]*httpx.MockResponse{
 			"https://waba-v2.360dialog.io/messages": {
 				httpx.NewMockResponse(201, nil, []byte(`{ "contacts": [{"input": "250788123123", "user_id": "US.1234"}], "messages": [{"id": "157b5e14568e8"}] }`)),
@@ -615,7 +693,7 @@ var SendTestCasesD3C = []OutgoingTestCase{
 			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"list","body":{"text":"Interactive List Msg"},"action":{"button":"Menu","sections":[{"rows":[{"id":"0","title":"ROW1"},{"id":"1","title":"ROW2"},{"id":"2","title":"ROW3"},{"id":"3","title":"ROW4"},{"id":"4","title":"ROW5"},{"id":"5","title":"ROW6"},{"id":"6","title":"ROW7"},{"id":"7","title":"ROW8"},{"id":"8","title":"ROW9"},{"id":"9","title":"ROW10"}]}]}}}`,
 		}},
 		ExpectedExtIDs:    []string{"157b5e14568e8"},
-		ExpectedLogErrors: []*clogs.Error{&clogs.Error{Message: "too many quick replies WhatsApp supports only up to 10 quick replies"}},
+		ExpectedLogErrors: []*svclogs.Error{&svclogs.Error{Message: "too many quick replies WhatsApp supports only up to 10 quick replies"}},
 	},
 	{
 		Label:           "Interactive List Message Send In Spanish",
@@ -757,7 +835,8 @@ var SendTestCasesD3C = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"location_request_message","body":{"text":"Interactive send location"},"action":{"name":"send_location"}}}`,
 		}},
-		ExpectedExtIDs: []string{"157b5e14568e8"},
+		ExpectedExtIDs:    []string{"157b5e14568e8"},
+		ExpectedLogErrors: []*svclogs.Error{{Message: "quick reply of type text can't be combined with a location quick reply and won't be sent"}},
 	},
 	{
 		Label:           "Interactive with location request, with attachment",
@@ -775,7 +854,38 @@ var SendTestCasesD3C = []OutgoingTestCase{
 			{Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"image","image":{"link":"https://foo.bar/image.jpg"}}`},
 			{Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"location_request_message","body":{"text":"Interactive send location"},"action":{"name":"send_location"}}}`},
 		},
-		ExpectedExtIDs: []string{"157b5e14568e8", "157b5e14568e8"},
+		ExpectedExtIDs:    []string{"157b5e14568e8", "157b5e14568e8"},
+		ExpectedLogErrors: []*svclogs.Error{{Message: "quick reply of type text can't be combined with a location quick reply and won't be sent"}},
+	},
+	{
+		Label:           "Interactive with form",
+		MsgText:         "Interactive form msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "form", Text: "Book now", Extra: "123456"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://waba-v2.360dialog.io/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"flow","body":{"text":"Interactive form msg"},"action":{"name":"flow","parameters":{"flow_message_version":"3","flow_id":"123456","flow_cta":"Book now"}}}}`,
+		}},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
+	},
+	{
+		Label:           "Interactive with URL button",
+		MsgText:         "Interactive URL msg",
+		MsgURN:          "whatsapp:250788123123",
+		MsgQuickReplies: []models.QuickReply{{Type: "url", Text: "Visit", Extra: "https://example.com"}},
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://waba-v2.360dialog.io/messages": {
+				httpx.NewMockResponse(201, nil, []byte(`{ "messages": [{"id": "157b5e14568e8"}] }`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"interactive","interactive":{"type":"cta_url","body":{"text":"Interactive URL msg"},"action":{"name":"cta_url","parameters":{"display_text":"Visit","url":"https://example.com"}}}}`,
+		}},
+		ExpectedExtIDs: []string{"157b5e14568e8"},
 	},
 	{
 		Label:   "Link Sending",
@@ -810,7 +920,7 @@ var SendTestCasesD3C = []OutgoingTestCase{
 				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Error","preview_url":false}}`,
 			},
 		},
-		ExpectedError: courier.ErrResponseUnparseable,
+		ExpectedError: channels.ErrResponseUnparseable,
 	},
 	{
 		Label:   "Error",
@@ -827,7 +937,7 @@ var SendTestCasesD3C = []OutgoingTestCase{
 				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Error","preview_url":false}}`,
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("250012", "(#250012) some error"),
+		ExpectedError: channels.ErrFailedWithReason("250012", "(#250012) some error"),
 	},
 	{
 		Label:   "Error Channel Contact Pair limit hit",
@@ -838,7 +948,7 @@ var SendTestCasesD3C = []OutgoingTestCase{
 				httpx.NewMockResponse(403, nil, []byte(`{ "error": {"message": "(#131056) (Business Account, Consumer Account) pair rate limit hit","code": 131056 }}`)),
 			},
 		},
-		ExpectedError: courier.ErrConnectionThrottled,
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Error Throttled",
@@ -855,7 +965,18 @@ var SendTestCasesD3C = []OutgoingTestCase{
 				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Error","preview_url":false}}`,
 			},
 		},
-		ExpectedError: courier.ErrConnectionThrottled,
+		ExpectedError: channels.ErrConnectionThrottled,
+	},
+	{
+		Label:   "Error HTTP 429",
+		MsgText: "Error",
+		MsgURN:  "whatsapp:250788123123",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://waba-v2.360dialog.io/messages": {
+				httpx.NewMockResponse(429, nil, []byte(`{ "error": {"message": "Calls to this api have exceeded the rate limit","code": 613 }}`)),
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Error Retryable",
@@ -872,7 +993,7 @@ var SendTestCasesD3C = []OutgoingTestCase{
 				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Error","preview_url":false}}`,
 			},
 		},
-		ExpectedError: courier.ErrRetryableWithReason("131053", "Media upload error"),
+		ExpectedError: channels.ErrRetryableWithReason("131053", "Media upload error"),
 	},
 	{
 		Label:   "Error Message",
@@ -889,7 +1010,7 @@ var SendTestCasesD3C = []OutgoingTestCase{
 				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Error","preview_url":false}}`,
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("0", "Other error with message"),
+		ExpectedError: channels.ErrFailedWithReason("0", "Other error with message"),
 	},
 	{
 		Label:   "Error Connection",
@@ -906,7 +1027,7 @@ var SendTestCasesD3C = []OutgoingTestCase{
 				Body: `{"messaging_product":"whatsapp","recipient_type":"individual","to":"250788123123","type":"text","text":{"body":"Error","preview_url":false}}`,
 			},
 		},
-		ExpectedError: courier.ErrConnectionFailed,
+		ExpectedError: channels.ErrConnectionFailed,
 	},
 }
 
@@ -921,4 +1042,59 @@ func TestOutgoing(t *testing.T) {
 	checkRedacted := []string{"the-auth-token"}
 
 	RunOutgoingTestCases(t, ChannelWAC, newWAHandler(models.ChannelType("D3C"), "360Dialog"), SendTestCasesD3C, checkRedacted, nil)
+}
+
+func TestSendEvent(t *testing.T) {
+	channel := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "D3C", "12345_ID", "", []string{urns.WhatsApp.Prefix}, map[string]any{
+		"auth_token": "the-auth-token",
+		"base_url":   "https://waba-v2.360dialog.io",
+	})
+
+	s := web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()))
+
+	h := newWAHandler(models.ChannelType("D3C"), "360Dialog").(*handler)
+	s.MountHandler(h)
+
+	s.Runtime().HTTP.Default.Transport = test.MockTransport(map[string][]*httpx.MockResponse{
+		"https://waba-v2.360dialog.io/messages": {
+			httpx.NewMockResponse(200, nil, []byte(`{"success": true}`)),
+			httpx.NewMockResponse(400, nil, []byte(`{"error": {"message": "(#131009) Parameter value is not valid", "code": 131009}}`)),
+			httpx.MockConnectionError,
+		},
+	})
+
+	// typing indicators are supported but there's no explicit stop
+	assert.Equal(t, map[string]time.Duration{events.TypeTypingStarted: 20 * time.Second}, h.SendableEvents(channel))
+
+	channelRef := assets.NewChannelReference("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "360Dialog")
+	typing := events.NewTypingStarted(events.DirectionOutgoing, channelRef, "whatsapp:250788123123", "wamid.HBgMNTU3")
+
+	// a typing indicator is sent as a mark-as-read call with a typing_indicator field
+	clog := models.NewChannelLogForEventSend(channel, nil)
+	err := h.SendEvent(context.Background(), channel, typing, clog)
+	assert.NoError(t, err)
+	assert.Len(t, clog.HttpLogs, 1)
+	assert.Equal(t, "https://waba-v2.360dialog.io/messages", clog.HttpLogs[0].URL)
+	assert.Contains(t, clog.HttpLogs[0].Request, `{"messaging_product":"whatsapp","status":"read","message_id":"wamid.HBgMNTU3","typing_indicator":{"type":"text"}}`)
+
+	// an error response is a response error
+	err = h.SendEvent(context.Background(), channel, typing, clog)
+	assert.Equal(t, channels.ErrResponseStatus, err)
+
+	// as is a connection error
+	err = h.SendEvent(context.Background(), channel, typing, clog)
+	assert.Equal(t, channels.ErrConnectionFailed, err)
+
+	// an event without a msg external ID can't be sent
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStarted(events.DirectionOutgoing, channelRef, "whatsapp:250788123123", ""), clog)
+	assert.ErrorContains(t, err, "requires msg_external_id")
+
+	// a channel without an auth token config can't send
+	noAuth := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "D3C", "12345_ID", "", []string{urns.WhatsApp.Prefix}, map[string]any{"base_url": "https://waba-v2.360dialog.io"})
+	err = h.SendEvent(context.Background(), noAuth, typing, clog)
+	assert.Equal(t, channels.ErrChannelConfig, err)
+
+	// nor can an event type the handler doesn't declare support for
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStopped(events.DirectionOutgoing, channelRef, "whatsapp:250788123123", ""), clog)
+	assert.ErrorContains(t, err, "unsupported event type: typing_stopped")
 }

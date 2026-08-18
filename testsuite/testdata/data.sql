@@ -10,26 +10,29 @@ INSERT INTO orgs_org("id", "name", "language", "is_anon", "config")
 
 /* Channel with id 10, 11, 12 */
 DELETE FROM channels_channel;
-INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "address", "org_id", "country", "role", "config")
-                      VALUES('10', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c95d', 'KN', '2500', 1, 'RW', 'SR', '{ "encoding": "smart", "use_national": true, "max_length_int": 320, "max_length_str": "320" }');
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('10', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c95d', 'KN', 'Kannel 1', '2500', 1, 'RW', 'SR', '{ "encoding": "smart", "use_national": true, "max_length_int": 320, "max_length_str": "320" }');
 
-INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "address", "org_id", "country", "role", "config")
-                      VALUES('11', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c96a', 'FBA', '4500', 1, 'US', 'SR', '{}');
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('11', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c96a', 'FBA', 'Facebook 1', '4500', 1, 'US', 'SR', '{}');
 
-INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "address", "org_id", "country", "role", "config")
-                      VALUES('12', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c97a', 'DM', '4500', 1, 'US', 'SR', '{}');
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('12', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c97a', 'DM', 'Discord 1', '4500', 1, 'US', 'SR', '{}');
 
-INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "address", "org_id", "country", "role", "config")
-                      VALUES('13', '{"telegram"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c98a', 'TG', 'courierbot', 1, NULL, 'SR', '{}');
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('13', '{"telegram"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c98a', 'TG', 'Telegram 1', 'courierbot', 1, NULL, 'SR', '{}');
 
-INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "address", "org_id", "country", "role", "config")
-                      VALUES('14', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c99a', 'KN', NULL, 1, 'US', 'SR', '{}');
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('14', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327c99a', 'KN', 'Kannel 2', NULL, 1, 'US', 'SR', '{}');
 
-INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "address", "org_id", "country", "role", "config")
-                      VALUES('15', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327100a', 'EX', NULL, 1, 'US', 'R', '{}');
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('15', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327100a', 'EX', 'External 1', NULL, 1, 'US', 'R', '{}');
 
-INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "address", "org_id", "country", "role", "config")
-                      VALUES('16', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327222a', 'EX', NULL, 1, 'US', '', '{}');
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('16', '{"tel"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc3327222a', 'EX', 'External 2', NULL, 1, 'US', '', '{}');
+
+INSERT INTO channels_channel("id", "schemes", "is_active", "created_on", "modified_on", "uuid", "channel_type", "name", "address", "org_id", "country", "role", "config")
+                      VALUES('17', '{"whatsapp"}', 'Y', NOW(), NOW(), 'dbc126ed-66bc-4e28-b67b-81dc33277a17', 'WAC', 'WhatsApp Cloud 1', '12345', 1, NULL, 'SR', '{}');
 
 /* Contacts with ids 100, 101 */
 DELETE FROM contacts_contact;
@@ -40,12 +43,6 @@ INSERT INTO contacts_contact("id", "is_active", "status", "created_on", "modifie
 DELETE FROM contacts_contacturn;
 INSERT INTO contacts_contacturn("id", "identity", "path", "scheme", "priority", "channel_id", "contact_id", "org_id")
                          VALUES(1000, 'tel:+12067799192', '+12067799192', 'tel', 50, 10, 100, 1);
-
-/* Msg optins with ids 1, 2 */
-DELETE FROM msgs_optin;
-INSERT INTO msgs_optin(id, uuid, org_id, name) VALUES
-                      (1, 'fc1cef6e-b5b1-452d-9528-a4b24db28eb0', 1, 'Polls'),
-                      (2, '2b1eba23-4a97-46ac-9022-11304412b32f', 1, 'Jokes');
 
 /** Msg with id 10000 */
 DELETE FROM msgs_msg;

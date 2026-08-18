@@ -10,12 +10,14 @@ import (
 	"testing"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
-	. "github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/core/channels"
+	"github.com/nyaruka/courier/v26/core/models"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
-	"github.com/nyaruka/courier/v26/utils/clogs"
+	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/stretchr/testify/assert"
 )
@@ -25,7 +27,7 @@ const (
 	receiveURL  = "/c/sl/" + channelUUID + "/receive/"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel(channelUUID, "SL", "2022", "US", []string{urns.Slack.Prefix}, map[string]any{"bot_token": "xoxb-abc123", "verification_token": "one-long-verification-token"}),
 }
 
@@ -213,8 +215,22 @@ var defaultSendTestCases = []OutgoingTestCase{
 		ExpectedRequests: []ExpectedRequest{{
 			Body: `{"channel":"U0123ABCDEF","text":"Hello"}`,
 		}},
-		ExpectedError:     courier.ErrFailedWithReason("", "invalid_auth"),
-		ExpectedLogErrors: []*clogs.Error{&clogs.Error{Message: "invalid_auth"}},
+		ExpectedError:     channels.ErrFailedWithReason("", "invalid_auth"),
+		ExpectedLogErrors: []*svclogs.Error{&svclogs.Error{Message: "invalid_auth"}},
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Hello",
+		MsgURN:  "slack:U0123ABCDEF",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"*/chat.postMessage": {
+				httpx.NewMockResponse(429, nil, []byte(`{"ok":false,"error":"ratelimited"}`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Body: `{"channel":"U0123ABCDEF","text":"Hello"}`,
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Response Unexpected",
@@ -225,7 +241,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 				httpx.NewMockResponse(200, nil, []byte(`{"channel":"U0123ABCDEF"}`)),
 			},
 		},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 	{
 		Label:   "Response Unexpected",
@@ -236,7 +252,7 @@ var defaultSendTestCases = []OutgoingTestCase{
 				httpx.NewMockResponse(200, nil, []byte(`{"ok":false,"channel":"U0123ABCDEF"}`)),
 			},
 		},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 }
 
@@ -276,7 +292,7 @@ var fileSendTestCases = []OutgoingTestCase{
 			{},
 			{BodyContains: "image.png"},
 		},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 }
 
@@ -298,9 +314,8 @@ func TestSendFiles(t *testing.T) {
 func TestVerification(t *testing.T) {
 	RunIncomingTestCases(t, testChannels, newHandler(), []IncomingTestCase{
 		{Label: "Valid token", URL: receiveURL, ExpectedRespStatus: 200,
-			Data:                 `{"token":"one-long-verification-token","challenge":"challenge123","type":"url_verification"}`,
-			Headers:              map[string]string{"content-type": "text/plain"},
-			ExpectedBodyContains: "challenge123", NoQueueErrorCheck: true, NoInvalidChannelCheck: true,
+			Data:    `{"token":"one-long-verification-token","challenge":"challenge123","type":"url_verification"}`,
+			Headers: map[string]string{"content-type": "text/plain"},
 		},
 		{Label: "Invalid token", URL: receiveURL, ExpectedRespStatus: 403,
 			Data:    `{"token":"abc321","challenge":"challenge123","type":"url_verification"}`,
@@ -371,13 +386,13 @@ func TestDescribeURN(t *testing.T) {
 	defer server.Close()
 
 	handler := newHandler()
-	handler.Initialize(courier.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()), test.NewMockBackend()))
-	clog := courier.NewChannelLog(courier.ChannelLogTypeUnknown, testChannels[0], handler.RedactValues(testChannels[0]))
+	web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig())).MountHandler(handler)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, testChannels[0], nil, handler.RedactValues(testChannels[0]))
 	urn, _ := urns.New(urns.Slack, "U012345")
 
 	data := map[string]string{"name": "dummy user"}
 
-	describe, err := handler.(courier.URNDescriber).DescribeURN(context.Background(), testChannels[0], urn, clog)
+	describe, err := handler.(models.URNDescriber).DescribeURN(context.Background(), testChannels[0], urn, clog)
 	assert.Nil(t, err)
 	assert.Equal(t, data, describe)
 

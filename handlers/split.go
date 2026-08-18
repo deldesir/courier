@@ -5,7 +5,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/nyaruka/courier/v26"
 	"github.com/nyaruka/courier/v26/core/models"
 )
 
@@ -15,7 +14,6 @@ const (
 	MsgPartTypeText MsgPartType = iota
 	MsgPartTypeAttachment
 	MsgPartTypeCaptionedAttachment
-	MsgPartTypeOptIn
 )
 
 // MsgPart represents a message part - either Text or Attachment will be set
@@ -23,7 +21,6 @@ type MsgPart struct {
 	Type       MsgPartType
 	Text       string
 	Attachment string
-	OptIn      *models.OptInReference
 	IsFirst    bool
 	IsLast     bool
 }
@@ -35,13 +32,9 @@ type SplitOptions struct {
 }
 
 // SplitMsg splits an outgoing message into separate text and attachment parts, with attachment parts first.
-func SplitMsg(m courier.MsgOut, opts SplitOptions) []MsgPart {
+func SplitMsg(m *models.MsgOut, opts SplitOptions) []MsgPart {
 	text := m.Text()
 	attachments := m.Attachments()
-
-	if m.OptIn() != nil {
-		return []MsgPart{{Type: MsgPartTypeOptIn, Text: text, OptIn: m.OptIn(), IsFirst: true, IsLast: true}}
-	}
 
 	// if we have a single attachment and text we may be able to combine them into a captioned attachment
 	if len(attachments) == 1 && len(text) > 0 && (len(text) <= opts.MaxCaptionLen || opts.MaxCaptionLen == 0) {
@@ -73,7 +66,7 @@ func SplitMsg(m courier.MsgOut, opts SplitOptions) []MsgPart {
 }
 
 // deprecated use SplitMsg instead
-func SplitMsgByChannel(channel courier.Channel, text string, maxLength int) []string {
+func SplitMsgByChannel(channel *models.Channel, text string, maxLength int) []string {
 	max := channel.IntConfigForKey(models.ConfigMaxLength, maxLength)
 
 	return SplitText(text, max)

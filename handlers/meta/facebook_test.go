@@ -10,18 +10,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
 	"github.com/stretchr/testify/assert"
 )
 
-var facebookTestChannels = []courier.Channel{
-	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c568c", "FBA", "12345", "", []string{urns.Facebook.Prefix}, map[string]any{models.ConfigAuthToken: "a123"}),
+// note that the address here can't be a channel address in the test database seed data because these channels are
+// routed to by address rather than UUID
+var facebookTestChannels = []*models.Channel{
+	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c568c", "FBA", "1234567890", "", []string{urns.Facebook.Prefix}, map[string]any{models.ConfigAuthToken: "a123"}),
 }
 
 var facebookIncomingTests = []IncomingTestCase{
@@ -31,7 +37,6 @@ var facebookIncomingTests = []IncomingTestCase{
 		Data:                  string(test.ReadFile("./testdata/fba/hello_msg.json")),
 		ExpectedRespStatus:    200,
 		ExpectedBodyContains:  "Handled",
-		NoQueueErrorCheck:     true,
 		NoInvalidChannelCheck: true,
 		ExpectedMsgText:       Sp("Hello World"),
 		ExpectedURN:           "facebook:5678",
@@ -113,24 +118,8 @@ var facebookIncomingTests = []IncomingTestCase{
 		URL:                  "/c/fba/receive",
 		Data:                 string(test.ReadFile("./testdata/fba/notification_messages_optin.json")),
 		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		ExpectedEvents: []ExpectedEvent{
-			{Type: models.EventTypeOptIn, URN: "facebook:5678", Time: time.Date(2016, 4, 7, 1, 11, 27, 970000000, time.UTC), Extra: map[string]string{"title": "Bird Facts", "payload": "3456"}},
-		},
-		ExpectedURNAuthTokens: map[urns.URN]map[string]string{"facebook:5678": {"optin:3456": "12345678901234567890"}},
-		PrepRequest:           addValidSignature,
-	},
-	{
-		Label:                "Receive Notification Messages OptOut",
-		URL:                  "/c/fba/receive",
-		Data:                 string(test.ReadFile("./testdata/fba/notification_messages_optout.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		ExpectedEvents: []ExpectedEvent{
-			{Type: models.EventTypeOptOut, URN: "facebook:5678", Time: time.Date(2016, 4, 7, 1, 11, 27, 970000000, time.UTC), Extra: map[string]string{"title": "Bird Facts", "payload": "3456"}},
-		},
-		ExpectedURNAuthTokens: map[urns.URN]map[string]string{"facebook:5678": {}},
-		PrepRequest:           addValidSignature,
+		ExpectedBodyContains: "ignoring optin",
+		PrepRequest:          addValidSignature,
 	},
 	{
 		Label:                "Receive Get Started",
@@ -293,8 +282,8 @@ func TestFacebookDescribeURN(t *testing.T) {
 
 	channel := facebookTestChannels[0]
 	handler := newHandler("FBA", "Facebook")
-	handler.Initialize(courier.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()), test.NewMockBackend()))
-	clog := courier.NewChannelLog(courier.ChannelLogTypeUnknown, channel, handler.RedactValues(channel))
+	web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig())).MountHandler(handler)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, handler.RedactValues(channel))
 
 	tcs := []struct {
 		urn              urns.URN
@@ -305,7 +294,7 @@ func TestFacebookDescribeURN(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
-		metadata, _ := handler.(courier.URNDescriber).DescribeURN(context.Background(), channel, tc.urn, clog)
+		metadata, _ := handler.(models.URNDescriber).DescribeURN(context.Background(), channel, tc.urn, clog)
 		assert.Equal(t, metadata, tc.expectedMetadata)
 	}
 
@@ -320,7 +309,6 @@ func TestFacebookVerify(t *testing.T) {
 			ExpectedRespStatus:    200,
 			ExpectedBodyContains:  "yarchallenge",
 			NoLogsExpected:        true,
-			NoQueueErrorCheck:     true,
 			NoInvalidChannelCheck: true,
 		},
 		{
@@ -361,7 +349,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgURN:    "facebook:12345",
 		MsgOrigin: models.MsgOriginChat,
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -377,7 +365,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgURN:    "facebook:12345",
 		MsgOrigin: models.MsgOriginBroadcast,
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -394,7 +382,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgURNAuth: "345678",
 		MsgOrigin:  models.MsgOriginBroadcast,
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -411,7 +399,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgOrigin:               models.MsgOriginFlow,
 		MsgResponseToExternalID: "23526",
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -428,7 +416,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgOrigin:       models.MsgOriginBroadcast,
 		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -445,7 +433,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgOrigin:       models.MsgOriginBroadcast,
 		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -461,7 +449,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgURN:          "facebook:12345",
 		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
@@ -483,7 +471,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgURN:         "facebook:12345",
 		MsgAttachments: []string{"image/jpeg:https://foo.bar/image.jpg"},
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -500,7 +488,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgAttachments:  []string{"image/jpeg:https://foo.bar/image.jpg"},
 		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
@@ -522,7 +510,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgURN:         "facebook:12345",
 		MsgAttachments: []string{"application/pdf:https://foo.bar/document.pdf"},
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -537,7 +525,7 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		MsgURN:         "facebook:12345",
 		MsgAttachments: []string{"document:https://foo.bar/document.pdf"},
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
 			},
 		},
@@ -548,63 +536,59 @@ var facebookOutgoingTests = []OutgoingTestCase{
 		ExpectedExtIDs: []string{"mid.133"},
 	},
 	{
-		Label:    "Opt-in request",
-		MsgURN:   "facebook:12345",
-		MsgOptIn: &models.OptInReference{ID: 3456, Name: "Joke Of The Day"},
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"attachment":{"type":"template","payload":{"template_type":"notification_messages","title":"Joke Of The Day","payload":"3456"}}}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
 		Label:   "Response doesn't contain message id",
 		MsgText: "ID Error",
 		MsgURN:  "facebook:12345",
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{ "is_error": true }`)),
 			},
 		},
-		ExpectedError: courier.ErrResponseUnexpected,
+		ExpectedError: channels.ErrResponseUnexpected,
 	},
 	{
 		Label:   "Response status code is non-200",
 		MsgText: "Error",
 		MsgURN:  "facebook:12345",
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(403, nil, []byte(`{ "is_error": true }`)),
 			},
 		},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error",
+		MsgURN:  "facebook:12345",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"https://graph.facebook.com/v25.0/me/messages*": {
+				httpx.NewMockResponse(429, nil, []byte(`{ "is_error": true }`)),
+			},
+		},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:   "Response is invalid JSON",
 		MsgText: "Error",
 		MsgURN:  "facebook:12345",
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`bad json`)),
 			},
 		},
-		ExpectedError: courier.ErrResponseUnparseable,
+		ExpectedError: channels.ErrResponseUnparseable,
 	},
 	{
 		Label:   "Response is channel specific error",
 		MsgText: "Error",
 		MsgURN:  "facebook:12345",
 		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v22.0/me/messages*": {
+			"https://graph.facebook.com/v25.0/me/messages*": {
 				httpx.NewMockResponse(200, nil, []byte(`{ "error": {"message": "The image size is too large.","code": 36000 }}`)),
 			},
 		},
-		ExpectedError: courier.ErrFailedWithReason("36000", "The image size is too large."),
+		ExpectedError: channels.ErrFailedWithReason("36000", "The image size is too large."),
 	},
 }
 
@@ -617,6 +601,62 @@ func TestFacebookOutgoing(t *testing.T) {
 	checkRedacted := []string{"wac_admin_system_user_token", "missing_facebook_app_secret", "missing_facebook_webhook_secret", "a123"}
 
 	RunOutgoingTestCases(t, channel, newHandler("FBA", "Facebook"), facebookOutgoingTests, checkRedacted, nil)
+}
+
+func TestFacebookSendEvent(t *testing.T) {
+	channel := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "FBA", "12345", "", []string{urns.Facebook.Prefix}, map[string]any{models.ConfigAuthToken: "a123"})
+
+	s := web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()))
+
+	h := newHandler("FBA", "Facebook").(*handler)
+	s.MountHandler(h)
+
+	s.Runtime().HTTP.Default.Transport = test.MockTransport(map[string][]*httpx.MockResponse{
+		"https://graph.facebook.com/v25.0/me/messages*": {
+			httpx.NewMockResponse(200, nil, []byte(`{"recipient_id": "5678"}`)),
+			httpx.NewMockResponse(200, nil, []byte(`{"recipient_id": "5678"}`)),
+			httpx.NewMockResponse(400, nil, []byte(`{"error": {"message": "Invalid user", "code": 100}}`)),
+			httpx.MockConnectionError,
+		},
+	})
+
+	// typing events are supported on both Facebook and Instagram channels, including explicit stop
+	expected := map[string]time.Duration{events.TypeTypingStarted: 15 * time.Second, events.TypeTypingStopped: 0}
+	assert.Equal(t, expected, h.SendableEvents(channel))
+	assert.Equal(t, expected, newHandler("IG", "Instagram").(*handler).SendableEvents(channel))
+
+	channelRef := assets.NewChannelReference("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "Facebook")
+
+	// a typing started event is sent as a typing_on sender action
+	clog := models.NewChannelLogForEventSend(channel, nil)
+	err := h.SendEvent(context.Background(), channel, events.NewTypingStarted(events.DirectionOutgoing, channelRef, "facebook:5678", ""), clog)
+	assert.NoError(t, err)
+	assert.Len(t, clog.HttpLogs, 1)
+	assert.Equal(t, "https://graph.facebook.com/v25.0/me/messages?access_token=a123", clog.HttpLogs[0].URL)
+	assert.Contains(t, clog.HttpLogs[0].Request, `{"recipient":{"id":"5678"},"sender_action":"typing_on"}`)
+
+	// and a typing stopped event as a typing_off sender action
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStopped(events.DirectionOutgoing, channelRef, "facebook:5678", ""), clog)
+	assert.NoError(t, err)
+	assert.Len(t, clog.HttpLogs, 2)
+	assert.Contains(t, clog.HttpLogs[1].Request, `{"recipient":{"id":"5678"},"sender_action":"typing_off"}`)
+
+	// an error response is a response error
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStarted(events.DirectionOutgoing, channelRef, "facebook:5678", ""), clog)
+	assert.Equal(t, channels.ErrResponseStatus, err)
+
+	// as is a connection error
+	err = h.SendEvent(context.Background(), channel, events.NewTypingStarted(events.DirectionOutgoing, channelRef, "facebook:5678", ""), clog)
+	assert.Equal(t, channels.ErrConnectionFailed, err)
+
+	// a channel without an auth token config can't send
+	noAuth := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "FBA", "12345", "", []string{urns.Facebook.Prefix}, nil)
+	err = h.SendEvent(context.Background(), noAuth, events.NewTypingStarted(events.DirectionOutgoing, channelRef, "facebook:5678", ""), clog)
+	assert.Equal(t, channels.ErrChannelConfig, err)
+
+	// nor can an event type the handler doesn't know how to send
+	err = h.SendEvent(context.Background(), channel, events.NewContactLanguageChanged("eng"), clog)
+	assert.ErrorContains(t, err, "unsupported event type: contact_language_changed")
 }
 
 func TestSigning(t *testing.T) {
@@ -642,11 +682,10 @@ func TestSigning(t *testing.T) {
 }
 
 func TestFacebookBuildAttachmentRequest(t *testing.T) {
-	mb := test.NewMockBackend()
-	s := courier.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()), mb)
+	s := web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()))
 
 	handler := &handler{NewBaseHandler(models.ChannelType("FBA"), "Facebook", DisableUUIDRouting())}
-	handler.Initialize(s)
+	s.MountHandler(handler)
 	req, _ := handler.BuildAttachmentRequest(context.Background(), facebookTestChannels[0], "https://example.org/v1/media/41", nil)
 	assert.Equal(t, "https://example.org/v1/media/41", req.URL.String())
 	assert.Equal(t, http.Header{}, req.Header)

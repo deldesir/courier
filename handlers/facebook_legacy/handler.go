@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/buger/jsonparser"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/utils"
@@ -51,27 +51,26 @@ const (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("FB"), "Facebook")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMultiReceive, handlers.JSONPayload(h, h.receiveEvents))
-	s.AddHandlerRoute(h, http.MethodGet, "receive", courier.ChannelLogTypeWebhookVerify, h.receiveVerify)
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMultiReceive, handlers.JSONPayload(h, h.receiveEvents))
+	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeWebhookVerify, h.receiveVerify)
 	return nil
 }
 
 // receiveVerify handles Facebook's webhook verification callback
-func (h *handler) receiveVerify(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveVerify(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	mode := r.URL.Query().Get("hub.mode")
 
 	// this isn't a subscribe verification, that's an error
@@ -104,8 +103,8 @@ func (h *handler) receiveVerify(ctx context.Context, channel courier.Channel, w 
 	return nil, err
 }
 
-func (h *handler) subscribeToEvents(ctx context.Context, channel courier.Channel, authToken string) {
-	clog := courier.NewChannelLog(courier.ChannelLogTypePageSubscribe, channel, h.RedactValues(channel))
+func (h *handler) subscribeToEvents(ctx context.Context, channel *models.Channel, authToken string) {
+	clog := models.NewChannelLog(models.ChannelLogTypePageSubscribe, channel, nil, h.RedactValues(channel))
 
 	// subscribe to messaging events for this page
 	form := url.Values{}
@@ -121,7 +120,7 @@ func (h *handler) subscribeToEvents(ctx context.Context, channel courier.Channel
 		slog.Error("error subscribing to Facebook page events", "channel_uuid", channel.UUID())
 	}
 
-	h.Backend().WriteChannelLog(ctx, clog)
+	models.WriteChannelLog(h.Runtime(), clog)
 }
 
 type fbUser struct {
@@ -208,7 +207,7 @@ type moPayload struct {
 }
 
 // receiveEvents is our HTTP handler function for incoming messages and status updates
-func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	// not a page object? ignore
 	if payload.Object != "page" {
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring non-page request")
@@ -220,7 +219,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 	}
 
 	// the list of events we deal with
-	events := make([]courier.Event, 0, 2)
+	events := make([]channels.Event, 0, 2)
 
 	// the list of data we will return in our response
 	data := make([]any, 0, 2)
@@ -251,19 +250,19 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid facebook id"))
 		}
 		if msg.OptIn != nil {
-			event := h.Backend().NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithOccurredOn(date)
+			event := models.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithOccurredOn(date)
 
 			// build our extra
 			extra := map[string]string{referrerIDKey: msg.OptIn.Ref}
 			event = event.WithExtra(extra)
 
-			err := h.Backend().WriteChannelEvent(ctx, event, clog)
+			err := models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
 			if err != nil {
 				return nil, err
 			}
 
 			events = append(events, event)
-			data = append(data, courier.NewEventReceiveData(event))
+			data = append(data, channels.NewEventReceiveData(event))
 
 		} else if msg.Postback != nil {
 			// by default postbacks are treated as new conversations, unless we have referral information
@@ -271,7 +270,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 			if msg.Postback.Referral.Ref != "" {
 				eventType = models.EventTypeReferral
 			}
-			event := h.Backend().NewChannelEvent(channel, eventType, urn, clog).WithOccurredOn(date)
+			event := models.NewChannelEvent(channel, eventType, urn, clog).WithOccurredOn(date)
 
 			// build our extra
 			extra := map[string]string{
@@ -292,17 +291,17 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 
 			event = event.WithExtra(extra)
 
-			err := h.Backend().WriteChannelEvent(ctx, event, clog)
+			err := models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
 			if err != nil {
 				return nil, err
 			}
 
 			events = append(events, event)
-			data = append(data, courier.NewEventReceiveData(event))
+			data = append(data, channels.NewEventReceiveData(event))
 
 		} else if msg.Referral != nil {
 			// this is an incoming referral
-			event := h.Backend().NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithOccurredOn(date)
+			event := models.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithOccurredOn(date)
 
 			// build our extra
 			extra := map[string]string{sourceKey: msg.Referral.Source, typeKey: msg.Referral.Type}
@@ -318,13 +317,13 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 			}
 			event = event.WithExtra(extra)
 
-			err := h.Backend().WriteChannelEvent(ctx, event, clog)
+			err := models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
 			if err != nil {
 				return nil, err
 			}
 
 			events = append(events, event)
-			data = append(data, courier.NewEventReceiveData(event))
+			data = append(data, channels.NewEventReceiveData(event))
 
 		} else if msg.Message != nil {
 			// this is an incoming message
@@ -334,7 +333,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 
 			// ignore echos
 			if msg.Message.IsEcho {
-				data = append(data, courier.NewInfoData("ignoring echo"))
+				data = append(data, channels.NewInfoData("ignoring echo"))
 				continue
 			}
 
@@ -371,41 +370,41 @@ func (h *handler) receiveEvents(ctx context.Context, channel courier.Channel, w 
 			}
 
 			// create our message
-			event := h.Backend().NewIncomingMsg(ctx, channel, urn, text, msg.Message.MID, clog).WithReceivedOn(date)
+			event := models.NewIncomingMsg(channel, urn, text, msg.Message.MID, clog).WithReceivedOn(date)
 
 			// add any attachment URL found
 			for _, attURL := range attachmentURLs {
 				event.WithAttachment(attURL)
 			}
 
-			err := h.Backend().WriteMsg(ctx, event, clog)
+			err := models.WriteMsg(ctx, h.Runtime(), event, clog)
 			if err != nil {
 				return nil, err
 			}
 
 			events = append(events, event)
-			data = append(data, courier.NewMsgReceiveData(event))
+			data = append(data, channels.NewMsgReceiveData(event))
 			seenMsgIDs[msg.Message.MID] = true
 
 		} else if msg.Delivery != nil {
 			// this is a delivery report
 			for _, mid := range msg.Delivery.MIDs {
-				event := h.Backend().NewStatusUpdateByExternalID(channel, mid, models.MsgStatusDelivered, clog)
-				err := h.Backend().WriteStatusUpdate(ctx, event)
+				event := models.NewStatusUpdateByExternalID(channel, mid, models.MsgStatusDelivered, clog)
+				err := models.WriteStatusUpdate(ctx, h.Runtime(), event)
 				if err != nil {
 					return nil, err
 				}
 
 				events = append(events, event)
-				data = append(data, courier.NewStatusData(event))
+				data = append(data, channels.NewStatusData(event))
 			}
 
 		} else {
-			data = append(data, courier.NewInfoData("ignoring unknown entry type"))
+			data = append(data, channels.NewInfoData("ignoring unknown entry type"))
 		}
 	}
 
-	return events, courier.WriteDataResponse(w, http.StatusOK, "Events Handled", data)
+	return events, channels.WriteDataResponse(w, http.StatusOK, "Events Handled", data)
 }
 
 //	{
@@ -452,10 +451,10 @@ type mtQuickReply struct {
 	ContentType string `json:"content_type"`
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	accessToken := msg.Channel().StringConfigForKey(models.ConfigAuthToken, "")
 	if accessToken == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 	payload := mtPayload{}
 
@@ -502,7 +501,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 
 		// include any quick replies on the last piece we send
 		if i == (len(msgParts)+len(msg.Attachments()))-1 {
-			qrs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), "text")
+			qrs := handlers.FilterQuickRepliesByType(msg.QuickReplies(), models.QuickReplyTypeText)
 			for _, qr := range qrs {
 				payload.Message.QuickReplies = append(payload.Message.QuickReplies, mtQuickReply{qr.Text, qr.Text, "text"})
 			}
@@ -521,15 +520,13 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		req.Header.Set("Accept", "application/json")
 
 		resp, respBody, err := h.RequestHTTP(req, clog)
-		if err != nil || resp.StatusCode/100 == 5 {
-			return courier.ErrConnectionFailed
-		} else if resp.StatusCode/100 != 2 {
-			return courier.ErrResponseStatus
+		if err := handlers.ErrorFromResponse(resp, err); err != nil {
+			return err
 		}
 
 		externalID, err := jsonparser.GetString(respBody, "message_id")
 		if err != nil {
-			return courier.ErrResponseUnexpected
+			return channels.ErrResponseUnexpected
 		}
 
 		res.AddExternalID(externalID)
@@ -539,7 +536,7 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 }
 
 // DescribeURN looks up URN metadata for new contacts
-func (h *handler) DescribeURN(ctx context.Context, channel courier.Channel, urn urns.URN, clog *courier.ChannelLog) (map[string]string, error) {
+func (h *handler) DescribeURN(ctx context.Context, channel *models.Channel, urn urns.URN, clog *models.ChannelLog) (map[string]string, error) {
 
 	accessToken := channel.StringConfigForKey(models.ConfigAuthToken, "")
 	if accessToken == "" {

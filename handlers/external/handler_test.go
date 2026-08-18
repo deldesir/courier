@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
@@ -18,11 +18,11 @@ const (
 	receiveURL = "/c/ex/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/receive/"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "EX", "2020", "US", []string{urns.Phone.Prefix}, nil),
 }
 
-var gmChannels = []courier.Channel{
+var gmChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "EX", "2020", "GM", []string{urns.Phone.Prefix}, nil),
 }
 
@@ -197,7 +197,7 @@ var handleTestCases = []IncomingTestCase{
 	},
 }
 
-var testSOAPReceiveChannels = []courier.Channel{
+var testSOAPReceiveChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "EX", "2020", "US",
 		[]string{urns.Phone.Prefix},
 		map[string]any{
@@ -240,7 +240,7 @@ var gmTestCases = []IncomingTestCase{
 	},
 }
 
-var customChannels = []courier.Channel{
+var customChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "EX", "2020", "US",
 		[]string{urns.Phone.Prefix},
 		map[string]any{
@@ -271,7 +271,7 @@ var customTestCases = []IncomingTestCase{
 	},
 }
 
-var extChannels = []courier.Channel{
+var extChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "EX", "2020", "GM", []string{urns.External.Prefix}, nil),
 }
 
@@ -439,7 +439,26 @@ var getSendTestCases = []OutgoingTestCase{
 				"from": {"2020"},
 			},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{
+		Label:   "Throttled",
+		MsgText: "Error Message",
+		MsgURN:  "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"http://example.com/send*": {
+				httpx.NewMockResponse(429, nil, []byte(`1: Unknown channel`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{
+			Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+			Params: url.Values{
+				"text": {`Error Message`},
+				"to":   {"+250788383383"},
+				"from": {"2020"},
+			},
+		}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{
 		Label:          "Send Attachment",
@@ -516,7 +535,7 @@ var postSendTestCases = []OutgoingTestCase{
 				"from": {"2020"},
 			},
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 	{
 		Label:          "Send Attachment",
@@ -602,7 +621,7 @@ var jsonSendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Authorization": "Token ABCDEF", "Content-Type": "application/json"},
 			Body:    `{ "to":"+250788383383", "text":"Error Message", "from":"2020", "quick_replies":[] }`,
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 	{
 		Label:          "Send Attachment",
@@ -708,7 +727,7 @@ var xmlSendTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "text/xml; charset=utf-8"},
 			Body:    `<msg><to>+250788383383</to><text>Error Message</text><from>2020</from><quick_replies></quick_replies></msg>`,
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 	{
 		Label:          "Send Attachment",
@@ -815,7 +834,7 @@ var xmlSendWithResponseContentTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "text/xml; charset=utf-8"},
 			Body:    `<msg><to>+250788383383</to><text>Error Message</text><from>2020</from><quick_replies></quick_replies></msg>`,
 		}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
 	},
 	{
 		Label:   "Error Sending with 200 status code",
@@ -830,7 +849,7 @@ var xmlSendWithResponseContentTestCases = []OutgoingTestCase{
 			Headers: map[string]string{"Content-Type": "text/xml; charset=utf-8"},
 			Body:    `<msg><to>+250788383383</to><text>Error Message</text><from>2020</from><quick_replies></quick_replies></msg>`,
 		}},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 	{
 		Label:          "Send Attachment",

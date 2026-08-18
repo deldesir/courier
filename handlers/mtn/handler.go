@@ -14,7 +14,7 @@ import (
 
 	"github.com/buger/jsonparser"
 	"github.com/gomodule/redigo/redis"
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/urns"
@@ -27,7 +27,7 @@ var (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
@@ -36,17 +36,16 @@ type handler struct {
 	fetchTokenMutex sync.Mutex
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{
 		BaseHandler:     handlers.NewBaseHandler(models.ChannelType("MTN"), "MTN Developer Portal"),
 		fetchTokenMutex: sync.Mutex{},
 	}
 }
 
-// Initialize implements courier.ChannelHandler
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
+// Initialize implements channels.Handler
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
 	return nil
 }
 
@@ -76,9 +75,9 @@ type moPayload struct {
 }
 
 // receiveEvent is our HTTP handler function for incoming messages
-func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
 	if payload.Message != "" {
-		clog.Type = courier.ChannelLogTypeMsgReceive
+		clog.Type = models.ChannelLogTypeMsgReceive
 
 		date := time.Unix(payload.Created/1000, payload.Created%1000*1000000).UTC()
 		urn, err := urns.ParsePhone(payload.From, channel.Country(), true, false)
@@ -87,11 +86,11 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 		}
 
 		// create and write the message
-		msg := h.Backend().NewIncomingMsg(ctx, channel, urn, payload.Message, "", clog).WithReceivedOn(date)
-		return handlers.WriteMsgsAndResponse(ctx, h, []courier.MsgIn{msg}, w, r, clog)
+		msg := models.NewIncomingMsg(channel, urn, payload.Message, "", clog).WithReceivedOn(date)
+		return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
 
 	} else {
-		clog.Type = courier.ChannelLogTypeMsgStatus
+		clog.Type = models.ChannelLogTypeMsgStatus
 
 		if payload.TransactionID == "" {
 			return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "missing transactionId, ignored")
@@ -108,7 +107,7 @@ func (h *handler) receiveEvent(ctx context.Context, channel courier.Channel, w h
 		}
 
 		// write our status
-		status := h.Backend().NewStatusUpdateByExternalID(channel, payload.TransactionID, msgStatus, clog)
+		status := models.NewStatusUpdateByExternalID(channel, payload.TransactionID, msgStatus, clog)
 		return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
 	}
 }
@@ -121,10 +120,10 @@ type mtPayload struct {
 	CPAddress        string   `json:"cpAddress,omitempty"`
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	accessToken, err := h.getAccessToken(msg.Channel(), clog)
 	if err != nil {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	baseURL := msg.Channel().StringConfigForKey(configAPIHost, apiHostURL)
@@ -153,15 +152,13 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
-	if err != nil || resp.StatusCode/100 == 5 {
-		return courier.ErrConnectionFailed
-	} else if resp.StatusCode/100 != 2 {
-		return courier.ErrResponseStatus
+	if err := handlers.ErrorFromResponse(resp, err); err != nil {
+		return err
 	}
 
 	externalID, err := jsonparser.GetString(respBody, "transactionId")
 	if err != nil {
-		clog.Error(courier.ErrorResponseValueMissing("transactionId"))
+		clog.Error(models.ErrorResponseValueMissing("transactionId"))
 	} else {
 		res.AddExternalID(externalID)
 	}
@@ -169,14 +166,14 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 	return nil
 }
 
-func (h *handler) RedactValues(ch courier.Channel) []string {
+func (h *handler) RedactValues(ch *models.Channel) []string {
 	return []string{
 		ch.StringConfigForKey(models.ConfigAPIKey, ""),
 		ch.StringConfigForKey(models.ConfigAuthToken, ""),
 	}
 }
 
-func (h *handler) getAccessToken(channel courier.Channel, clog *courier.ChannelLog) (string, error) {
+func (h *handler) getAccessToken(channel *models.Channel, clog *models.ChannelLog) (string, error) {
 	tokenKey := fmt.Sprintf("channel-token:%s", channel.UUID())
 
 	h.fetchTokenMutex.Lock()
@@ -213,7 +210,7 @@ func (h *handler) getAccessToken(channel courier.Channel, clog *courier.ChannelL
 }
 
 // fetchAccessToken tries to fetch a new token for our channel, setting the result in redis
-func (h *handler) fetchAccessToken(channel courier.Channel, clog *courier.ChannelLog) (string, time.Duration, error) {
+func (h *handler) fetchAccessToken(channel *models.Channel, clog *models.ChannelLog) (string, time.Duration, error) {
 	form := url.Values{
 		"client_id":     []string{channel.StringConfigForKey(models.ConfigAPIKey, "")},
 		"client_secret": []string{channel.StringConfigForKey(models.ConfigAuthToken, "")},
@@ -233,7 +230,7 @@ func (h *handler) fetchAccessToken(channel courier.Channel, clog *courier.Channe
 
 	token, err := jsonparser.GetString(respBody, "access_token")
 	if err != nil {
-		clog.Error(courier.ErrorResponseValueMissing("access_token"))
+		clog.Error(models.ErrorResponseValueMissing("access_token"))
 		return "", 0, err
 	}
 

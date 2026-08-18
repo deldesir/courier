@@ -1,0 +1,1574 @@
+package models_test
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/gomodule/redigo/redis"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/testsuite"
+	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/courier/v26/utils/queue"
+	"github.com/nyaruka/gocommon/aws/dynamo"
+	"github.com/nyaruka/gocommon/aws/dynamo/dyntest"
+	"github.com/nyaruka/gocommon/centrifugo"
+	"github.com/nyaruka/gocommon/dates"
+	"github.com/nyaruka/gocommon/dbutil/assertdb"
+	"github.com/nyaruka/gocommon/httpx"
+	"github.com/nyaruka/gocommon/i18n"
+	"github.com/nyaruka/gocommon/jsonx"
+	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/gocommon/uuids"
+	"github.com/nyaruka/null/v3"
+	"github.com/nyaruka/vkutil/assertvk"
+	"github.com/stretchr/testify/suite"
+)
+
+type ModelsTestSuite struct {
+	suite.Suite
+
+	rt *runtime.Runtime
+}
+
+func (ts *ModelsTestSuite) SetupSuite() {
+	ctx, rt := testsuite.Runtime(ts.T())
+	ts.rt = rt
+
+	// start from a clean baseline in case a previous test run left state behind
+	testsuite.ResetDB(ts.T(), ts.rt)
+	testsuite.ResetValkey(ts.T(), ts.rt)
+	dyntest.Truncate(ts.T(), ts.rt.Dynamo.Main.Client(), ts.rt.Dynamo.Main.Table())
+	dyntest.Truncate(ts.T(), ts.rt.Dynamo.History.Client(), ts.rt.Dynamo.History.Table())
+
+	ts.rt.S3.Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("test-attachments")})
+}
+
+func (ts *ModelsTestSuite) TearDownSuite() {
+	ctx := context.Background()
+
+	testsuite.ResetDB(ts.T(), ts.rt)
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	dyntest.Truncate(ts.T(), ts.rt.Dynamo.Main.Client(), ts.rt.Dynamo.Main.Table())
+	dyntest.Truncate(ts.T(), ts.rt.Dynamo.History.Client(), ts.rt.Dynamo.History.Table())
+
+	ts.rt.S3.EmptyBucket(ctx, "test-attachments")
+}
+
+func (ts *ModelsTestSuite) getChannel(cType string, cUUID string) *models.Channel {
+	channelUUID := models.ChannelUUID(cUUID)
+
+	channel, err := models.GetChannel(context.Background(), models.ChannelType(cType), channelUUID)
+	ts.Require().NoError(err, "error getting channel")
+	ts.Require().NotNil(channel)
+
+	return channel
+}
+
+func (ts *ModelsTestSuite) TestDeleteMsgByExternalID() {
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	ctx := context.Background()
+
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	// noop for invalid external ID
+	err := models.DeleteMsgByExternalID(ctx, ts.rt, knChannel, "ext-invalid")
+	ts.Nil(err)
+
+	// noop for external ID of outgoing message
+	err = models.DeleteMsgByExternalID(ctx, ts.rt, knChannel, "ext1")
+	ts.Nil(err)
+
+	ts.assertNoQueuedContactTask(100)
+
+	// a valid external id becomes a queued task
+	err = models.DeleteMsgByExternalID(ctx, ts.rt, knChannel, "ext2")
+	ts.Nil(err)
+
+	ts.assertQueuedContactTask(100, "msg_deleted", map[string]any{"msg_uuid": "0199df10-9519-7fe2-a29c-c890d1713673"})
+
+	// reset valkey for next test
+	testsuite.ResetValkey(ts.T(), ts.rt)
+	// a valid external identifier becomes a queued task as well
+	err = models.DeleteMsgByExternalID(ctx, ts.rt, knChannel, "ext3")
+	ts.Nil(err)
+
+	ts.assertQueuedContactTask(100, "msg_deleted", map[string]any{"msg_uuid": "019bb1ca-a92d-78f5-ba61-06aa62f2b41a"})
+}
+
+func (ts *ModelsTestSuite) TestContact() {
+
+	testsuite.ResetDB(ts.T(), ts.rt)
+
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+	urn := urns.URN("tel:+12065551518")
+
+	ctx := context.Background()
+	now := time.Now()
+
+	contact, err := models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn, nil, "Ryan Lewis", false, clog)
+	ts.NoError(err)
+	ts.Nil(contact)
+
+	// create our new contact
+	contact, err = models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn, nil, "Ryan Lewis", true, clog)
+	ts.NoError(err)
+
+	now2 := time.Now()
+
+	// load this contact again by URN, should be same contact, name unchanged
+	contact2, err := models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn, nil, "Other Name", true, clog)
+	ts.NoError(err)
+
+	ts.Equal(contact.UUID_, contact2.UUID_)
+	ts.Equal(contact.ID_, contact2.ID_)
+	ts.Equal(knChannel.OrgID(), contact2.OrgID_)
+	ts.Equal(null.String("Ryan Lewis"), contact2.Name_)
+	ts.True(contact2.ModifiedOn_.After(now))
+	ts.True(contact2.CreatedOn_.After(now))
+	ts.True(contact2.ModifiedOn_.Before(now2))
+	ts.True(contact2.CreatedOn_.Before(now2))
+
+	// load a contact by URN instead (this one is in our testdata)
+	cURN := urns.URN("tel:+12067799192")
+	contact, err = models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, cURN, nil, "", true, clog)
+	ts.NoError(err)
+	ts.NotNil(contact)
+
+	ts.Equal(null.String(""), contact.Name_)
+	ts.Equal(models.ContactUUID("a984069d-0008-4d8c-a772-b14a8a6acccc"), contact.UUID_)
+
+	urn = urns.URN("tel:+12065551519")
+
+	// long name are truncated
+
+	longName := "LongRandomNameHPGBRDjZvkz7y58jI2UPkio56IKGaMvaeDTvF74Q5SUkIHozFn1MLELfjX7vRrFto8YG2KPVaWzekgmFbkuxujIotFAgfhHqoHKW5c177FUtKf5YK9KbY8hp0x7PxIFY3MS5lMyMA5ELlqIgikThpr"
+	contact3, err := models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn, nil, longName, true, clog)
+	ts.NoError(err)
+
+	ts.Equal(null.String(longName[0:127]), contact3.Name_)
+
+}
+
+func (ts *ModelsTestSuite) TestContactRace() {
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+	urn := urns.URN("tel:+12065551518")
+
+	models.SetURNSleep(true)
+	defer func() { models.SetURNSleep(false) }()
+
+	ctx := context.Background()
+
+	// create our contact twice
+	var contact1, contact2 *models.Contact
+	var err1, err2 error
+
+	go func() {
+		contact1, err1 = models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn, nil, "Ryan Lewis", true, clog)
+	}()
+	go func() {
+		contact2, err2 = models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn, nil, "Ryan Lewis", true, clog)
+	}()
+
+	time.Sleep(time.Second)
+
+	ts.NoError(err1)
+	ts.NoError(err2)
+	ts.Equal(contact1.ID_, contact2.ID_)
+}
+
+func (ts *ModelsTestSuite) TestContactURN() {
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	fbChannel := ts.getChannel("FBA", "dbc126ed-66bc-4e28-b67b-81dc3327c96a")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+	urn := urns.URN("tel:+12065551515")
+
+	ctx := context.Background()
+
+	contact, err := models.ContactForURN(ctx, ts.rt, knChannel.OrgID_, knChannel, urn, nil, "", true, clog)
+	ts.NoError(err)
+	ts.NotNil(contact)
+
+	tx, err := ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	contact, err = models.ContactForURN(ctx, ts.rt, fbChannel.OrgID_, fbChannel, urn, map[string]string{"token1": "chestnut"}, "", true, clog)
+	ts.NoError(err)
+	ts.NotNil(contact)
+
+	contactURNs, err := models.GetURNsForContact(ctx, tx, contact.ID_)
+	ts.NoError(err)
+	ts.Equal(null.Map[string]{"token1": "chestnut"}, contactURNs[0].AuthTokens)
+
+	// now build a URN for our number with the kannel channel
+	knURN, err := models.GetOrCreateContactURN(ctx, tx, knChannel, contact.ID_, urn, map[string]string{"token2": "sesame"})
+	ts.NoError(err)
+	ts.NoError(tx.Commit())
+	ts.Equal(knURN.OrgID, knChannel.OrgID_)
+	ts.Equal(null.Map[string]{"token1": "chestnut", "token2": "sesame"}, knURN.AuthTokens)
+
+	tx, err = ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	// then with our twilio channel
+	fbURN, err := models.GetOrCreateContactURN(ctx, tx, fbChannel, contact.ID_, urn, nil)
+	ts.NoError(err)
+	ts.NoError(tx.Commit())
+
+	// should be the same URN
+	ts.Equal(knURN.ID, fbURN.ID)
+
+	// same contact
+	ts.Equal(knURN.ContactID, fbURN.ContactID)
+
+	// and channel should be set to facebook
+	ts.Equal(fbURN.ChannelID, fbChannel.ID())
+
+	// auth should be unchanged
+	ts.Equal(null.Map[string]{"token1": "chestnut", "token2": "sesame"}, fbURN.AuthTokens)
+
+	tx, err = ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	// again with different auth
+	fbURN, err = models.GetOrCreateContactURN(ctx, tx, fbChannel, contact.ID_, urn, map[string]string{"token3": "peanut"})
+	ts.NoError(err)
+	ts.NoError(tx.Commit())
+	ts.Equal(null.Map[string]{"token1": "chestnut", "token2": "sesame", "token3": "peanut"}, fbURN.AuthTokens)
+
+	// test that we don't use display when looking up URNs
+	tgChannel := ts.getChannel("TG", "dbc126ed-66bc-4e28-b67b-81dc3327c98a")
+	tgURN := urns.URN("telegram:12345")
+
+	tgContact, err := models.ContactForURN(ctx, ts.rt, tgChannel.OrgID_, tgChannel, tgURN, nil, "", true, clog)
+	ts.NoError(err)
+
+	tgURNDisplay := urns.URN("telegram:12345#Jane")
+	displayContact, err := models.ContactForURN(ctx, ts.rt, tgChannel.OrgID_, tgChannel, tgURNDisplay, nil, "", true, clog)
+
+	ts.NoError(err)
+	ts.Equal(tgContact.URNID_, displayContact.URNID_)
+	ts.Equal(tgContact.ID_, displayContact.ID_)
+
+	tx, err = ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	tgContactURN, err := models.GetOrCreateContactURN(ctx, tx, tgChannel, tgContact.ID_, tgURNDisplay, nil)
+	ts.NoError(err)
+	ts.NoError(tx.Commit())
+	ts.Equal(tgContact.URNID_, tgContactURN.ID)
+	ts.Equal(null.String("Jane"), tgContactURN.Display)
+
+	// try to create two contacts at the same time in goroutines, this tests our transaction rollbacks
+	urn2 := urns.URN("tel:+12065551616")
+	var wait sync.WaitGroup
+	var contact2, contact3 *models.Contact
+	wait.Add(2)
+	go func() {
+		var err2 error
+		contact2, err2 = models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn2, nil, "", true, clog)
+		ts.NoError(err2)
+		wait.Done()
+	}()
+	go func() {
+		var err3 error
+		contact3, err3 = models.ContactForURN(ctx, ts.rt, knChannel.OrgID(), knChannel, urn2, nil, "", true, clog)
+		ts.NoError(err3)
+		wait.Done()
+	}()
+	wait.Wait()
+	ts.NotNil(contact2)
+	ts.NotNil(contact3)
+	ts.Equal(contact2.ID_, contact3.ID_)
+	ts.Equal(contact2.URNID_, contact3.URNID_)
+}
+
+func (ts *ModelsTestSuite) TestContactURNMetadata() {
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	fbChannel := ts.getChannel("FBA", "dbc126ed-66bc-4e28-b67b-81dc3327c96a")
+	knURN := urns.URN("tel:+12065551111")
+	fbURN := urns.URN("tel:+12065552222")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+
+	ctx := context.Background()
+
+	knContact, err := models.ContactForURN(ctx, ts.rt, knChannel.OrgID_, knChannel, knURN, nil, "", true, clog)
+	ts.NoError(err)
+
+	tx, err := ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	_, err = models.GetOrCreateContactURN(ctx, tx, fbChannel, knContact.ID_, fbURN, nil)
+	ts.NoError(err)
+	ts.NoError(tx.Commit())
+
+	// looking up contact by fbURN should update channel_id on the URN but NOT reorder priorities
+	// (priority reordering is delegated to mailroom)
+	fbContact, err := models.ContactForURN(ctx, ts.rt, fbChannel.OrgID_, fbChannel, fbURN, nil, "", true, clog)
+	ts.NoError(err)
+
+	ts.Equal(fbContact.ID_, knContact.ID_)
+
+	// get all the URNs for this contact
+	tx, err = ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	urns, err := models.GetURNsForContact(ctx, tx, fbContact.ID_)
+	ts.NoError(err)
+	ts.NoError(tx.Commit())
+
+	// priorities are unchanged (knURN was created first so it's still top priority)
+	ts.Equal("tel:+12065551111", urns[0].Identity)
+
+	ts.Equal("tel:+12065552222", urns[1].Identity)
+	// but channel_id on the looked-up URN should be updated to the fb channel
+	ts.Equal(fbChannel.ID(), urns[1].ChannelID)
+}
+
+func (ts *ModelsTestSuite) TestMsgStatus() {
+	ctx := context.Background()
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	now := time.Now().In(time.UTC)
+
+	updateStatusByUUID := func(uuid models.MsgUUID, status models.MsgStatus, newExtID string) *models.ChannelLog {
+		clog := models.NewChannelLog(models.ChannelLogTypeMsgStatus, channel, nil, nil)
+		statusObj := models.NewStatusUpdate(channel, uuid, status, clog)
+		if newExtID != "" {
+			statusObj.SetExternalIdentifier(newExtID)
+		}
+		err := models.WriteStatusUpdate(ctx, ts.rt, statusObj)
+		ts.NoError(err)
+		models.FlushStatusWriter()
+		return clog
+	}
+
+	updateStatusByExtID := func(extID string, status models.MsgStatus) *models.ChannelLog {
+		clog := models.NewChannelLog(models.ChannelLogTypeMsgStatus, channel, nil, nil)
+		statusObj := models.NewStatusUpdateByExternalID(channel, extID, status, clog)
+		err := models.WriteStatusUpdate(ctx, ts.rt, statusObj)
+		ts.NoError(err)
+		models.FlushStatusWriter()
+		return clog
+	}
+
+	getHistoryItems := func() []*dynamo.Item {
+		ts.rt.Dynamo.History.Flush()
+		items := dyntest.ScanAll(ts.T(), ts.rt.Dynamo.History.Client(), ts.rt.Dynamo.History.Table())
+		dyntest.Truncate(ts.T(), ts.rt.Dynamo.History.Client(), ts.rt.Dynamo.History.Table())
+		return items
+	}
+
+	// put test message back into queued state
+	ts.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q', sent_on = NULL WHERE id = $1`, 10001)
+
+	// update to WIRED using UUID and provide new external ID
+	clog1 := updateStatusByUUID("0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusWired, "ext0")
+
+	m := testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df10-10dc-7e6e-834b-3d959ece93b2")
+	ts.Equal(models.MsgStatusWired, m.Status)
+	ts.Equal(null.String("ext0"), m.ExternalIdentifier)
+	ts.True(m.ModifiedOn.After(now))
+	ts.True(m.SentOn.After(now))
+	ts.Equal(null.NullString, m.FailedReason)
+	ts.Equal([]string{string(clog1.UUID)}, []string(m.LogUUIDs))
+
+	history := getHistoryItems()
+	ts.Len(history, 1)
+	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("wired", history[0].Data["status"])
+
+	sentOn := *m.SentOn
+
+	// update to SENT using UUID
+	clog2 := updateStatusByUUID("0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusSent, "")
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df10-10dc-7e6e-834b-3d959ece93b2")
+	ts.Equal(models.MsgStatusSent, m.Status)
+	ts.Equal(null.String("ext0"), m.ExternalIdentifier) // no change
+	ts.True(m.ModifiedOn.After(now))
+	ts.True(m.SentOn.Equal(sentOn)) // no change
+	ts.Equal([]string{string(clog1.UUID), string(clog2.UUID)}, []string(m.LogUUIDs))
+
+	history = getHistoryItems()
+	ts.Len(history, 1)
+	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("sent", history[0].Data["status"])
+
+	// update to DELIVERED using UUID
+	clog3 := updateStatusByUUID("0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusDelivered, "")
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df10-10dc-7e6e-834b-3d959ece93b2")
+	ts.Equal(m.Status, models.MsgStatusDelivered)
+	ts.True(m.ModifiedOn.After(now))
+	ts.True(m.SentOn.Equal(sentOn))                     // no change
+	ts.Equal(null.String("ext0"), m.ExternalIdentifier) // no change
+	ts.Equal([]string{string(clog1.UUID), string(clog2.UUID), string(clog3.UUID)}, []string(m.LogUUIDs))
+
+	history = getHistoryItems()
+	ts.Len(history, 1)
+	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("delivered", history[0].Data["status"])
+
+	// update to READ using UUID
+	clog4 := updateStatusByUUID("0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusRead, "")
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df10-10dc-7e6e-834b-3d959ece93b2")
+	ts.Equal(m.Status, models.MsgStatusRead)
+	ts.True(m.ModifiedOn.After(now))
+	ts.True(m.SentOn.Equal(sentOn)) // no change
+	ts.Equal([]string{string(clog1.UUID), string(clog2.UUID), string(clog3.UUID), string(clog4.UUID)}, []string(m.LogUUIDs))
+
+	history = getHistoryItems()
+	ts.Len(history, 1)
+	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("read", history[0].Data["status"])
+
+	// no change for incoming messages
+	updateStatusByUUID("0199df10-9519-7fe2-a29c-c890d1713673", models.MsgStatusSent, "")
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df10-9519-7fe2-a29c-c890d1713673")
+	ts.Equal(models.MsgStatusPending, m.Status)
+	ts.Equal(m.ExternalIdentifier, null.String("ext2"))
+	ts.Equal([]string(nil), []string(m.LogUUIDs))
+
+	// update to FAILED using external id
+	clog5 := updateStatusByExtID("ext1", models.MsgStatusFailed)
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(models.MsgStatusFailed, m.Status)
+	ts.True(m.ModifiedOn.After(now))
+	ts.Nil(m.SentOn)
+	ts.Equal([]string{string(clog5.UUID)}, []string(m.LogUUIDs))
+
+	history = getHistoryItems()
+	ts.Len(history, 1)
+	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
+	ts.Equal("evt#0199df0f-9f82-7689-b02d-f34105991321#sts", history[0].SK)
+	ts.Equal("failed", history[0].Data["status"])
+
+	now = time.Now().In(time.UTC)
+	time.Sleep(2 * time.Millisecond)
+
+	// update to WIRED using external id
+	updateStatusByExtID("ext1", models.MsgStatusWired)
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(models.MsgStatusWired, m.Status)
+	ts.True(m.ModifiedOn.After(now))
+	ts.True(m.SentOn.After(now))
+
+	sentOn = *m.SentOn
+
+	// update to SENT using external id
+	updateStatusByExtID("ext1", models.MsgStatusSent)
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(models.MsgStatusSent, m.Status)
+	ts.True(m.ModifiedOn.After(now))
+	ts.True(m.SentOn.Equal(sentOn)) // no change
+	ts.Equal(m.ExternalIdentifier, null.String("ext1"))
+
+	// put test outgoing messages back into queued state
+	ts.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q', sent_on = NULL WHERE id IN ($1, $2)`, 10002, 10001)
+
+	// can skip WIRED and go straight to SENT or DELIVERED
+	updateStatusByExtID("ext1", models.MsgStatusSent)
+	updateStatusByUUID("0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusDelivered, "")
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(models.MsgStatusSent, m.Status)
+	ts.NotNil(m.SentOn)
+	ts.Equal(m.ExternalIdentifier, null.String("ext1"))
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df10-10dc-7e6e-834b-3d959ece93b2")
+	ts.Equal(models.MsgStatusDelivered, m.Status)
+	ts.Equal(m.ExternalIdentifier, null.String("ext0"))
+	ts.NotNil(m.SentOn)
+
+	// reset our status to sent
+	updateStatusByExtID("ext1", models.MsgStatusSent)
+
+	// error our msg
+	now = time.Now().In(time.UTC)
+	time.Sleep(2 * time.Millisecond)
+	updateStatusByExtID("ext1", models.MsgStatusErrored)
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(m.Status, models.MsgStatusErrored)
+	ts.Equal(m.ErrorCount, 1)
+	ts.True(m.ModifiedOn.After(now))
+	ts.True(m.NextAttempt.After(now))
+	ts.Equal(null.NullString, m.FailedReason)
+	ts.Equal(m.ExternalIdentifier, null.String("ext1"))
+
+	// second go
+	updateStatusByExtID("ext1", models.MsgStatusErrored)
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(m.Status, models.MsgStatusErrored)
+	ts.Equal(m.ErrorCount, 2)
+	ts.Equal(null.NullString, m.FailedReason)
+
+	// third go
+	updateStatusByExtID("ext1", models.MsgStatusErrored)
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(m.Status, models.MsgStatusFailed)
+	ts.Equal(m.ErrorCount, 3)
+	ts.Equal(null.String("E"), m.FailedReason)
+
+}
+
+func (ts *ModelsTestSuite) TestMsgStatusSocketPublish() {
+	ctx := context.Background()
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeMsgStatus, channel, nil, nil)
+
+	ts.rt.Centrifugo.Client.(*centrifugo.MockClient).Clear()
+
+	vc := ts.rt.VK.Get()
+	defer vc.Close()
+
+	socket := "history:a984069d-0008-4d8c-a772-b14a8a6acccc"
+
+	// put test message back into queued state
+	ts.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q', sent_on = NULL WHERE id = $1`, 10001)
+
+	// write a status update before the contact's socket is subscribed... nothing is published
+	status := models.NewStatusUpdate(channel, "0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusSent, clog)
+	ts.NoError(models.WriteStatusUpdate(ctx, ts.rt, status))
+	models.FlushStatusWriter()
+
+	ts.Empty(testsuite.CentrifugoHistory(ts.T(), ts.rt, socket))
+
+	// mark the socket subscribed (as the authorizing service would) and write another status update
+	_, err := vc.Do("SET", centrifugo.SubscriptionKey(socket), "1")
+	ts.NoError(err)
+	defer vc.Do("DEL", centrifugo.SubscriptionKey(socket))
+
+	status = models.NewStatusUpdate(channel, "0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusDelivered, clog)
+	ts.NoError(models.WriteStatusUpdate(ctx, ts.rt, status))
+	models.FlushStatusWriter()
+
+	sent := testsuite.CentrifugoHistory(ts.T(), ts.rt, socket)
+	if ts.Len(sent, 1) {
+		var decoded map[string]any
+		ts.NoError(json.Unmarshal(sent[0], &decoded))
+		ts.Equal("msg_status_changed", decoded["type"])
+		ts.Equal("0199df10-10dc-7e6e-834b-3d959ece93b2", decoded["msg_uuid"])
+		ts.Equal("delivered", decoded["status"])
+	}
+}
+
+func (ts *ModelsTestSuite) TestSentExternalIDCaching() {
+	rc := ts.rt.VK.Get()
+	defer rc.Close()
+
+	ctx := context.Background()
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeMsgSend, channel, nil, nil)
+
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	// create a status update from a send which will have a UUID and an external ID
+	status1 := models.NewStatusUpdate(channel, "0199df0f-9f82-7689-b02d-f34105991321", models.MsgStatusSent, clog)
+	status1.SetExternalIdentifier("ex457")
+	err := models.WriteStatusUpdate(ctx, ts.rt, status1)
+	ts.NoError(err)
+
+	// give batcher time to write it
+	time.Sleep(time.Millisecond * 600)
+
+	keys, err := redis.Strings(rc.Do("KEYS", "{sent-external-ids}:*"))
+	ts.NoError(err)
+	ts.Len(keys, 1)
+	assertvk.HGetAll(ts.T(), rc, keys[0], map[string]string{"10|ex457": "0199df0f-9f82-7689-b02d-f34105991321"})
+
+	// mimic a delay in that status being written by reverting the db changes
+	ts.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'W', external_identifier = NULL WHERE id = 10000`)
+
+	// create a callback status update which only has external id
+	status2 := models.NewStatusUpdateByExternalID(channel, "ex457", models.MsgStatusDelivered, clog)
+
+	err = models.WriteStatusUpdate(ctx, ts.rt, status2)
+	ts.NoError(err)
+
+	// give batcher time to write it
+	time.Sleep(time.Millisecond * 700)
+
+	// msg status successfully updated in the database
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT status FROM msgs_msg WHERE id = 10000`).Returns("D")
+}
+
+func (ts *ModelsTestSuite) TestCheckForDuplicate() {
+	rc := ts.rt.VK.Get()
+	defer rc.Close()
+
+	ctx := context.Background()
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	twChannel := ts.getChannel("FBA", "dbc126ed-66bc-4e28-b67b-81dc3327c96a")
+	urn := urns.URN("tel:+12065551215")
+	urn2 := urns.URN("tel:+12065551277")
+
+	createAndWriteMsg := func(ch *models.Channel, u urns.URN, text, extID string) *models.MsgIn {
+		clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+		m := models.NewIncomingMsg(ch, u, text, extID, clog)
+		err := models.WriteMsg(ctx, ts.rt, m, clog)
+		ts.NoError(err)
+		return m
+	}
+
+	msg1 := createAndWriteMsg(knChannel, urn, "ping", "")
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE uuid = $1`, msg1.UUID()).Returns(1)
+
+	keys, err := redis.Strings(rc.Do("KEYS", "{seen-msgs}:*"))
+	ts.NoError(err)
+	ts.Len(keys, 1)
+	assertvk.HGetAll(ts.T(), rc, keys[0], map[string]string{
+		"dbc126ed-66bc-4e28-b67b-81dc3327c95d|tel:+12065551215": string(msg1.UUID()) + "|fb826459f96c6e3ee563238d158a24702afbdd78",
+	})
+
+	// trying again should lead to same UUID
+	msg2 := createAndWriteMsg(knChannel, urn, "ping", "")
+	ts.Equal(msg1.UUID(), msg2.UUID())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'ping'`).Returns(1)
+
+	// different text should change that
+	msg3 := createAndWriteMsg(knChannel, urn, "test", "")
+	ts.NotEqual(msg2.UUID(), msg3.UUID())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'test'`).Returns(1)
+
+	// an outgoing message should clear things
+	msgJSON := `[{
+		"text": "test",
+		"contact": {"id": 100, "uuid": "a984069d-0008-4d8c-a772-b14a8a6acccc"},
+		"id": 10000,
+		"channel_uuid": "dbc126ed-66bc-4e28-b67b-81dc3327c95d",
+		"uuid": "0199df0f-9f82-7689-b02d-f34105991321",
+		"urn": "tel:+12065551215",
+		"org_id": 1,
+		"origin": "chat",
+		"created_on": "2017-07-21T19:22:23.242757Z",
+		"high_priority": true,
+		"response_to_external_id": "external-id",
+		"is_resend": true
+	}]`
+	err = queue.PushOntoQueue(rc, models.MsgQueueName, "dbc126ed-66bc-4e28-b67b-81dc3327c95d", 10, string(msgJSON), queue.HighPriority)
+	ts.NoError(err)
+	_, err = models.PopNextOutgoingMsg(ctx, ts.rt)
+	ts.NoError(err)
+
+	msg4 := createAndWriteMsg(knChannel, urn, "test", "")
+	ts.NotEqual(msg3.UUID(), msg4.UUID())
+
+	// message on a different channel but same text won't be considered a dupe
+	msg5 := createAndWriteMsg(twChannel, urn, "test", "")
+	ts.NotEqual(msg4.UUID(), msg5.UUID())
+
+	// message on a different URN but same text won't be considered a dupe
+	msg6 := createAndWriteMsg(twChannel, urn2, "test", "")
+	ts.NotEqual(msg5.UUID(), msg6.UUID())
+
+	// when messages have external IDs those are used to de-dupe and text is ignored
+	msg7 := createAndWriteMsg(twChannel, urn, "test", "EX123")
+	msg8 := createAndWriteMsg(twChannel, urn, "testtest", "EX123")
+	msg9 := createAndWriteMsg(twChannel, urn, "test", "EX234")
+
+	ts.Equal(msg7.UUID(), msg8.UUID())
+	ts.NotEqual(msg7.UUID(), msg9.UUID())
+}
+
+func (ts *ModelsTestSuite) TestOutgoingQueue() {
+	// add one of our outgoing messages to the queue
+	ctx := context.Background()
+	r := ts.rt.VK.Get()
+	defer r.Close()
+
+	msgJSON := `[{
+		"org_id": 1,
+		"id": 10000,
+		"uuid": "0199df0f-9f82-7689-b02d-f34105991321",
+		"high_priority": true,
+		"text": "test message",
+		"contact": {"id": 100, "uuid": "a984069d-0008-4d8c-a772-b14a8a6acccc"},
+		"created_on": "2025-10-14T20:16:03.821434Z",
+		"channel_uuid": "dbc126ed-66bc-4e28-b67b-81dc3327c95d",
+		"urn": "tel:+12067799192",
+		"origin": "chat"
+	}]`
+
+	err := queue.PushOntoQueue(r, models.MsgQueueName, "dbc126ed-66bc-4e28-b67b-81dc3327c95d", 10, string(msgJSON), queue.HighPriority)
+	ts.NoError(err)
+
+	// pop a message off our queue
+	msg, err := models.PopNextOutgoingMsg(ctx, ts.rt)
+	ts.NoError(err)
+	ts.NotNil(msg)
+
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, msg.Channel(), nil, nil)
+
+	// make sure it is the message we just added
+	ts.Equal(models.MsgUUID("0199df0f-9f82-7689-b02d-f34105991321"), msg.UUID())
+
+	// and that it has the appropriate text
+	ts.Equal(msg.Text(), "test message")
+
+	// mark this message as dealt with
+	models.OnSendComplete(ctx, ts.rt, msg, models.NewStatusUpdate(msg.Channel(), msg.UUID(), models.MsgStatusWired, clog), urns.NilURN, clog)
+
+	// this message should now be marked as sent
+	sent, err := models.WasMsgSent(ctx, ts.rt, msg.UUID())
+	ts.NoError(err)
+	ts.True(sent)
+
+	// pop another message off, shouldn't get anything
+	msg2, err := models.PopNextOutgoingMsg(ctx, ts.rt)
+	ts.Nil(msg2)
+	ts.Nil(err)
+
+	// checking another message should show unsent
+	msg3 := testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df10-10dc-7e6e-834b-3d959ece93b2")
+	sent, err = models.WasMsgSent(ctx, ts.rt, msg3.UUID)
+	ts.NoError(err)
+	ts.False(sent)
+
+	// write an error for our original message
+	err = models.WriteStatusUpdate(ctx, ts.rt, models.NewStatusUpdate(msg.Channel(), msg.UUID(), models.MsgStatusErrored, clog))
+	ts.NoError(err)
+
+	// message should no longer be considered sent
+	sent, err = models.WasMsgSent(ctx, ts.rt, msg.UUID())
+	ts.NoError(err)
+	ts.False(sent)
+}
+
+func (ts *ModelsTestSuite) TestChannel() {
+	noAddress := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c99a")
+	ts.Equal(i18n.Country("US"), noAddress.Country())
+	ts.Equal(models.NilChannelAddress, noAddress.ChannelAddress())
+
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+
+	ts.Equal("2500", knChannel.Address())
+	ts.Equal(models.ChannelAddress("2500"), knChannel.ChannelAddress())
+	ts.Equal(i18n.Country("RW"), knChannel.Country())
+	ts.Equal([]models.ChannelRole{models.ChannelRoleSend, models.ChannelRoleReceive}, knChannel.Roles())
+	ts.True(knChannel.HasRole(models.ChannelRoleSend))
+	ts.True(knChannel.HasRole(models.ChannelRoleReceive))
+	ts.False(knChannel.HasRole(models.ChannelRoleCall))
+	ts.False(knChannel.HasRole(models.ChannelRoleAnswer))
+
+	// assert our config values
+	val := knChannel.ConfigForKey("use_national", false)
+	boolVal, isBool := val.(bool)
+	ts.True(isBool)
+	ts.True(boolVal)
+
+	val = knChannel.ConfigForKey("encoding", "default")
+	ts.Equal("smart", val)
+
+	val = knChannel.StringConfigForKey("encoding", "default")
+	ts.Equal("smart", val)
+
+	val = knChannel.StringConfigForKey("encoding_missing", "default")
+	ts.Equal("default", val)
+
+	val = knChannel.IntConfigForKey("max_length_int", -1)
+	ts.Equal(320, val)
+
+	val = knChannel.IntConfigForKey("max_length_str", -1)
+	ts.Equal(320, val)
+
+	val = knChannel.IntConfigForKey("max_length_missing", -1)
+	ts.Equal(-1, val)
+
+	// missing value
+	val = knChannel.ConfigForKey("missing", "missingValue")
+	ts.Equal("missingValue", val)
+
+	// try an org config
+	val = knChannel.OrgConfigForKey("CHATBASE_API_KEY", nil)
+	ts.Equal("cak", val)
+
+	// and a missing value
+	val = knChannel.OrgConfigForKey("missing", "missingValue")
+	ts.Equal("missingValue", val)
+
+	exChannel := ts.getChannel("EX", "dbc126ed-66bc-4e28-b67b-81dc3327100a")
+	ts.Equal([]models.ChannelRole{models.ChannelRoleReceive}, exChannel.Roles())
+	ts.False(exChannel.HasRole(models.ChannelRoleSend))
+	ts.True(exChannel.HasRole(models.ChannelRoleReceive))
+	ts.False(exChannel.HasRole(models.ChannelRoleCall))
+	ts.False(exChannel.HasRole(models.ChannelRoleAnswer))
+
+	exChannel2 := ts.getChannel("EX", "dbc126ed-66bc-4e28-b67b-81dc3327222a")
+	ts.False(exChannel2.HasRole(models.ChannelRoleSend))
+	ts.False(exChannel2.HasRole(models.ChannelRoleReceive))
+	ts.False(exChannel2.HasRole(models.ChannelRoleCall))
+	ts.False(exChannel2.HasRole(models.ChannelRoleAnswer))
+}
+
+func (ts *ModelsTestSuite) TestGetChannel() {
+	ctx := context.Background()
+
+	knUUID := models.ChannelUUID("dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	xxUUID := models.ChannelUUID("0a1256fe-c6e4-494d-99d3-576286f31d3b") // doesn't exist
+
+	ch, err := models.GetChannel(ctx, models.ChannelType("KN"), knUUID)
+	ts.Assert().NoError(err)
+	ts.Assert().NotNil(ch)
+	ts.Assert().Equal(knUUID, ch.UUID())
+
+	ch, err = models.GetChannel(ctx, models.ChannelType("KN"), knUUID) // from cache
+	ts.Assert().NoError(err)
+	ts.Assert().NotNil(ch)
+	ts.Assert().Equal(knUUID, ch.UUID())
+
+	ch, err = models.GetChannel(ctx, models.ChannelType("KN"), xxUUID)
+	ts.Assert().Error(err)
+	ts.Assert().Nil(ch)
+	ts.Assert().True(ch == nil) // https://github.com/stretchr/testify/issues/503
+
+	ch, err = models.GetChannel(ctx, models.ChannelType("KN"), xxUUID) // from cache
+	ts.Assert().Error(err)
+	ts.Assert().Nil(ch)
+	ts.Assert().True(ch == nil) // https://github.com/stretchr/testify/issues/503
+}
+
+func (ts *ModelsTestSuite) TestWriteChannelLog() {
+	ctx := context.Background()
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+
+	getClogFromDynamo := func(clog *models.ChannelLog) (*dynamo.Item, error) {
+		return dynamo.GetItem(ctx, ts.rt.Dynamo.Main.Client(), ts.rt.Dynamo.Main.Table(), models.ChannelLogDynamoKey(clog))
+	}
+
+	httpClient := &http.Client{Transport: httpx.WithTraces(httpx.WithMocks(nil, map[string][]*httpx.MockResponse{
+		"https://api.messages.com/send.json": {
+			httpx.NewMockResponse(200, nil, []byte(`{"status":"success"}`)),
+		},
+	}))}
+
+	// make a request that will have a response
+	req, _ := http.NewRequest("POST", "https://api.messages.com/send.json", nil)
+	trace, _, err := utils.DoTraced(httpClient, req)
+	ts.NoError(err)
+
+	clog1 := models.NewChannelLog(models.ChannelLogTypeTokenRefresh, channel, nil, nil)
+	clog1.HTTP(trace)
+	clog1.Error(models.ErrorResponseStatusCode())
+
+	models.WriteChannelLog(ts.rt, clog1)
+
+	time.Sleep(time.Second) // give writer time to write this
+
+	// check that we can read the log back from DynamoDB
+	item1, err := getClogFromDynamo(clog1)
+	ts.NoError(err)
+	ts.Equal(1, item1.OrgID)
+	ts.Equal("token_refresh", item1.Data["type"])
+	ts.NotNil(item1.DataGZ)
+
+	var dataGZ map[string]any
+	err = dynamo.UnmarshalJSONGZ(item1.DataGZ, &dataGZ)
+	ts.NoError(err)
+	ts.NotNil(dataGZ["http_logs"])
+	ts.Equal("https://api.messages.com/send.json", dataGZ["http_logs"].([]any)[0].(map[string]any)["url"])
+
+	clog2 := models.NewChannelLog(models.ChannelLogTypeMsgSend, channel, nil, nil)
+	clog2.HTTP(trace)
+
+	models.WriteChannelLog(ts.rt, clog2)
+
+	time.Sleep(time.Second) // give writer time to write this
+
+	// check that we can read the log back from DynamoDB
+	item2, err := getClogFromDynamo(clog2)
+	ts.NoError(err)
+	ts.Equal("msg_send", item2.Data["type"])
+
+	dyntest.AssertCount(ts.T(), ts.rt.Dynamo.Main.Client(), ts.rt.Dynamo.Main.Table(), 2)
+}
+
+func (ts *ModelsTestSuite) TestContactForMsg() {
+	ctx := context.Background()
+	waChannel := ts.getChannel("WAC", "dbc126ed-66bc-4e28-b67b-81dc33277a17")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, waChannel, nil, nil)
+
+	// sender is the primary URN - a phone number, or a BSUID for a webhook with no phone number, in which case
+	// handlers attach no new URN
+	newWAMsg := func(sender, bsuid urns.URN) *models.MsgIn {
+		m := models.NewIncomingMsg(waChannel, sender, "hi", "", clog)
+		if bsuid != urns.NilURN {
+			m.WithNewURN(bsuid, models.NewURNAppend)
+		}
+		return m
+	}
+	lookup := func(urn urns.URN) *models.Contact {
+		c, err := models.ContactForURN(ctx, ts.rt, waChannel.OrgID_, waChannel, urn, nil, "", false, clog)
+		ts.NoError(err)
+		return c
+	}
+
+	// no existing contact: a message with a phone number and BSUID creates one keyed on the phone number
+	c1, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:12065551234", "whatsapp:US.1234"), clog)
+	ts.NoError(err)
+	ts.True(c1.IsNew_)
+	ts.Equal(c1.ID_, lookup("whatsapp:12065551234").ID_)
+	ts.Nil(lookup("whatsapp:US.1234")) // BSUID is appended by mailroom, not here
+
+	// existing contact known only by the phone number: a message with that phone number and a BSUID is matched
+	// directly by the phone number
+	c1Again, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:12065551234", "whatsapp:US.1234"), clog)
+	ts.NoError(err)
+	ts.False(c1Again.IsNew_)
+	ts.Equal(c1.ID_, c1Again.ID_)
+
+	// no existing contact: a BSUID-only message creates one keyed on the BSUID
+	b1, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:US.7777", urns.NilURN), clog)
+	ts.NoError(err)
+	ts.True(b1.IsNew_)
+	ts.Equal(b1.ID_, lookup("whatsapp:US.7777").ID_)
+
+	// existing contact known only by a BSUID: a BSUID-only message is matched to it
+	b1Again, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:US.7777", urns.NilURN), clog)
+	ts.NoError(err)
+	ts.False(b1Again.IsNew_)
+	ts.Equal(b1.ID_, b1Again.ID_)
+
+	// existing contact known only by a BSUID: a message with a new phone number and that BSUID is matched to it
+	// (not duplicated) and the phone number is added to it
+	existingByBSUID, err := models.ContactForURN(ctx, ts.rt, waChannel.OrgID_, waChannel, "whatsapp:US.5555", nil, "", true, clog)
+	ts.NoError(err)
+
+	matched, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:12065555555", "whatsapp:US.5555"), clog)
+	ts.NoError(err)
+	ts.False(matched.IsNew_)
+	ts.Equal(existingByBSUID.ID_, matched.ID_)
+	ts.Equal(existingByBSUID.ID_, lookup("whatsapp:12065555555").ID_) // phone number now resolves to the same contact
+	ts.NotEqual(existingByBSUID.URNID_, matched.URNID_)               // and the message is attributed to the phone URN
+
+	// existing contact known by both URNs: a message with both is matched directly by the phone number
+	matchedBoth, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:12065555555", "whatsapp:US.5555"), clog)
+	ts.NoError(err)
+	ts.False(matchedBoth.IsNew_)
+	ts.Equal(existingByBSUID.ID_, matchedBoth.ID_)
+
+	// existing contact known by both URNs: a BSUID-only message is matched by the BSUID
+	matchedBSUIDOnly, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:US.5555", urns.NilURN), clog)
+	ts.NoError(err)
+	ts.False(matchedBSUIDOnly.IsNew_)
+	ts.Equal(existingByBSUID.ID_, matchedBSUIDOnly.ID_)
+
+	// user changes their phone number: a message with a new phone number and their BSUID is matched by the BSUID
+	// and the new phone number is added alongside the old one
+	changedPhone, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:12065556666", "whatsapp:US.5555"), clog)
+	ts.NoError(err)
+	ts.False(changedPhone.IsNew_)
+	ts.Equal(existingByBSUID.ID_, changedPhone.ID_)
+	ts.Equal(existingByBSUID.ID_, lookup("whatsapp:12065556666").ID_) // new phone number added
+	ts.Equal(existingByBSUID.ID_, lookup("whatsapp:12065555555").ID_) // old phone number retained
+
+	// existing contact known by the phone number: matched directly, even if another contact owns the BSUID
+	other, err := models.ContactForURN(ctx, ts.rt, waChannel.OrgID_, waChannel, "whatsapp:US.9999", nil, "", true, clog)
+	ts.NoError(err)
+
+	matchedByPhone, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:12065555555", "whatsapp:US.9999"), clog)
+	ts.NoError(err)
+	ts.False(matchedByPhone.IsNew_)
+	ts.Equal(existingByBSUID.ID_, matchedByPhone.ID_)
+	ts.Equal(other.ID_, lookup("whatsapp:US.9999").ID_) // BSUID left with its owner, conflict is mailroom's to resolve
+
+	// no BSUID attached: existing single-URN resolution, a new phone number creates a new contact
+	c2, err := models.ContactForMsg(ctx, ts.rt, newWAMsg("whatsapp:12065550000", urns.NilURN), clog)
+	ts.NoError(err)
+	ts.True(c2.IsNew_)
+
+	// adding a URN which belongs to another contact - as can happen if it's created after our lookups - doesn't
+	// steal it, and tells the caller to start over
+	added, err := models.AddContactURN(ctx, ts.rt, waChannel, existingByBSUID, "whatsapp:12065550000", nil)
+	ts.NoError(err)
+	ts.False(added)
+	ts.Equal(c2.ID_, lookup("whatsapp:12065550000").ID_)
+}
+
+func (ts *ModelsTestSuite) TestSaveAttachment() {
+	testJPG := test.ReadFile("../../test/testdata/test.jpg")
+	ctx := context.Background()
+
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+
+	defer uuids.SetGenerator(uuids.DefaultGenerator)
+	uuids.SetGenerator(uuids.NewSeededGenerator(1234, time.Now))
+
+	newURL, err := models.SaveAttachment(ctx, ts.rt, knChannel, "image/jpeg", testJPG, "jpg")
+	ts.NoError(err)
+	ts.Equal("http://localstack:4566/test-attachments/attachments/1/15a2/ee5e/15a2ee5e-5e45-4711-8e0f-6b2abe4360d8.jpg", newURL)
+}
+
+func (ts *ModelsTestSuite) TestWriteMsg() {
+	ctx := context.Background()
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+
+	// have to round to microseconds because postgres can't store nanos
+	now := time.Now().Round(time.Microsecond).In(time.UTC)
+
+	// create a new courier msg
+	urn := urns.URN("tel:+12065551212")
+	msg1 := models.NewIncomingMsg(knChannel, urn, "test-write", "ext123", clog).WithReceivedOn(now).WithContactName("test contact")
+
+	// try to write it to our db
+	err := models.WriteMsg(ctx, ts.rt, msg1, clog)
+	ts.NoError(err)
+
+	time.Sleep(1 * time.Second)
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'test-write'`).Returns(1)
+
+	// trying to writing the same msg again should result in it getting the same UUID and not being actually written
+	msg2 := models.NewIncomingMsg(knChannel, urn, "test-write", "ext123", clog)
+	err = models.WriteMsg(ctx, ts.rt, msg2, clog)
+	ts.NoError(err)
+	ts.Equal(msg2.UUID(), msg1.UUID())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'test-write'`).Returns(1)
+
+	// load it back from the id
+	m := testsuite.ReadDBMsg(ts.T(), ts.rt, msg1.UUID())
+
+	tx, err := ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	// load our URN
+	contactURN, err := models.GetOrCreateContactURN(ctx, tx, knChannel, m.ContactID, urn, nil)
+	if !ts.NoError(err) || !ts.NoError(tx.Commit()) {
+		ts.FailNow("failed writing contact urn")
+	}
+
+	// make sure our values are set appropriately
+	ts.Equal(knChannel.ID_, m.ChannelID)
+	ts.Equal(knChannel.OrgID_, m.OrgID)
+	ts.Equal(contactURN.ContactID, m.ContactID)
+	ts.Equal(contactURN.ID, m.ContactURNID)
+	ts.Equal("ext123", string(m.ExternalIdentifier))
+	ts.Equal("test-write", m.Text)
+	ts.Equal(0, len(m.Attachments))
+	ts.Equal(now, m.SentOn.In(time.UTC))
+	ts.NotNil(m.CreatedOn)
+	ts.NotNil(m.ModifiedOn)
+
+	contact, err := models.ContactForURN(ctx, ts.rt, m.OrgID, knChannel, urn, nil, "", true, clog)
+	ts.NoError(err)
+	ts.Equal(null.String("test contact"), contact.Name_)
+	ts.Equal(m.OrgID, contact.OrgID_)
+	ts.Equal(m.ContactID, contact.ID_)
+	ts.NotNil(contact.UUID_)
+	ts.NotNil(contact.ID_)
+
+	// waiting 5 seconds should let us write it successfully
+	time.Sleep(5 * time.Second)
+	msg3 := models.NewIncomingMsg(knChannel, urn, "test-write", "", clog)
+	ts.Greater(msg3.UUID(), msg1.UUID())
+
+	// msg with null bytes in it, that's fine for a request body
+	msg4 := models.NewIncomingMsg(knChannel, urn, "test456\x00456", "ext456", clog)
+	_, err = models.WriteMsgToDB(ctx, ts.rt, msg4, clog)
+	ts.NoError(err)
+
+	// more null bytes
+	text, _ := url.PathUnescape("%1C%00%00%00%00%00%07%E0%00")
+	msg5 := models.NewIncomingMsg(knChannel, urn, text, "", clog)
+	_, err = models.WriteMsgToDB(ctx, ts.rt, msg5, clog)
+	ts.NoError(err)
+
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	// check that msg is queued to mailroom for handling
+	msg6 := models.NewIncomingMsg(knChannel, urn, "hello 1 2 3", "", clog)
+	err = models.WriteMsg(ctx, ts.rt, msg6, clog)
+	ts.NoError(err)
+
+	ts.assertQueuedContactTask(contact.ID_, "msg_received", map[string]any{
+		"channel_id":      float64(10),
+		"msg_uuid":        string(msg6.UUID()),
+		"msg_external_id": msg6.ExternalID(),
+		"urn":             msg6.URN().String(),
+		"urn_id":          float64(contact.URNID_),
+		"text":            msg6.Text(),
+		"attachments":     nil,
+		"new_contact":     contact.IsNew_,
+	})
+
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	// check that msg with new_urn is queued with that field included
+	msg7 := models.NewIncomingMsg(knChannel, urn, "hello with new urn", "", clog)
+	msg7.WithNewURN(urns.URN("tel:+12065559999"), models.NewURNAppend)
+	err = models.WriteMsg(ctx, ts.rt, msg7, clog)
+	ts.NoError(err)
+
+	ts.assertQueuedContactTask(contact.ID_, "msg_received", map[string]any{
+		"channel_id":      float64(10),
+		"msg_uuid":        string(msg7.UUID()),
+		"msg_external_id": msg7.ExternalID(),
+		"urn":             msg7.URN().String(),
+		"urn_id":          float64(contact.URNID_),
+		"text":            msg7.Text(),
+		"attachments":     nil,
+		"new_contact":     contact.IsNew_,
+		"new_urn":         map[string]any{"value": "tel:+12065559999", "action": "append"},
+	})
+
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	// check that msg with payload is queued with that field included
+	msg8 := models.NewIncomingMsg(knChannel, urn, "hello with payload", "", clog)
+	msg8.WithPayload(json.RawMessage(`{"first_name": "Bob", "age": 32}`))
+	err = models.WriteMsg(ctx, ts.rt, msg8, clog)
+	ts.NoError(err)
+
+	ts.assertQueuedContactTask(contact.ID_, "msg_received", map[string]any{
+		"channel_id":      float64(10),
+		"msg_uuid":        string(msg8.UUID()),
+		"msg_external_id": msg8.ExternalID(),
+		"urn":             msg8.URN().String(),
+		"urn_id":          float64(contact.URNID_),
+		"text":            msg8.Text(),
+		"attachments":     nil,
+		"new_contact":     contact.IsNew_,
+		"payload":         map[string]any{"first_name": "Bob", "age": float64(32)},
+	})
+}
+
+func (ts *ModelsTestSuite) TestWriteMsgWithAttachments() {
+	ctx := context.Background()
+
+	defer uuids.SetGenerator(uuids.DefaultGenerator)
+	uuids.SetGenerator(uuids.NewSeededGenerator(1234, time.Now))
+
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+	urn := urns.URN("tel:+12065551218")
+
+	msg1 := models.NewIncomingMsg(knChannel, urn, "two regular attachments", "", clog)
+	msg1.WithAttachment("http://example.com/test.jpg")
+	msg1.WithAttachment("http://example.com/test.m4a")
+
+	// should just write attachments as they are
+	err := models.WriteMsg(ctx, ts.rt, msg1, clog)
+	ts.NoError(err)
+	ts.Equal([]string{"http://example.com/test.jpg", "http://example.com/test.m4a"}, msg1.Attachments())
+
+	// try an embedded attachment
+	msg2 := models.NewIncomingMsg(knChannel, urn, "embedded attachment data", "", clog)
+	msg2.WithAttachment(fmt.Sprintf("data:%s", base64.StdEncoding.EncodeToString(test.ReadFile("../../test/testdata/test.jpg"))))
+
+	// should have actually fetched and saved it to storage, with the correct content type
+	err = models.WriteMsg(ctx, ts.rt, msg2, clog)
+	ts.NoError(err)
+	ts.Equal([]string{"image/jpeg:http://localstack:4566/test-attachments/attachments/1/f879/21a1/f87921a1-0484-4660-9955-f9b28b006b78.jpg"}, msg2.Attachments())
+
+	// try an invalid embedded attachment
+	msg3 := models.NewIncomingMsg(knChannel, urn, "invalid embedded attachment data", "", clog)
+	msg3.WithAttachment("data:34564363576573573")
+
+	err = models.WriteMsg(ctx, ts.rt, msg3, clog)
+	ts.EqualError(err, "unable to decode attachment data: illegal base64 data at input byte 16")
+
+	// try a geo attachment
+	msg4 := models.NewIncomingMsg(knChannel, urn, "geo attachment", "", clog)
+	msg4.WithAttachment("geo:123.234,-45.676")
+
+	// should be saved as is
+	err = models.WriteMsg(ctx, ts.rt, msg4, clog)
+	ts.NoError(err)
+	ts.Equal([]string{"geo:123.234,-45.676"}, msg4.Attachments())
+}
+
+func (ts *ModelsTestSuite) TestPreferredChannelCheckRole() {
+	exChannel := ts.getChannel("EX", "dbc126ed-66bc-4e28-b67b-81dc3327100a")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, exChannel, nil, nil)
+	ctx := context.Background()
+
+	// have to round to microseconds because postgres can't store nanos
+	now := time.Now().Round(time.Microsecond).In(time.UTC)
+
+	urn := urns.URN("tel:+12065552020")
+	msg := models.NewIncomingMsg(exChannel, urn, "test123", "ext123", clog).WithReceivedOn(now).WithContactName("test contact")
+
+	// try to write it to our db
+	err := models.WriteMsg(ctx, ts.rt, msg, clog)
+	ts.NoError(err)
+
+	time.Sleep(1 * time.Second)
+
+	// load it back from the id
+	m := testsuite.ReadDBMsg(ts.T(), ts.rt, msg.UUID())
+
+	tx, err := ts.rt.DB.Beginx()
+	ts.NoError(err)
+	defer tx.Rollback()
+
+	// load our URN
+	exContactURN, err := models.GetOrCreateContactURN(ctx, tx, exChannel, m.ContactID, urn, nil)
+	if !ts.NoError(err) || !ts.NoError(tx.Commit()) {
+		ts.FailNow("failed writing contact urn")
+	}
+
+	ts.Equal(exContactURN.ChannelID, models.NilChannelID)
+}
+
+func (ts *ModelsTestSuite) TestChannelEvent() {
+	ctx := context.Background()
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, nil)
+	urn := urns.URN("tel:+12065551616")
+
+	event := models.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithExtra(map[string]string{"ref_id": "12345"}).WithContactName("kermit frog")
+	err := models.WriteChannelEvent(ctx, ts.rt, event, clog)
+	ts.NoError(err)
+
+	contact, err := models.ContactForURN(ctx, ts.rt, channel.OrgID_, channel, urn, nil, "", true, clog)
+	ts.NoError(err)
+	ts.Equal(null.String("kermit frog"), contact.Name_)
+
+	dbE := testsuite.ReadDBEvent(ts.T(), ts.rt, event.UUID())
+	ts.Equal(dbE.EventType, models.EventTypeReferral)
+	ts.Equal(null.Map[string](map[string]string{"ref_id": "12345"}), dbE.Extra)
+	ts.Equal(contact.ID_, dbE.ContactID)
+	ts.Equal(contact.URNID_, dbE.ContactURNID)
+
+	ts.assertQueuedContactTask(contact.ID_, "event_received", map[string]any{
+		"event_uuid":  string(event.UUID()),
+		"event_type":  "referral",
+		"channel_id":  float64(10),
+		"urn_id":      float64(contact.URNID_),
+		"extra":       map[string]any{"ref_id": "12345"},
+		"new_contact": true,
+		"occurred_on": event.OccurredOn().Format(time.RFC3339Nano),
+	})
+}
+
+func (ts *ModelsTestSuite) TestSessionTimeout() {
+	ctx := context.Background()
+
+	dates.SetNowFunc(dates.NewSequentialNow(time.Date(2025, 1, 28, 20, 43, 34, 157379218, time.UTC), time.Second))
+	defer dates.SetNowFunc(time.Now)
+
+	msgJSON := `{
+		"uuid": "54c893b9-b026-44fc-a490-50aed0361c3f",
+		"id": 204,
+		"org_id": 1,
+		"text": "Test message 21",
+		"contact": {"id": 100, "uuid": "a984069d-0008-4d8c-a772-b14a8a6acccc"},
+		"channel_uuid": "f3ad3eb6-d00d-4dc3-92e9-9f34f32940ba",
+		"urn": "telegram:3527065",
+		"created_on": "2017-07-21T19:22:23.242757Z",
+		"high_priority": true,
+		"session": {
+			"uuid": "79c1dbc6-4200-4333-b17a-1f996273a4cb",
+			"status": "W",
+			"sprint_uuid": "0897c392-8b08-43c4-b9d9-e75d332a2c58",
+			"timeout": 3600
+		},
+		"session_id": 12345,
+		"session_timeout": 3600,
+		"session_modified_on": "2025-01-28T20:43:34.157379218Z"
+	}`
+
+	msg := &models.MsgOut{}
+	jsonx.MustUnmarshal([]byte(msgJSON), msg)
+
+	err := models.InsertTimeoutFire(ctx, ts.rt, msg)
+	ts.NoError(err)
+
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT org_id, contact_id, fire_type, scope, session_uuid::text, sprint_uuid::text FROM contacts_contactfire`).
+		Columns(map[string]any{
+			"org_id":       int64(1),
+			"contact_id":   int64(100),
+			"fire_type":    "T",
+			"scope":        "",
+			"session_uuid": "79c1dbc6-4200-4333-b17a-1f996273a4cb",
+			"sprint_uuid":  "0897c392-8b08-43c4-b9d9-e75d332a2c58",
+		})
+
+	// if there's a conflict (e.g. in this case trying to add same timeout again), it should be ignored
+	err = models.InsertTimeoutFire(ctx, ts.rt, msg)
+	ts.NoError(err)
+
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM contacts_contactfire`).Returns(1)
+}
+
+func (ts *ModelsTestSuite) TestMailroomEvents() {
+	ctx := context.Background()
+
+	testsuite.ResetDB(ts.T(), ts.rt)
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, nil)
+	urn := urns.URN("tel:+12065551616")
+
+	// ensure contact exists before event write so new_contact is false
+	_, err := models.ContactForURN(ctx, ts.rt, channel.OrgID_, channel, urn, nil, "kermit frog", true, clog)
+	ts.NoError(err)
+
+	event := models.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).
+		WithExtra(map[string]string{"ref_id": "12345"}).
+		WithContactName("kermit frog").
+		WithOccurredOn(time.Date(2020, 8, 5, 13, 30, 0, 123456789, time.UTC))
+	err = models.WriteChannelEvent(ctx, ts.rt, event, clog)
+	ts.NoError(err)
+
+	contact, err := models.ContactForURN(ctx, ts.rt, channel.OrgID_, channel, urn, nil, "", true, clog)
+	ts.NoError(err)
+	ts.Equal(null.String("kermit frog"), contact.Name_)
+	ts.False(contact.IsNew_)
+
+	dbE := testsuite.ReadDBEvent(ts.T(), ts.rt, event.UUID())
+	ts.Equal(dbE.EventType, models.EventTypeReferral)
+	ts.Equal(null.Map[string](map[string]string{"ref_id": "12345"}), dbE.Extra)
+	ts.Equal(contact.ID_, dbE.ContactID)
+	ts.Equal(contact.URNID_, dbE.ContactURNID)
+
+	ts.assertQueuedContactTask(contact.ID_, "event_received", map[string]any{
+		"event_uuid":  string(event.UUID()),
+		"event_type":  "referral",
+		"channel_id":  float64(10),
+		"urn_id":      float64(contact.URNID_),
+		"extra":       map[string]any{"ref_id": "12345"},
+		"new_contact": false,
+		"occurred_on": event.OccurredOn().Format(time.RFC3339Nano),
+	})
+}
+
+func (ts *ModelsTestSuite) TestResolveMedia() {
+	ctx := context.Background()
+	rc := ts.rt.VK.Get()
+	defer rc.Close()
+
+	tcs := []struct {
+		url   string
+		media *models.Media
+		err   string
+	}{
+		{ // image upload that can be resolved
+			url: "http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+			media: &models.Media{
+				UUID_:        "ec6972be-809c-4c8d-be59-ba9dbd74c977",
+				Path_:        "/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+				ContentType_: "image/jpeg",
+				URL_:         "http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+				Size_:        123,
+				Width_:       1024,
+				Height_:      768,
+				Alternates_:  []*models.Media{},
+			},
+		},
+		{ // image upload that can be resolved
+			url: "http://nyaruka.us-east-1.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+			media: &models.Media{
+				UUID_:        "ec6972be-809c-4c8d-be59-ba9dbd74c977",
+				Path_:        "/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+				ContentType_: "image/jpeg",
+				URL_:         "http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+				Size_:        123,
+				Width_:       1024,
+				Height_:      768,
+				Alternates_:  []*models.Media{},
+			},
+		},
+		{ // same image upload, this time from cache
+			url: "http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+			media: &models.Media{
+				UUID_:        "ec6972be-809c-4c8d-be59-ba9dbd74c977",
+				Path_:        "/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+				ContentType_: "image/jpeg",
+				URL_:         "http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg",
+				Size_:        123,
+				Width_:       1024,
+				Height_:      768,
+				Alternates_:  []*models.Media{},
+			},
+		},
+		{ // image upload that can't be resolved
+			url:   "http://nyaruka.s3.com/orgs/1/media/9790/97904d00-1e64-4f92-b4a0-156e21239d24/test.jpg",
+			media: nil,
+		},
+		{ // image upload that can't be resolved, this time from cache
+			url:   "http://nyaruka.s3.com/orgs/1/media/9790/97904d00-1e64-4f92-b4a0-156e21239d24/test.jpg",
+			media: nil,
+		},
+		{ // image upload but with wrong domain
+			url:   "http://temba.s2.com/orgs/1/media/f328/f32801ec-433a-4862-978d-56c1823b92b2/test.jpg",
+			media: nil,
+		},
+		{ // image upload but no UUID in URL
+			url:   "http://nyaruka.s3.com/orgs/1/media/test.jpg",
+			media: nil,
+		},
+		{ // audio upload
+			url: "http://nyaruka.s3.com/orgs/1/media/5310/5310f50f-9c8e-4035-9150-be5a1f78f21a/test.mp3",
+			media: &models.Media{
+				UUID_:        "5310f50f-9c8e-4035-9150-be5a1f78f21a",
+				Path_:        "/orgs/1/media/5310/5310f50f-9c8e-4035-9150-be5a1f78f21a/test.mp3",
+				ContentType_: "audio/mp3",
+				URL_:         "http://nyaruka.s3.com/orgs/1/media/5310/5310f50f-9c8e-4035-9150-be5a1f78f21a/test.mp3",
+				Size_:        123,
+				Duration_:    500,
+				Alternates_: []*models.Media{
+					{
+						UUID_:        "514c552c-e585-40e2-938a-fe9450172da8",
+						Path_:        "/orgs/1/media/514c/514c552c-e585-40e2-938a-fe9450172da8/test.m4a",
+						ContentType_: "audio/mp4",
+						URL_:         "http://nyaruka.s3.com/orgs/1/media/514c/514c552c-e585-40e2-938a-fe9450172da8/test.m4a",
+						Size_:        114,
+						Duration_:    500,
+					},
+				},
+			},
+		},
+		{ // user entered unparseable URL
+			url: ":xx",
+			err: "error parsing media URL: parse \":xx\": missing protocol scheme",
+		},
+	}
+
+	for _, tc := range tcs {
+		media, err := models.ResolveMedia(ctx, ts.rt, tc.url)
+		if tc.err != "" {
+			ts.EqualError(err, tc.err)
+		} else {
+			ts.NoError(err, "unexpected error for url '%s'", tc.url)
+			ts.Equal(tc.media, media, "media mismatch for url '%s'", tc.url)
+		}
+	}
+
+	// check we've cached 3 media lookups
+	assertvk.HLen(ts.T(), rc, fmt.Sprintf("{media-lookups}:%s", time.Now().In(time.UTC).Format("2006-01-02")), 3)
+
+	// without an S3 region (e.g. local dev using path-style URLs), stripping is a no-op: unqualified URLs
+	// still resolve and region-qualified URLs no longer match our media domain
+	origRegion := ts.rt.S3.Region
+	ts.rt.S3.Region = ""
+	defer func() { ts.rt.S3.Region = origRegion }()
+
+	media, err := models.ResolveMedia(ctx, ts.rt, "http://nyaruka.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg")
+	ts.NoError(err)
+	ts.NotNil(media)
+
+	media, err = models.ResolveMedia(ctx, ts.rt, "http://nyaruka.us-east-1.s3.com/orgs/1/media/ec69/ec6972be-809c-4c8d-be59-ba9dbd74c977/test.jpg")
+	ts.NoError(err)
+	ts.Nil(media)
+}
+
+func (ts *ModelsTestSuite) assertNoQueuedContactTask(contactID models.ContactID) {
+	rc := ts.rt.VK.Get()
+	defer rc.Close()
+
+	assertvk.ZCard(ts.T(), rc, "{tasks:realtime}:queued", 0)
+	assertvk.LLen(ts.T(), rc, "{tasks:realtime}:o:1/0", 0)
+	assertvk.LLen(ts.T(), rc, "{tasks:realtime}:o:1/1", 0)
+	assertvk.LLen(ts.T(), rc, fmt.Sprintf("c:1:%d", contactID), 0)
+}
+
+func (ts *ModelsTestSuite) assertQueuedContactTask(contactID models.ContactID, expectedType string, expectedBody map[string]any) {
+	rc := ts.rt.VK.Get()
+	defer rc.Close()
+
+	assertvk.ZCard(ts.T(), rc, "{tasks:realtime}:queued", 1)
+	assertvk.LLen(ts.T(), rc, "{tasks:realtime}:o:1/0", 0)
+	assertvk.LLen(ts.T(), rc, "{tasks:realtime}:o:1/1", 1)
+	assertvk.LLen(ts.T(), rc, fmt.Sprintf("c:1:%d", contactID), 1)
+
+	data, err := redis.Bytes(rc.Do("LPOP", fmt.Sprintf("c:1:%d", contactID)))
+	ts.NoError(err)
+
+	var body map[string]any
+	jsonx.MustUnmarshal(data, &body)
+
+	ts.Equal(expectedType, body["type"])
+	ts.Equal(expectedBody, body["task"])
+}
+
+func (ts *ModelsTestSuite) TestSpools() {
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, nil)
+	urn := urns.URN("tel:+12065552222")
+
+	// drain anything left over from previous runs so we can assert absolute sizes, and delete whatever those
+	// leftovers wrote so our row count assertions start from zero
+	ts.NoError(models.MsgSpool().Flush())
+	ts.NoError(models.StatusSpool().Flush())
+	ts.NoError(models.EventSpool().Flush())
+	ts.rt.DB.MustExec(`DELETE FROM msgs_msg WHERE text = 'spool-flush-test'`)
+	ts.rt.DB.MustExec(`DELETE FROM channels_channelevent WHERE extra::jsonb->>'ref_id' = 'spool-flush'`)
+
+	// spool an incoming msg as if the database had been down when it was received
+	msg := models.NewIncomingMsg(channel, urn, "spool-flush-test", "spool-ext1", clog)
+	ts.NoError(models.MsgSpool().Add([]*models.MsgIn{msg}))
+	ts.Equal(1, models.MsgSpool().Size())
+
+	// flushing should write it to the database and queue it for handling
+	ts.NoError(models.MsgSpool().Flush())
+	ts.Equal(0, models.MsgSpool().Size())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'spool-flush-test'`).Returns(1)
+
+	// flushing a replayed copy of the same msg is deduped by its unique violation rather than failed
+	ts.NoError(models.MsgSpool().Add([]*models.MsgIn{msg}))
+	ts.NoError(models.MsgSpool().Flush())
+	ts.Equal(0, models.MsgSpool().Size())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'spool-flush-test'`).Returns(1)
+
+	// spool a status update for an existing message
+	ts.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q' WHERE id = $1`, 10001)
+	status := models.NewStatusUpdate(channel, "0199df10-10dc-7e6e-834b-3d959ece93b2", models.MsgStatusSent, clog)
+	ts.NoError(models.StatusSpool().Add([]*models.StatusUpdate{status}))
+	ts.Equal(1, models.StatusSpool().Size())
+
+	ts.NoError(models.StatusSpool().Flush())
+	ts.Equal(0, models.StatusSpool().Size())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT status FROM msgs_msg WHERE id = 10001`).Returns("S")
+
+	// a status that can't be resolved to a message flushes without error (logged and dropped)
+	unresolved := models.NewStatusUpdateByExternalID(channel, "no-such-ext-id", models.MsgStatusDelivered, clog)
+	ts.NoError(models.StatusSpool().Add([]*models.StatusUpdate{unresolved}))
+	ts.NoError(models.StatusSpool().Flush())
+	ts.Equal(0, models.StatusSpool().Size())
+
+	// spool a channel event
+	event := models.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithExtra(map[string]string{"ref_id": "spool-flush"})
+	ts.NoError(models.EventSpool().Add([]*models.ChannelEvent{event}))
+	ts.Equal(1, models.EventSpool().Size())
+
+	ts.NoError(models.EventSpool().Flush())
+	ts.Equal(0, models.EventSpool().Size())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM channels_channelevent WHERE extra::jsonb->>'ref_id' = 'spool-flush'`).Returns(1)
+}
+
+func TestModelsSuite(t *testing.T) {
+	suite.Run(t, new(ModelsTestSuite))
+}

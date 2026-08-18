@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/nyaruka/courier/v26"
+	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/gocommon/httpx"
@@ -30,21 +30,20 @@ var (
 )
 
 func init() {
-	courier.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler())
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() courier.ChannelHandler {
+func newHandler() channels.Handler {
 	return &handler{handlers.NewBaseHandler(models.ChannelType("PM"), "Play Mobile")}
 }
 
 // Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(s *courier.Server) error {
-	h.SetServer(s)
-	s.AddHandlerRoute(h, http.MethodPost, "receive", courier.ChannelLogTypeMsgReceive, h.receiveMessage)
+func (h *handler) Initialize(r *channels.Routes) error {
+	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
 	return nil
 }
 
@@ -95,7 +94,7 @@ type mtResponse struct {
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, c courier.Channel, w http.ResponseWriter, r *http.Request, clog *courier.ChannelLog) ([]courier.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
 	payload := &mtResponse{}
 	err := handlers.DecodeAndValidateXML(payload, r)
 
@@ -107,7 +106,7 @@ func (h *handler) receiveMessage(ctx context.Context, c courier.Channel, w http.
 		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "no messages, ignored")
 	}
 
-	msgs := make([]courier.MsgIn, 0, 1)
+	msgs := make([]*models.MsgIn, 0, 1)
 
 	// parse each inbound message
 	for _, pmMsg := range payload.Message {
@@ -121,17 +120,20 @@ func (h *handler) receiveMessage(ctx context.Context, c courier.Channel, w http.
 			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
 		}
 
-		// remove message prefix according to a list of possible prefixes, useful for free accounts
-		incomingPrefixes := c.ConfigForKey(configIncomingPrefixes, []string{})
-		if prefixes, ok := incomingPrefixes.([]string); ok {
-			for _, prefix := range prefixes {
-				text := pmMsg.Content.Text
+		// remove message prefix according to a list of possible prefixes, useful for free accounts. Channel config is
+		// JSON so the configured list arrives as []any of strings, not []string.
+		prefixes, _ := c.ConfigForKey(configIncomingPrefixes, []any{}).([]any)
+		for _, p := range prefixes {
+			prefix, ok := p.(string)
+			if !ok {
+				continue
+			}
 
-				if strings.HasPrefix(strings.ToLower(text), strings.ToLower(prefix)) {
-					text = strings.TrimSpace(text[len(prefix):])
-					pmMsg.Content.Text = text
-					break
-				}
+			text := pmMsg.Content.Text
+
+			if strings.HasPrefix(strings.ToLower(text), strings.ToLower(prefix)) {
+				pmMsg.Content.Text = strings.TrimSpace(text[len(prefix):])
+				break
 			}
 		}
 
@@ -139,7 +141,7 @@ func (h *handler) receiveMessage(ctx context.Context, c courier.Channel, w http.
 		if pmMsg.Content.Text == "" {
 			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, errors.New("no text"))
 		}
-		msg := h.Backend().NewIncomingMsg(ctx, c, urn, pmMsg.Content.Text, pmMsg.ID, clog)
+		msg := models.NewIncomingMsg(c, urn, pmMsg.Content.Text, pmMsg.ID, clog)
 		msgs = append(msgs, msg)
 	}
 
@@ -147,13 +149,13 @@ func (h *handler) receiveMessage(ctx context.Context, c courier.Channel, w http.
 	return handlers.WriteMsgsAndResponse(ctx, h, msgs, w, r, clog)
 }
 
-func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.SendResult, clog *courier.ChannelLog) error {
+func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	username := msg.Channel().StringConfigForKey(configUsername, "")
 	password := msg.Channel().StringConfigForKey(configPassword, "")
 	shortCode := msg.Channel().Address()
 	baseURL := msg.Channel().StringConfigForKey(configBaseURL, "")
 	if username == "" || password == "" || shortCode == "" || baseURL == "" {
-		return courier.ErrChannelConfig
+		return channels.ErrChannelConfig
 	}
 
 	for i, part := range handlers.SplitMsgByChannel(msg.Channel(), handlers.GetTextAndAttachments(msg), maxMsgLength) {
@@ -181,16 +183,14 @@ func (h *handler) Send(ctx context.Context, msg courier.MsgOut, res *courier.Sen
 		req.Header.Set("Accept", "application/json")
 
 		resp, _, err := h.RequestHTTP(req, clog)
-		if err != nil || resp.StatusCode/100 == 5 {
-			return courier.ErrConnectionFailed
-		} else if resp.StatusCode/100 != 2 {
-			return courier.ErrResponseStatus
+		if err := handlers.ErrorFromResponse(resp, err); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (h *handler) RedactValues(ch courier.Channel) []string {
+func (h *handler) RedactValues(ch *models.Channel) []string {
 	return []string{
 		httpx.BasicAuth(ch.StringConfigForKey(models.ConfigUsername, ""), ch.StringConfigForKey(models.ConfigPassword, "")),
 	}

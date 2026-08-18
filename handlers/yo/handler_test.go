@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nyaruka/courier/v26"
-	. "github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/core/channels"
+	"github.com/nyaruka/courier/v26/core/models"
+	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
@@ -23,7 +24,7 @@ var (
 	receiveInvalidDate          = "/c/yo/8eb23e93-5ecb-45ba-b726-3b064e0c56ab/receive/?sender=%2B2349067554729&message=Join&time=20170623T123000Z"
 )
 
-var testChannels = []courier.Channel{
+var testChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "YO", "2020", "UG", []string{urns.Phone.Prefix}, map[string]any{"username": "yo-username", "password": "yo-password"}),
 }
 
@@ -74,7 +75,7 @@ var getSendTestCases = []OutgoingTestCase{
 			"password":     {"yo-password"},
 			"origin":       {"2020"},
 		}}},
-		ExpectedError: courier.ErrContactStopped,
+		ExpectedError: channels.ErrContactStopped,
 	},
 	{Label: "Errored wrong authorization",
 		MsgText: "Simple Message", MsgURN: "tel:+250788383383",
@@ -89,7 +90,7 @@ var getSendTestCases = []OutgoingTestCase{
 			"password":     {"yo-password"},
 			"origin":       {"2020"},
 		}}},
-		ExpectedError: courier.ErrResponseContent,
+		ExpectedError: channels.ErrResponseContent,
 	},
 	{Label: "Unicode Send",
 		MsgText: "☺", MsgURN: "tel:+250788383383",
@@ -118,7 +119,22 @@ var getSendTestCases = []OutgoingTestCase{
 			"password":     {"yo-password"},
 			"origin":       {"2020"},
 		}}},
-		ExpectedError: courier.ErrResponseStatus,
+		ExpectedError: channels.ErrResponseStatus,
+	},
+	{Label: "Throttled",
+		MsgText: "Error Message", MsgURN: "tel:+250788383383",
+		MockResponses: map[string][]*httpx.MockResponse{
+			"http://smgw1.yo.co.ug:9100/sendsms*": {
+				httpx.NewMockResponse(429, nil, []byte(`Error`)),
+			},
+		},
+		ExpectedRequests: []ExpectedRequest{{Params: url.Values{"sms_content": {"Error Message"},
+			"destinations": {"250788383383"},
+			"ybsacctno":    {"yo-username"},
+			"password":     {"yo-password"},
+			"origin":       {"2020"},
+		}}},
+		ExpectedError: channels.ErrConnectionThrottled,
 	},
 	{Label: "Connection error",
 		MsgText: "Error Message", MsgURN: "tel:+250788383383",
@@ -133,7 +149,7 @@ var getSendTestCases = []OutgoingTestCase{
 			"password":     {"yo-password"},
 			"origin":       {"2020"},
 		}}},
-		ExpectedError: courier.ErrConnectionFailed,
+		ExpectedError: channels.ErrConnectionFailed,
 	},
 	{Label: "Send Attachment",
 		MsgText: "My pic!", MsgURN: "tel:+250788383383", MsgAttachments: []string{"image/jpeg:https://foo.bar/image.jpg"},
