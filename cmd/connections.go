@@ -43,11 +43,15 @@ func testConnections(rt *runtime.Runtime) {
 		log.Info("valkey ok")
 	}
 
-	// test S3 bucket access
-	if err := rt.S3.Test(ctx, rt.Config.S3AttachmentsBucket); err != nil {
-		log.Error("attachments bucket not accessible", "error", err)
+	// test S3 bucket access (optional in nanoRP mode)
+	if rt.S3 != nil {
+		if err := rt.S3.Test(ctx, rt.Config.S3AttachmentsBucket); err != nil {
+			log.Error("attachments bucket not accessible", "error", err)
+		} else {
+			log.Info("attachments bucket ok")
+		}
 	} else {
-		log.Info("attachments bucket ok")
+		log.Info("attachments bucket disabled (nanoRP mode)")
 	}
 
 	// test that the Centrifugo server is reachable and accepts our key
