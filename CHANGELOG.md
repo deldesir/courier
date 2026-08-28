@@ -1,3 +1,42 @@
+v26.3.43 (2026-08-27)
+-------------------------
+ * Don't store channel logs for channel types whose traffic is internal to the platform
+ * Update dependencies
+
+v26.3.42 (2026-08-27)
+-------------------------
+ * Enforce allowed domains for webchat channels
+ * Fix log type of Kannel status report logs
+
+v26.3.41 (2026-08-26)
+-------------------------
+ * Add WebChat channel type
+ * Rate limit webchat chat starts per IP per channel
+
+v26.3.40 (2026-08-25)
+-------------------------
+ * Write msgs_msg.folder when creating incoming messages and updating outgoing message statuses
+
+v26.3.39 (2026-08-25)
+-------------------------
+ * Replace built-in Sentry integration with hooks for wrapping applications
+
+v26.3.38 (2026-08-19)
+-------------------------
+ * Fix pop script to correctly charge tps_cost of queued messages
+
+v26.3.37 (2026-08-18)
+-------------------------
+ * Remove orphaned per-channel rate limit checks from queue pop script
+
+v26.3.36 (2026-08-18)
+-------------------------
+ * Update dependencies
+ * Add tests for malformed form extra cases
+ * Support flow_action, flow_action_payload and flow_token when sending WhatsApp Flows
+ * Consolidate WhatsApp send response parsing into a shared helper
+ * Remove disabled WhatsApp legacy handler
+
 v26.3.35 (2026-08-12)
 -------------------------
  * Parse derived config values once in Config.Parse rather than at each use site
