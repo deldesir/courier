@@ -15,21 +15,8 @@ local delim = string.find(queue, "|")
 local tps = 0
 local tpsKey = ""
 
-local queueName = ""
-
 if delim then
-    queueName = string.sub(queue, string.len(KEYS[2])+2, delim-1)
     tps = tonumber(string.sub(queue, delim+1))
-end
-
-if queueName then
-    local rateLimitKey = "rate_limit:" .. queueName
-    local rateLimitEngaged = redis.call("get", rateLimitKey)
-    if rateLimitEngaged then
-        redis.call("zincrby", KEYS[2] .. ":throttled", workers, queue)
-        redis.call("zrem", KEYS[2] .. ":active", queue)
-        return {"retry", ""}
-    end
 end
 
 -- if we have a tps, then check whether we exceed it
@@ -54,14 +41,6 @@ local isFutureResult = result[1] and tonumber(result[2]) > tonumber(KEYS[1])
 
 -- if we didn't find one, try again from our bulk queue
 if not result[1] or isFutureResult then
-    -- check if we are rate limited for bulk queue
-    local rateLimitBulkKey = "rate_limit_bulk:" .. queueName
-    local rateLimitBulk = redis.call("get", rateLimitBulkKey)
-    if rateLimitBulk then
-        return {"retry", ""}
-    end
-
-    -- we are not pause check our bulk queue
     local bulkQueue = queue .. "/0"
     local bulkResult = redis.call("zrangebyscore", bulkQueue, 0, "+inf", "WITHSCORES", "LIMIT", 0, 1)
 
@@ -91,14 +70,19 @@ if result[1] and not isFutureResult then
 
     -- parse it as JSON to get the first element out
     local valueList = cjson.decode(result[1])
-    local popValue = cjson.encode(valueList[1])
+    local popped = valueList[1]
+    local popValue = cjson.encode(popped)
     table.remove(valueList, 1)
 
     -- increment our tps for this second if we have a limit
-    if tps > 0 then 
-        redis.call("incrby", tpsKey, popValue["tps_cost"] or 1)
+    if tps > 0 then
+        local tpsCost = 1
+        if type(popped) == "table" and type(popped["tps_cost"]) == "number" then
+            tpsCost = math.max(1, math.floor(popped["tps_cost"]))
+        end
+        redis.call("incrby", tpsKey, tpsCost)
         redis.call("expire", tpsKey, 10)
-    end 
+    end
 
     -- encode it back if there is anything left
     if table.getn(valueList) > 0 then
