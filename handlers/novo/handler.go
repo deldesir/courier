@@ -7,75 +7,72 @@ import (
 	"strings"
 
 	"net/url"
-	"time"
 
 	"github.com/buger/jsonparser"
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/urns"
 )
 
 const (
 	configMerchantId     = "merchant_id"
 	configMerchantSecret = "merchant_secret"
+
+	sendURL = "http://novosmstools.com/novo_te/%s/sendSMS"
 )
 
-var (
-	maxMsgLength = 160
-	sendURL      = "http://novosmstools.com/novo_te/%s/sendSMS"
-)
+var maxMsgLength = 160
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("NV"), "Novo")}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("NV"), "Novo")}
+
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, h.receiveMessage)
+	return h
 }
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
-}
-
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
 	// check authentication
 	secret := c.StringConfigForKey(models.ConfigSecret, "")
 	if secret != "" {
 		authorization := r.Header.Get("Authorization")
 		if authorization != secret {
-			return nil, channels.WriteAndLogUnauthorized(w, r, c, fmt.Errorf("invalid Authorization header"))
+			return channels.Unauthenticated(fmt.Errorf("invalid Authorization header"))
 		}
 	}
 
 	err := r.ParseForm()
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+		return err
 	}
 
 	body := r.Form.Get("text")
 	from := r.Form.Get("from")
 	if from == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("missing required field 'from'"))
+		return fmt.Errorf("missing required field 'from'")
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(from, c.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+		return err
 	}
 
-	// create and write the message
-	msg := models.NewIncomingMsg(c, urn, body, "", clog).WithReceivedOn(time.Now().UTC())
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	msg := models.NewIncomingMsg(c, urn, body, "", clog).WithReceivedOn(dates.Now().UTC())
+	in.Msg(msg)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {

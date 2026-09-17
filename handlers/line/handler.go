@@ -19,21 +19,23 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/goflow/core/events"
 )
 
-var (
+const (
 	replySendURL = "https://api.line.me/v2/bot/message/reply"
 	pushSendURL  = "https://api.line.me/v2/bot/message/push"
 	loadingURL   = "https://api.line.me/v2/bot/chat/loading/start"
 	mediaDataURL = "https://api-data.line.me/v2/bot/message"
-	maxMsgLength = 2000
 	maxMsgSend   = 5
 
 	signatureHeader = "X-Line-Signature"
 )
+
+var maxMsgLength = 2000
 
 // see https://developers.line.biz/en/reference/messaging-api/#message-objects
 var mediaSupport = map[handlers.MediaType]handlers.MediaTypeSupport{
@@ -44,21 +46,18 @@ var mediaSupport = map[handlers.MediaType]handlers.MediaTypeSupport{
 }
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("LN"), "Line")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("LN"), "Line")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+	return h
 }
 
 //	{
@@ -113,14 +112,11 @@ type moPayload struct {
 	} `json:"events"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := h.validateSignature(channel, r)
-	if err != nil {
-		return nil, err
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
+	if err := h.validateSignature(channel, r); err != nil {
+		return channels.Unauthenticated(err)
 	}
-
-	msgs := []*models.MsgIn{}
 
 	for _, lineEvent := range payload.Events {
 		if lineEvent.ReplyToken == "" || (lineEvent.Source.Type == "" && lineEvent.Source.UserID == "") || (lineEvent.Message.Type == "" && lineEvent.Message.ID == "") {
@@ -154,7 +150,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 
 		urn, err := urns.New(urns.Line, lineEvent.Source.UserID)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid line id"))
+			return errors.New("invalid line id")
 		}
 
 		msg := models.NewIncomingMsg(channel, urn, text, lineEvent.ReplyToken, clog).WithReceivedOn(date)
@@ -163,14 +159,10 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 			msg.WithAttachment(mediaURL)
 		}
 
-		msgs = append(msgs, msg)
+		in.Msg(msg)
 	}
 
-	if len(msgs) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, no message")
-	}
-
-	return handlers.WriteMsgsAndResponse(ctx, h, msgs, w, r, clog)
+	return nil
 
 }
 

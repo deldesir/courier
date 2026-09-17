@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -395,8 +396,9 @@ func (ts *ModelsTestSuite) TestMsgStatus() {
 	history := getHistoryItems()
 	ts.Len(history, 1)
 	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
-	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts#W", history[0].SK)
 	ts.Equal("wired", history[0].Data["status"])
+	ts.NotNil(history[0].TTL) // sent-ish statuses expire
 
 	sentOn := *m.SentOn
 
@@ -414,7 +416,7 @@ func (ts *ModelsTestSuite) TestMsgStatus() {
 	history = getHistoryItems()
 	ts.Len(history, 1)
 	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
-	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts#S", history[0].SK)
 	ts.Equal("sent", history[0].Data["status"])
 
 	// update to DELIVERED using UUID
@@ -431,7 +433,7 @@ func (ts *ModelsTestSuite) TestMsgStatus() {
 	history = getHistoryItems()
 	ts.Len(history, 1)
 	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
-	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts#D", history[0].SK)
 	ts.Equal("delivered", history[0].Data["status"])
 
 	// update to READ using UUID
@@ -447,8 +449,9 @@ func (ts *ModelsTestSuite) TestMsgStatus() {
 	history = getHistoryItems()
 	ts.Len(history, 1)
 	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
-	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts", history[0].SK)
+	ts.Equal("evt#0199df10-10dc-7e6e-834b-3d959ece93b2#sts#R", history[0].SK)
 	ts.Equal("read", history[0].Data["status"])
+	ts.NotNil(history[0].TTL) // read expires too, just later
 
 	// no change for incoming messages
 	updateStatusByUUID("0199df10-9519-7fe2-a29c-c890d1713673", models.MsgStatusSent, "")
@@ -472,8 +475,22 @@ func (ts *ModelsTestSuite) TestMsgStatus() {
 	history = getHistoryItems()
 	ts.Len(history, 1)
 	ts.Equal("con#a984069d-0008-4d8c-a772-b14a8a6acccc", history[0].PK)
-	ts.Equal("evt#0199df0f-9f82-7689-b02d-f34105991321#sts", history[0].SK)
+	ts.Equal("evt#0199df0f-9f82-7689-b02d-f34105991321#sts#F", history[0].SK)
 	ts.Equal("failed", history[0].Data["status"])
+	ts.Nil(history[0].TTL) // failed is kept forever
+
+	// failed is terminal so a late WIRED is recorded on the message but doesn't change its status
+	clog6 := updateStatusByExtID("ext1", models.MsgStatusWired)
+
+	m = testsuite.ReadDBMsg(ts.T(), ts.rt, "0199df0f-9f82-7689-b02d-f34105991321")
+	ts.Equal(models.MsgStatusFailed, m.Status)
+	ts.Equal(null.String("X"), m.Folder)
+	ts.Nil(m.SentOn)
+	ts.Equal([]string{string(clog5.UUID), string(clog6.UUID)}, []string(m.LogUUIDs))
+	ts.Len(getHistoryItems(), 0)
+
+	// put test message back into queued state
+	ts.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q', sent_on = NULL WHERE id = $1`, 10000)
 
 	now = time.Now().In(time.UTC)
 	time.Sleep(2 * time.Millisecond)
@@ -496,6 +513,16 @@ func (ts *ModelsTestSuite) TestMsgStatus() {
 	ts.True(m.ModifiedOn.After(now))
 	ts.True(m.SentOn.Equal(sentOn)) // no change
 	ts.Equal(m.ExternalIdentifier, null.String("ext1"))
+
+	// each status is its own history item so the WIRED item is still there alongside the SENT one
+	history = getHistoryItems()
+	ts.Len(history, 2)
+	sks := []string{history[0].SK, history[1].SK}
+	slices.Sort(sks)
+	ts.Equal([]string{
+		"evt#0199df0f-9f82-7689-b02d-f34105991321#sts#S",
+		"evt#0199df0f-9f82-7689-b02d-f34105991321#sts#W",
+	}, sks)
 
 	// put test outgoing messages back into queued state
 	ts.rt.DB.MustExec(`UPDATE msgs_msg SET status = 'Q', sent_on = NULL WHERE id IN ($1, $2)`, 10002, 10001)
@@ -1035,7 +1062,7 @@ func (ts *ModelsTestSuite) TestSaveAttachment() {
 
 	newURL, err := models.SaveAttachment(ctx, ts.rt, knChannel, "image/jpeg", testJPG, "jpg")
 	ts.NoError(err)
-	ts.Equal("http://localstack:4566/test-attachments/attachments/1/15a2/ee5e/15a2ee5e-5e45-4711-8e0f-6b2abe4360d8.jpg", newURL)
+	ts.Equal("http://s3:8333/test-attachments/attachments/1/15a2/ee5e/15a2ee5e-5e45-4711-8e0f-6b2abe4360d8.jpg", newURL)
 }
 
 func (ts *ModelsTestSuite) TestWriteMsg() {
@@ -1200,7 +1227,7 @@ func (ts *ModelsTestSuite) TestWriteMsgWithAttachments() {
 	// should have actually fetched and saved it to storage, with the correct content type
 	err = models.WriteMsg(ctx, ts.rt, msg2, clog)
 	ts.NoError(err)
-	ts.Equal([]string{"image/jpeg:http://localstack:4566/test-attachments/attachments/1/f879/21a1/f87921a1-0484-4660-9955-f9b28b006b78.jpg"}, msg2.Attachments())
+	ts.Equal([]string{"image/jpeg:http://s3:8333/test-attachments/attachments/1/f879/21a1/f87921a1-0484-4660-9955-f9b28b006b78.jpg"}, msg2.Attachments())
 
 	// try an invalid embedded attachment
 	msg3 := models.NewIncomingMsg(knChannel, urn, "invalid embedded attachment data", "", clog)
@@ -1578,6 +1605,48 @@ func (ts *ModelsTestSuite) TestSpools() {
 	ts.NoError(models.EventSpool().Flush())
 	ts.Equal(0, models.EventSpool().Size())
 	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM channels_channelevent WHERE extra::jsonb->>'ref_id' = 'spool-flush'`).Returns(1)
+}
+
+func (ts *ModelsTestSuite) TestSpoolsAtContactLimit() {
+	channel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, nil)
+	urn := urns.URN("tel:+12065559999") // not an existing contact
+
+	// drain anything left over from previous tests so we can assert absolute sizes
+	ts.NoError(models.MsgSpool().Flush())
+	ts.NoError(models.EventSpool().Flush())
+
+	// cap the org at its current number of contacts, as if it filled up while these items were spooled
+	var numContacts int
+	ts.NoError(ts.rt.DB.Get(&numContacts, `SELECT count(*) FROM contacts_contact WHERE org_id = 1`))
+	ts.rt.DB.MustExec(`INSERT INTO contacts_contactgroupcount(group_id, count, is_squashed) VALUES(1, $1, TRUE)`, numContacts)
+	ts.rt.DB.MustExec(`UPDATE orgs_org SET limits = '{"contacts": ` + fmt.Sprint(numContacts) + `}' WHERE id = 1`)
+	models.FlushChannelCache()
+	models.FlushContactCounts()
+
+	defer func() {
+		ts.rt.DB.MustExec(`UPDATE orgs_org SET limits = '{}' WHERE id = 1`)
+		ts.rt.DB.MustExec(`DELETE FROM contacts_contactgroupcount`)
+		models.FlushChannelCache()
+		models.FlushContactCounts()
+	}()
+
+	// a spooled msg from a new contact is dropped by the flush rather than failed and retried forever
+	msg := models.NewIncomingMsg(channel, urn, "spool-limit-test", "spool-limit-ext1", clog)
+	ts.NoError(models.MsgSpool().Add([]*models.MsgIn{msg}))
+	ts.NoError(models.MsgSpool().Flush())
+	ts.Equal(0, models.MsgSpool().Size())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'spool-limit-test'`).Returns(0)
+
+	// likewise a spooled channel event from a new contact
+	event := models.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithExtra(map[string]string{"ref_id": "spool-limit"})
+	ts.NoError(models.EventSpool().Add([]*models.ChannelEvent{event}))
+	ts.NoError(models.EventSpool().Flush())
+	ts.Equal(0, models.EventSpool().Size())
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM channels_channelevent WHERE extra::jsonb->>'ref_id' = 'spool-limit'`).Returns(0)
+
+	// and no contact was created for either
+	assertdb.Query(ts.T(), ts.rt.DB, `SELECT count(*) FROM contacts_contacturn WHERE identity = $1`, string(urn)).Returns(0)
 }
 
 func TestModelsSuite(t *testing.T) {

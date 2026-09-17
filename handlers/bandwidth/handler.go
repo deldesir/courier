@@ -12,16 +12,16 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	maxMsgLength = 2048
-	sendURL      = "https://messaging.bandwidth.com/api/v2/users/%s/messages"
-)
+const sendURL = "https://messaging.bandwidth.com/api/v2/users/%s/messages"
+
+var maxMsgLength = 2048
 
 const (
 	configAccountID        = "account_id"
@@ -31,22 +31,19 @@ const (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("BW"), "Bandwidth")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("BW"), "Bandwidth")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, h.statusMessage)
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, h.receiveMessage)
+	r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, h.receiveStatus)
+	return h
 }
 
 type moMessageData struct {
@@ -60,27 +57,27 @@ type moMessageData struct {
 	} `json:"message" validate:"required"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
 	var payload []moMessageData
 
 	body, err := handlers.ReadBody(r, 1000000)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	err = json.Unmarshal(body, &payload)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	if len(payload) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "no messages, ignored")
+		return channels.Ignore("no messages, ignored")
 	}
 
 	err = utils.Validate(payload[0])
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	messagePayload := payload[0]
@@ -89,13 +86,13 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 	// 2017-05-03T06:04:45Z
 	date, err := time.Parse("2006-01-02T15:04:05Z", messagePayload.Message.Time)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid date format: %s", messagePayload.Message.Time))
+		return fmt.Errorf("invalid date format: %s", messagePayload.Message.Time)
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(messagePayload.Message.From, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 	// build our msg
 	msg := models.NewIncomingMsg(channel, urn, messagePayload.Message.Text, messagePayload.Message.ID, clog).WithReceivedOn(date)
@@ -104,8 +101,8 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		msg.WithAttachment(attURL)
 	}
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 type moStatusData struct {
@@ -123,42 +120,41 @@ var statusMapping = map[string]models.MsgStatus{
 	"message-failed":    models.MsgStatusFailed,
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) statusMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
 	var payload []moStatusData
 	body, err := handlers.ReadBody(r, 1000000)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	err = json.Unmarshal(body, &payload)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	if len(payload) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "no messages, ignored")
+		return channels.Ignore("no messages, ignored")
 	}
 
 	err = utils.Validate(payload[0])
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	statusPayload := payload[0]
 	msgStatus, found := statusMapping[statusPayload.Type]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r,
-			fmt.Errorf("unknown status '%s', must be one of 'message-sending', 'message-delivered' or 'message-failed'", statusPayload.Type))
+		return handlers.UnknownStatusError(statusMapping, statusPayload.Type)
 	}
 
 	if statusPayload.ErrorCode != 0 {
 		clog.Error(models.ErrorExternal(strconv.Itoa(statusPayload.ErrorCode), statusPayload.Description))
 	}
 
-	// write our status
 	status := models.NewStatusUpdateByExternalID(channel, statusPayload.Message.ID, msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 type mtPayload struct {

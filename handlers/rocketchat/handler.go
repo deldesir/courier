@@ -11,34 +11,30 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
 const (
-	configBaseURL        = "base_url"
-	configSecret         = "secret"
 	configBotUsername    = "bot_username"
 	configAdminAuthToken = "admin_auth_token"
 	configAdminUserID    = "admin_user_id"
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("RC"), "RocketChat")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("RC"), "RocketChat")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+	return h
 }
 
 type RCAttachment struct {
@@ -56,22 +52,22 @@ type moPayload struct {
 	Attachments []RCAttachment `json:"attachments"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	// check authorization
-	secret := channel.StringConfigForKey(configSecret, "")
+	secret := channel.StringConfigForKey(models.ConfigSecret, "")
 	if fmt.Sprintf("Token %s", secret) != r.Header.Get("Authorization") {
-		return nil, channels.WriteAndLogUnauthorized(w, r, channel, fmt.Errorf("invalid Authorization header"))
+		return channels.Unauthenticated(fmt.Errorf("invalid Authorization header"))
 	}
 
 	// check content empty
 	if payload.Text == "" && len(payload.Attachments) == 0 {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("no text or attachment"))
+		return errors.New("no text or attachment")
 	}
 
 	urn, err := urns.NewFromParts(urns.RocketChat.Prefix, payload.User.URN, nil, payload.User.Username)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	msg := models.NewIncomingMsg(channel, urn, payload.Text, "", clog).WithContactName(payload.User.FullName)
@@ -79,7 +75,8 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		msg.WithAttachment(attachment.URL)
 	}
 
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 // BuildAttachmentRequest download media for message attachment with RC auth_token/user_id set
@@ -106,8 +103,8 @@ type mtPayload struct {
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
-	baseURL := msg.Channel().StringConfigForKey(configBaseURL, "")
-	secret := msg.Channel().StringConfigForKey(configSecret, "")
+	baseURL := msg.Channel().StringConfigForKey(models.ConfigBaseURL, "")
+	secret := msg.Channel().StringConfigForKey(models.ConfigSecret, "")
 	botUsername := msg.Channel().StringConfigForKey(configBotUsername, "")
 	if baseURL == "" || secret == "" || botUsername == "" {
 		return channels.ErrChannelConfig

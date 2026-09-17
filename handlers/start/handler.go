@@ -17,31 +17,28 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	maxMsgLength = 1600
-	sendURL      = "https://bulk.startmobile.ua/clients.php"
-)
+const sendURL = "https://bulk.startmobile.ua/clients.php"
+
+var maxMsgLength = 1600
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("ST"), "Start Mobile")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("ST"), "Start Mobile")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.XMLPayload(h.receiveMessage))
+	return h
 }
 
 type moPayload struct {
@@ -57,40 +54,34 @@ type moPayload struct {
 	} `xml:"body"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	payload := &moPayload{}
-	err := handlers.DecodeAndValidateXML(payload, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.Service.RequestID == "" || payload.From == "" || payload.To == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing parameters, must have 'request_id', 'to' and 'body'"))
+		return fmt.Errorf("missing parameters, must have 'request_id', 'to' and 'body'")
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(payload.From, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// create our date from the timestamp
 	ts, err := strconv.ParseInt(payload.Service.Timestamp, 10, 64)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid timestamp: %s", payload.Service.Timestamp))
+		return fmt.Errorf("invalid timestamp: %s", payload.Service.Timestamp)
 	}
 	date := time.Unix(ts, 0).UTC()
 
 	// build our msg
 	msg := models.NewIncomingMsg(channel, urn, payload.Body.Text, payload.Service.RequestID, clog).WithReceivedOn(date)
 
-	// and write it
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 // Start Mobile expects a XML response from a message receive request
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
+func (h *handler) RespondMsgs(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.Header().Set("Content-Type", "text/xml")
 	w.WriteHeader(200)
 	_, err := fmt.Fprint(w, `<answer type="async"><state>Accepted</state></answer>`)

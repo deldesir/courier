@@ -12,13 +12,13 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	maxMsgLength = 160
-	sendURL      = "https://devapi.globelabs.com.ph/smsmessaging/v1/outbound/%s/requests"
-)
+const sendURL = "https://devapi.globelabs.com.ph/smsmessaging/v1/outbound/%s/requests"
+
+var maxMsgLength = 160
 
 const (
 	configPassphrase = "passphrase"
@@ -27,21 +27,18 @@ const (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("GL"), "Globe Labs", handlers.WithRedactConfigKeys(configPassphrase, configAppSecret))}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("GL"), "Globe Labs", handlers.WithRedactConfigKeys(configPassphrase, configAppSecret))}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+	return h
 }
 
 //	{
@@ -73,36 +70,34 @@ type moPayload struct {
 	} `json:"inboundSMSMessageList"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if len(payload.InboundSMSMessageList.InboundSMSMessage) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "no messages, ignored")
+		return channels.Ignore("no messages, ignored")
 	}
-
-	msgs := make([]*models.MsgIn, 0, 1)
 
 	// parse each inbound message
 	for _, glMsg := range payload.InboundSMSMessageList.InboundSMSMessage {
 		// parse our date from format: "Fri Nov 22 2013 12:12:13 GMT+0000 (UTC)"
 		date, err := time.Parse("Mon Jan 2 2006 15:04:05 GMT+0000 (UTC)", glMsg.DateTime)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+			return err
 		}
 
 		if !strings.HasPrefix(glMsg.SenderAddress, "tel:") {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("invalid 'senderAddress' parameter"))
+			return fmt.Errorf("invalid 'senderAddress' parameter")
 		}
 
 		urn, err := urns.ParsePhone(glMsg.SenderAddress[4:], c.Country(), true, false)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+			return err
 		}
 
 		msg := models.NewIncomingMsg(c, urn, glMsg.Message, glMsg.MessageID, clog).WithReceivedOn(date)
-		msgs = append(msgs, msg)
+		in.Msg(msg)
 	}
 
-	return handlers.WriteMsgsAndResponse(ctx, h, msgs, w, r, clog)
+	return nil
 }
 
 //	{

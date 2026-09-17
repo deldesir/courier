@@ -21,14 +21,14 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "https://api.plivo.com/v1/Account/%s/Message/"
-	maxMsgLength = 1600
-)
+const sendURL = "https://api.plivo.com/v1/Account/%s/Message/"
+
+var maxMsgLength = 1600
 
 const (
 	configPlivoAuthID    = "PLIVO_AUTH_ID"
@@ -37,22 +37,19 @@ const (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("PL"), "Plivo")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("PL"), "Plivo")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
+	r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, handlers.FormPayload(h.receiveStatus))
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.FormPayload(h.receiveMessage))
+	return h
 }
 
 type statusForm struct {
@@ -71,21 +68,15 @@ var statusMapping = map[string]models.MsgStatus{
 	"rejected":    models.MsgStatusFailed,
 }
 
-// receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &statusForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, form *statusForm, in *channels.Received, clog *models.ChannelLog) error {
 	msgStatus, found := statusMapping[form.Status]
 	if !found {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, fmt.Sprintf("ignoring unknown status '%s'", form.Status))
+		return channels.Ignore("ignoring unknown status '%s'", form.Status)
 	}
 
 	if strings.TrimPrefix(channel.Address(), "+") != strings.TrimPrefix(form.From, "+") {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid to number [%s], expecting [%s]", strings.TrimPrefix(form.From, "+"), strings.TrimPrefix(channel.Address(), "+")))
+		return fmt.Errorf("invalid to number [%s], expecting [%s]", strings.TrimPrefix(form.From, "+"), strings.TrimPrefix(channel.Address(), "+"))
 	}
 
 	externalID := form.MessageUUID
@@ -93,9 +84,9 @@ func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w 
 		externalID = form.ParentMessageUUID
 	}
 
-	// write our status
 	status := models.NewStatusUpdateByExternalID(channel, externalID, msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 type moForm struct {
@@ -105,27 +96,21 @@ type moForm struct {
 	Text        string `name:"Text"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &moForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, form *moForm, in *channels.Received, clog *models.ChannelLog) error {
 	if strings.TrimPrefix(channel.Address(), "+") != strings.TrimPrefix(form.To, "+") {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid to number [%s], expecting [%s]", strings.TrimPrefix(form.To, "+"), strings.TrimPrefix(channel.Address(), "+")))
+		return fmt.Errorf("invalid to number [%s], expecting [%s]", strings.TrimPrefix(form.To, "+"), strings.TrimPrefix(channel.Address(), "+"))
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(form.From, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
-	// create and write the message
 	msg := models.NewIncomingMsg(channel, urn, form.Text, form.MessageUUID, clog)
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 type mtPayload struct {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -15,6 +16,8 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 	"golang.org/x/oauth2/google"
@@ -25,15 +28,14 @@ const (
 	configNotification    = "FCM_NOTIFICATION"
 	configKey             = "FCM_KEY"
 	configCredentialsFile = "FCM_CREDENTIALS_JSON"
+
+	sendURL = "https://fcm.googleapis.com/fcm/send"
 )
 
-var (
-	sendURL      = "https://fcm.googleapis.com/fcm/send"
-	maxMsgLength = 1024
-)
+var maxMsgLength = 1024
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
@@ -42,17 +44,15 @@ type handler struct {
 	fetchTokenMutex sync.Mutex
 }
 
-func newHandler() channels.Handler {
-	return &handler{
-		BaseHandler:     handlers.NewBaseHandler(models.ChannelType("FCM"), "Firebase", handlers.WithRedactConfigKeys(configKey)),
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{
+		BaseHandler:     handlers.NewBaseHandler(rt, models.ChannelType("FCM"), "Firebase", handlers.WithRedactConfigKeys(configKey)),
 		fetchTokenMutex: sync.Mutex{},
 	}
-}
 
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "register", models.ChannelLogTypeEventReceive, h.registerContact)
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.FormPayload(h.receiveMessage))
+	r.Add(h, http.MethodPost, "register", models.ChannelLogTypeReceive, h.registerContact)
+	return h
 }
 
 type receiveForm struct {
@@ -63,26 +63,21 @@ type receiveForm struct {
 	Name     string `name:"name"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &receiveForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
-	date := time.Now().UTC()
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, form *receiveForm, in *channels.Received, clog *models.ChannelLog) error {
+	date := dates.Now().UTC()
 	if form.Date != "" {
+		var err error
 		date, err = time.Parse("2006-01-02T15:04:05.000", form.Date)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unable to parse date: %s", form.Date))
+			return fmt.Errorf("unable to parse date: %s", form.Date)
 		}
 	}
 
 	// create our URN
 	urn, err := urns.New(urns.Firebase, form.From)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// if a new auth token was provided, record that
@@ -94,8 +89,8 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 	// build our msg
 	dbMsg := models.NewIncomingMsg(channel, urn, form.Msg, "", clog).WithReceivedOn(date).WithContactName(form.Name).WithURNAuthTokens(authTokens)
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{dbMsg}, w, r, clog)
+	in.Msg(dbMsg)
+	return nil
 }
 
 type registerForm struct {
@@ -109,18 +104,23 @@ func (h *handler) registerContact(ctx context.Context, channel *models.Channel, 
 	form := &registerForm{}
 	err := handlers.DecodeAndValidateForm(form, r)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return nil, channels.RespondRequestError(ctx, h, w, r, channel, err)
 	}
 
 	// create our URN
 	urn, err := urns.New(urns.Firebase, form.URN)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return nil, channels.RespondRequestError(ctx, h, w, r, channel, err)
 	}
 
 	// create our contact
 	contact, err := models.GetContact(ctx, h.Runtime(), channel, urn, map[string]string{"default": form.FCMToken}, form.Name, true, clog)
 	if err != nil {
+		var limitErr *models.LimitReachedError
+		if errors.As(err, &limitErr) {
+			channels.LogRequestError(r, channel, err)
+			return nil, channels.RespondError(w, http.StatusUnprocessableEntity, err)
+		}
 		return nil, err
 	}
 
@@ -313,5 +313,5 @@ func (h *handler) fetchAccessToken(channel *models.Channel) (string, time.Durati
 		return "", 0, err
 	}
 
-	return token.AccessToken, token.Expiry.UTC().Sub(time.Now().UTC()), nil
+	return token.AccessToken, token.Expiry.UTC().Sub(dates.Now().UTC()), nil
 }

@@ -6,64 +6,35 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/gsm7"
-	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "https://secure.m3techservice.com/GenericServiceRestAPI/api/SendSMS"
-	maxMsgLength = 160
-)
+const sendURL = "https://secure.m3techservice.com/GenericServiceRestAPI/api/SendSMS"
+
+var maxMsgLength = 160
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("M3"), "M3Tech")}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("M3"), "M3Tech")}
+
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.NewTelReceiveHandler("from", "text"))
+	return h
 }
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
-}
-
-// receiveMessage takes care of handling incoming messages
-func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := r.ParseForm()
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
-	}
-
-	body := r.Form.Get("text")
-	from := r.Form.Get("from")
-	if from == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("missing required field 'from'"))
-	}
-
-	// create our URN
-	urn, err := urns.ParsePhone(from, c.Country(), true, false)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
-	}
-
-	// create and write the message
-	msg := models.NewIncomingMsg(c, urn, body, "", clog).WithReceivedOn(time.Now().UTC())
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
-}
-
-// WriteMsgSuccessResponse writes a success response for the messages
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
+// RespondMsgs writes a success response for the messages
+func (h *handler) RespondMsgs(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.Header().Set("Content-Type", "application/json")
 	_, err := fmt.Fprintf(w, "SMS Accepted: %s", msgs[0].UUID())
 	return err

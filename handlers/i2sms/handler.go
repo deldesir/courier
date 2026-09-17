@@ -3,68 +3,39 @@ package i2sms
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/httpx"
-	"github.com/nyaruka/gocommon/urns"
 )
 
 const (
 	configChannelHash = "channel_hash"
+
+	sendURL = "https://mx2.i2sms.net/mxapi.php"
 )
 
-var (
-	sendURL      = "https://mx2.i2sms.net/mxapi.php"
-	maxMsgLength = 640
-)
+var maxMsgLength = 640
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("I2"), "I2SMS", handlers.WithRedactConfigKeys(models.ConfigPassword, configChannelHash))}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("I2"), "I2SMS", handlers.WithRedactConfigKeys(models.ConfigPassword, configChannelHash))}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receive)
-	return nil
-}
-
-// receive is our handler for MO messages
-func (h *handler) receive(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := r.ParseForm()
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
-	}
-
-	body := r.Form.Get("message")
-	from := r.Form.Get("mobile")
-	if from == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("missing required field 'mobile'"))
-	}
-
-	// create our URN
-	urn, err := urns.ParsePhone(from, c.Country(), true, false)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
-	}
-
-	// build our msg
-	msg := models.NewIncomingMsg(c, urn, body, "", clog).WithReceivedOn(time.Now().UTC())
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg,
+		handlers.NewTelReceiveHandler("mobile", "message"))
+	return h
 }
 
 //	{
@@ -139,8 +110,8 @@ func (h *handler) RedactValues(ch *models.Channel) []string {
 	}
 }
 
-// WriteMsgSuccessResponse writes a success response for the messages, i2SMS expects an empty body in our response
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
+// RespondMsgs writes a success response for the messages, i2SMS expects an empty body in our response
+func (h *handler) RespondMsgs(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.Header().Add("Content-type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, err := w.Write([]byte{})

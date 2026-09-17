@@ -104,7 +104,7 @@ type MsgIn struct {
 
 // NewIncomingMsg creates a new incoming message
 func NewIncomingMsg(channel *Channel, urn urns.URN, text string, extID string, clog *ChannelLog) *MsgIn {
-	now := time.Now()
+	now := dates.Now()
 
 	return &MsgIn{
 		UUID_:        MsgUUID(uuids.NewV7()),
@@ -194,13 +194,32 @@ func InsertIncomingMsg(ctx context.Context, db *sqlx.DB, m *MsgIn, contact *Cont
 	return err
 }
 
-// WriteMsg writes the passed in incoming message to the database, or spools it if the database is unavailable. If
-// the message is detected to be a duplicate of one already received, it's marked as such and not written.
+// IncomingMsgCheck is called before a received message is written. It can mark the message as a duplicate of one
+// already received, which is then reported as such rather than written again, or refuse it by returning a
+// LimitReachedError - which callers treat like a refused contact creation: reported rather than retried, and to be
+// recorded on the channel log so that the workspace can see it. The default detects duplicates. Deployments can
+// replace it to apply their own policies as well, e.g. from main before starting the service.
+var IncomingMsgCheck = CheckDuplicateMsg
+
+// CheckDuplicateMsg is the default incoming message check: it marks the given message as a duplicate if it's one
+// we've already received, giving it the original's UUID.
+func CheckDuplicateMsg(ctx context.Context, rt *runtime.Runtime, m *MsgIn, clog *ChannelLog) error {
+	if prevUUID := checkMsgAlreadyReceived(ctx, rt, m); prevUUID != "" {
+		m.UUID_ = prevUUID
+		m.Duplicate_ = true
+	}
+	return nil
+}
+
+// WriteMsg writes the passed in incoming message to the database, or spools it if the database is unavailable. A
+// message the incoming message check marks as a duplicate isn't written again, and one it refuses - or one from a
+// new contact in a workspace at its contact limit - is neither written nor spooled, and a LimitReachedError is
+// returned.
 func WriteMsg(ctx context.Context, rt *runtime.Runtime, msg *MsgIn, clog *ChannelLog) error {
-	// check if this message could be a duplicate and if so steal the original's UUID
-	if prevUUID := checkMsgAlreadyReceived(ctx, rt, msg); prevUUID != "" {
-		msg.UUID_ = prevUUID
-		msg.Duplicate_ = true
+	if err := IncomingMsgCheck(ctx, rt, msg, clog); err != nil {
+		return err
+	}
+	if msg.Duplicate_ {
 		return nil
 	}
 
@@ -253,6 +272,12 @@ func writeMsg(ctx context.Context, rt *runtime.Runtime, m *MsgIn, clog *ChannelL
 		if dbutil.IsUniqueViolation(err) {
 			slog.Warn("duplicate incoming message detected, ignoring", "msg", m.UUID())
 			return nil
+		}
+
+		// a message from a new contact in a workspace at its contact limit can't be written now and won't be
+		// able to be written later either, so it isn't spooled - the caller decides what to tell the provider
+		if isLimitReached(err) {
+			return err
 		}
 
 		// if we failed, log and write to spool
@@ -318,13 +343,18 @@ func flushMsg(ctx context.Context, rt *runtime.Runtime, m *MsgIn) error {
 	m.Channel_ = channel
 
 	// create log tho it won't be written
-	clog := NewChannelLog(ChannelLogTypeMsgReceive, channel, nil, nil)
+	clog := NewChannelLog(ChannelLogTypeReceive, channel, nil, nil)
 
 	// try to write it our db
 	contact, err := writeMsgToDB(ctx, rt, m, clog)
 	if err != nil {
 		if dbutil.IsUniqueViolation(err) {
 			slog.Warn("duplicate incoming message detected, ignoring", "msg", m.UUID())
+			return nil
+		}
+		if isLimitReached(err) {
+			// the workspace filled up while this was spooled, and retrying won't help
+			slog.Warn("dropping spooled msg from new contact in workspace at contact limit", "msg", m.UUID())
 			return nil
 		}
 		return err // fail? oh well, we'll try again later
@@ -427,6 +457,42 @@ func DeleteMsgByExternalID(ctx context.Context, rt *runtime.Runtime, channel *Ch
 	return nil
 }
 
+// ChatMsg is a message loaded from the database for a chat client fetching its conversation history - just the
+// fields such a client needs to render it
+type ChatMsg struct {
+	UUID         MsgUUID        `db:"uuid"`
+	Direction    MsgDirection   `db:"direction"`
+	Text         string         `db:"text"`
+	Attachments  pq.StringArray `db:"attachments"`
+	QuickReplies QuickReplies   `db:"quickreplies"`
+	CreatedOn    time.Time      `db:"created_on"`
+}
+
+// filtering by URN rather than contact both scopes the query to a single conversation - a contact can hold more
+// than one chat URN - and is what makes it cheap, as the URN foreign key is indexed. Message UUIDs are v7 so
+// UUID order is message order, which is what makes them the paging key.
+const sqlSelectChatMsgs = `
+SELECT uuid, direction, text, attachments, quickreplies, created_on
+  FROM msgs_msg
+ WHERE contact_urn_id = $1 AND channel_id = $2 AND visibility = 'V' AND ($3::uuid IS NULL OR uuid < $3)
+ ORDER BY uuid DESC
+ LIMIT $4`
+
+// GetChatMsgs returns the visible messages in both directions between the given URN and channel, newest first,
+// optionally only those before the given message UUID.
+func GetChatMsgs(ctx context.Context, db *sqlx.DB, channel *Channel, urnID ContactURNID, before MsgUUID, limit int) ([]*ChatMsg, error) {
+	var beforeUUID *string
+	if before != "" {
+		beforeUUID = (*string)(&before)
+	}
+
+	msgs := make([]*ChatMsg, 0, limit)
+	if err := db.SelectContext(ctx, &msgs, sqlSelectChatMsgs, urnID, channel.ID(), beforeUUID, limit); err != nil {
+		return nil, err
+	}
+	return msgs, nil
+}
+
 type MsgOrigin string
 
 const (
@@ -447,6 +513,21 @@ type QuickReply struct {
 	Type  string `json:"type"            validate:"required"`
 	Text  string `json:"text,omitempty"`
 	Extra string `json:"extra,omitempty"`
+}
+
+// QuickReplies is a slice of quick replies that can be scanned from a nullable JSONB column
+type QuickReplies []QuickReply
+
+func (qr *QuickReplies) Scan(value any) error {
+	if value == nil {
+		*qr = nil
+		return nil
+	}
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("failed to scan quick replies: expected []byte, got %T", value)
+	}
+	return json.Unmarshal(b, qr)
 }
 
 // RequiresExtra returns whether quick replies of this type need an extra value - a form ID or a URL - to be sendable

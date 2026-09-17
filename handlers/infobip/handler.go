@@ -13,6 +13,8 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
@@ -20,22 +22,19 @@ import (
 const configTransliteration = "transliteration"
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("IB"), "Infobip")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("IB"), "Infobip")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	r.Add(h, http.MethodPost, "delivered", models.ChannelLogTypeMsgStatus, handlers.JSONPayload(h, h.statusMessage))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodPost, "delivered", channels.ReceiveKindStatus, handlers.JSONPayload(h.receiveStatus))
+	return h
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -56,27 +55,19 @@ type ibStatus struct {
 	} `validate:"required" json:"status"`
 }
 
-// statusMessage is our HTTP handler function for status updates
-func (h *handler) statusMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *statusPayload, clog *models.ChannelLog) ([]channels.Event, error) {
-	data := make([]any, len(payload.Results))
-	statuses := make([]channels.Event, len(payload.Results))
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, payload *statusPayload, in *channels.Received, clog *models.ChannelLog) error {
+
 	for _, s := range payload.Results {
 		msgStatus, found := statusMapping[s.Status.GroupName]
 		if !found {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown status '%s', must be one of PENDING, DELIVERED, EXPIRED, REJECTED or UNDELIVERABLE", s.Status.GroupName))
+			return handlers.UnknownStatusError(statusMapping, s.Status.GroupName)
 		}
 
-		// write our status
-		status := models.NewStatusUpdateByExternalID(channel, s.MessageID, msgStatus, clog)
-		err := models.WriteStatusUpdate(ctx, h.Runtime(), status)
-		if err != nil {
-			return nil, err
-		}
-		data = append(data, channels.NewStatusData(status))
-		statuses = append(statuses, status)
+		in.Status(models.NewStatusUpdateByExternalID(channel, s.MessageID, msgStatus, clog))
 	}
 
-	return statuses, channels.WriteDataResponse(w, http.StatusOK, "statuses handled", data)
+	return nil
 }
 
 type v3InboundPayload struct {
@@ -113,13 +104,12 @@ type v3InboundPrice struct {
 	Currency        string  `json:"currency"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages (both SMS and MMS)
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *v3InboundPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages (both SMS and MMS)
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *v3InboundPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.MessageCount == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, no message")
+		return channels.Ignore("ignoring request, no message")
 	}
 
-	msgs := []*models.MsgIn{}
 	for _, infobipMessage := range payload.Results {
 		messageID := infobipMessage.MessageID
 		dateString := infobipMessage.ReceivedAt
@@ -127,7 +117,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		// create our URN
 		urn, err := urns.ParsePhone(infobipMessage.From, channel.Country(), true, false)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return err
 		}
 
 		// Check if this is an MMS message by looking at the Message field
@@ -159,7 +149,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		}
 
 		// Parse date if provided
-		date := time.Now()
+		date := dates.Now()
 		if dateString != "" {
 			// The format for ReceivedAt is "yyyy-MM-dd'T'HH:mm:ss.SSS+0000"
 			// It is not RFC3339 Compliant
@@ -167,7 +157,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 
 			date, err = time.Parse("2006-01-02T15:04:05.000-0700", dateString)
 			if err != nil {
-				return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+				return err
 			}
 		}
 
@@ -176,14 +166,10 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		for _, attachment := range attachments {
 			msg = msg.WithAttachment(attachment)
 		}
-		msgs = append(msgs, msg)
+		in.Msg(msg)
 	}
 
-	if len(msgs) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, no message")
-	}
-
-	return handlers.WriteMsgsAndResponse(ctx, h, msgs, w, r, clog)
+	return nil
 }
 
 type v3OutboundPayload struct {
@@ -302,7 +288,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		for _, attachmentStr := range msg.Attachments() {
 			mimeType, url := handlers.SplitAttachment(attachmentStr)
 			if mimeType == "" || url == "" {
-				handlers.WriteAndLogRequestError(ctx, h, msg.Channel(), nil, nil, fmt.Errorf("ignoring invalid attachment: %s", attachmentStr))
+				clog.Error(models.ErrorAttachmentNotDecodable())
 				continue
 			}
 

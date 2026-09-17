@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +15,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/handlers/meta/whatsapp"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/goflow/core/events"
@@ -39,14 +38,12 @@ type handler struct {
 	handlers.BaseHandler
 }
 
-func newWAHandler(channelType models.ChannelType, name string) channels.Handler {
-	return &handler{handlers.NewBaseHandler(channelType, name)}
-}
-
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMultiReceive, handlers.JSONPayload(h, h.receiveEvent))
-	return nil
+func newWAHandler(channelType models.ChannelType, name string) channels.NewHandlerFunc {
+	return func(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+		h := &handler{handlers.NewBaseHandler(rt, channelType, name)}
+		r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindAny, handlers.JSONPayload(h.receiveAny))
+		return h
+	}
 }
 
 //	{
@@ -75,157 +72,41 @@ type Notifications struct {
 	} `json:"entry"`
 }
 
-// receiveEvent is our HTTP handler function for incoming messages and status updates
-func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *Notifications, clog *models.ChannelLog) ([]channels.Event, error) {
-
+// receiveAny is our receive function for the single URL 360dialog delivers both messages and status updates through
+func (h *handler) receiveAny(ctx context.Context, channel *models.Channel, r *http.Request, payload *Notifications, in *channels.Received, clog *models.ChannelLog) error {
 	// is not a 'whatsapp_business_account' object? ignore it
 	if payload.Object != "whatsapp_business_account" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request")
+		return channels.Ignore("ignoring request")
 	}
 
 	// no entries? ignore this request
 	if len(payload.Entry) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, no entries")
+		return channels.Ignore("ignoring request, no entries")
 	}
 
-	var events []channels.Event
-	var data []any
-
-	events, data, err := h.processWhatsAppPayload(ctx, channel, payload, w, r, clog)
-	if err != nil {
-		return nil, err
-	}
-
-	return events, channels.WriteDataResponse(w, http.StatusOK, "Events Handled", data)
+	// a failure here is in the payload itself, so asking for it again wouldn't get any further. The seam writes
+	// whatever was parsed ahead of it rather than dropping it.
+	return h.parseWhatsAppPayload(channel, payload, r, in, clog)
 }
 
-func (h *handler) processWhatsAppPayload(ctx context.Context, channel *models.Channel, payload *Notifications, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, []any, error) {
-	// the list of events we deal with
-	events := make([]channels.Event, 0, 2)
+// parseWhatsAppPayload hands the notification's changes to the shared WhatsApp parser, which fills in the batch.
+// Media is resolved with the channel's own token against the provider's base URL.
+//
+// A malformed payload is answered as ignored rather than as an error: unlike the Cloud API handler, this one
+// doesn't force a 200 on error responses, and 360dialog would retry a payload that can't parse any better the
+// second time.
+func (h *handler) parseWhatsAppPayload(channel *models.Channel, payload *Notifications, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+	resolveMedia := func(mediaID string) (string, error) { return h.resolveMediaURL(channel, mediaID, clog) }
 
-	// the list of data we will return in our response
-	data := make([]any, 0, 2)
-
-	seenMsgIDs := make(map[string]bool)
-	contactNames := make(map[string]string)
-
-	// for each entry
+	var changes []whatsapp.Change
 	for _, entry := range payload.Entry {
-		if len(entry.Changes) == 0 {
-			continue
-		}
-
-		for _, change := range entry.Changes {
-
-			// contacts are keyed by both identifiers they can carry, as a message from a user with a username may
-			// only reference them by their user_id
-			for _, contact := range change.Value.Contacts {
-				if contact.WaID != "" {
-					contactNames[contact.WaID] = contact.Profile.Name
-				}
-				if contact.UserID != "" {
-					contactNames[contact.UserID] = contact.Profile.Name
-				}
-			}
-
-			for _, waMsg := range change.Value.Messages {
-				if seenMsgIDs[waMsg.ID] {
-					continue
-				}
-
-				if waMsg.GroupID != "" {
-					data = append(data, channels.NewInfoData("ignoring group message"))
-					continue
-				}
-
-				date, urn, text, mediaURL, mediaID, err, finalErr := waMsg.ExtractData(clog)
-				if finalErr != nil {
-					return nil, nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, finalErr.Error())
-				}
-
-				if err != nil {
-					channels.LogRequestError(r, channel, err)
-					continue
-				}
-
-				if mediaID != "" && mediaURL == "" {
-					mediaURL, err = h.resolveMediaURL(channel, mediaID, clog)
-					// we had an error downloading media
-					if err != nil {
-						channels.LogRequestError(r, channel, err)
-					}
-				}
-
-				// create our message
-				event := models.NewIncomingMsg(channel, urn, text, waMsg.ID, clog).WithReceivedOn(date).WithContactName(contactNames[waMsg.Identifier()])
-
-				if mediaURL != "" {
-					event.WithAttachment(mediaURL)
-				}
-
-				if payload := waMsg.ExtractPayload(); payload != nil {
-					event.WithPayload(payload)
-				} else if waMsg.Interactive.Type == "nfm_reply" && waMsg.Interactive.NFMReply.ResponseJSON != "" {
-					channels.LogRequestError(r, channel, errors.New("nfm_reply response_json is not a valid JSON object"))
-				}
-
-				// if we have a user_id, add it as a secondary whatsapp URN (unless it's already the primary URN)
-				if waMsg.FromUserID != "" {
-					userIDURN, urnErr := urns.New(urns.WhatsApp, waMsg.FromUserID)
-					if urnErr == nil {
-						if userIDURN != urn {
-							event.WithNewURN(userIDURN, models.NewURNAppend)
-						}
-					} else {
-						channels.LogRequestError(r, channel, fmt.Errorf("invalid user_id for whatsapp URN: %w", urnErr))
-					}
-				}
-
-				err = models.WriteMsg(ctx, h.Runtime(), event, clog)
-				if err != nil {
-					return nil, nil, err
-				}
-
-				events = append(events, event)
-				data = append(data, channels.NewMsgReceiveData(event))
-				seenMsgIDs[waMsg.ID] = true
-			}
-
-			for _, status := range change.Value.Statuses {
-
-				msgStatus, found := whatsapp.StatusMapping[status.Status]
-				if !found {
-					if whatsapp.IgnoreStatuses[status.Status] {
-						data = append(data, channels.NewInfoData(fmt.Sprintf("ignoring status: %s", status.Status)))
-					} else {
-						handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, fmt.Sprintf("unknown status: %s", status.Status))
-					}
-					continue
-				}
-
-				for _, statusError := range status.Errors {
-					clog.Error(models.ErrorExternal(strconv.Itoa(statusError.Code), statusError.Title))
-				}
-
-				event := models.NewStatusUpdateByExternalID(channel, status.ID, msgStatus, clog)
-				err := models.WriteStatusUpdate(ctx, h.Runtime(), event)
-				if err != nil {
-					return nil, nil, err
-				}
-
-				events = append(events, event)
-				data = append(data, channels.NewStatusData(event))
-
-			}
-
-			for _, chError := range change.Value.Errors {
-				clog.Error(models.ErrorExternal(strconv.Itoa(chError.Code), chError.Title))
-			}
-
-		}
-
+		changes = append(changes, entry.Changes...)
 	}
-	return events, data, nil
+
+	if err := whatsapp.ParseChanges(channel, changes, resolveMedia, r, in, clog); err != nil {
+		return channels.Ignore("%s", err.Error())
+	}
+	return nil
 }
 
 // BuildAttachmentRequest to download media for message attachment with Bearer token set
@@ -306,8 +187,8 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		}
 	}
 
-	// if we got a user_id in the response, set it as a new URN on the send result so the backend
-	// can queue a contact_changed task to append it to the contact (unless it's the URN we sent to)
+	// if we got a user_id in the response, set it as a new URN on the send result so that send completion
+	// can queue a contact_changed task to append it to the contact (unless it is the URN we sent to)
 	if userID != "" {
 		userIDURN, err := urns.New(urns.WhatsApp, userID)
 		if err != nil {

@@ -8,14 +8,13 @@ import (
 	"os"
 
 	"github.com/nyaruka/courier/v26/utils"
-	"github.com/nyaruka/ezconf"
 	"github.com/nyaruka/gocommon/httpx"
 )
 
 // Config is our top level configuration object
 type Config struct {
 	DB       string `validate:"url,startswith=postgres:"   help:"URL for your Postgres database"`
-	Valkey   string `validate:"url,startswith=valkey:"     help:"URL for your Valkey instance"`
+	Valkey   string `validate:"url,startswith=valkey:|startswith=valkeys:" help:"URL for your Valkey instance, valkeys:// for TLS"`
 	SpoolDir string `help:"the local directory where courier will write statuses or msgs that need to be retried (needs to be writable)"`
 
 	Domain          string `help:"the domain courier is exposed on"`
@@ -50,11 +49,7 @@ type Config struct {
 	LogLevel           slog.Level `help:"the logging level courier should use"`
 	Version            string     `help:"the version that will be used in request and response headers"`
 
-	// IncludeChannels is the list of channels to enable, empty means include all
-	IncludeChannels []string
-
-	// ExcludeChannels is the list of channels to exclude, empty means exclude none
-	ExcludeChannels []string
+	DefaultContactLimit int `help:"the maximum number of contacts a workspace can have, when not set on the workspace itself, zero means no limit"`
 
 	// parsed values that can't be set directly
 	DisallowedIPs      []net.IP
@@ -102,6 +97,8 @@ func NewDefaultConfig() *Config {
 		MaxWorkers:         32,
 		LogLevel:           slog.LevelWarn,
 		Version:            "Dev",
+
+		DefaultContactLimit: 10_000_000,
 	}
 
 	// Apply Smart Defaults for Android
@@ -122,26 +119,8 @@ func NewDefaultConfig() *Config {
 	return conf
 }
 
-// LoadConfig loads configuration from a config file, environment variables and command line args, on top of the
-// given base config, e.g. NewDefaultConfig().
-func LoadConfig(cfg *Config, args ...string) (*Config, error) {
-	loader := ezconf.NewLoader(cfg, "courier", "Courier - A fast message broker for SMS and IP messages", []string{"config.toml"})
-	if len(args) > 0 { // allow tests to pass in args
-		loader.SetArgs(args...)
-	}
-	if err := loader.Load(); err != nil {
-		return nil, err
-	}
-
-	if err := cfg.Parse(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
-	}
-
-	return cfg, nil
-}
-
 // Parse validates the config and fills in the values which can't be used in the form they're configured in. It's
-// called by LoadConfig, and a config built by other means (e.g. NewDefaultConfig in a test) must be parsed before
+// called by cmd.LoadConfig, and a config built by other means (e.g. NewDefaultConfig in a test) must be parsed before
 // being handed to NewRuntime - the values it fills in have no meaningful zero value, so skipping it would silently
 // leave the SSRF blocklist empty rather than fail.
 func (c *Config) Parse() error {

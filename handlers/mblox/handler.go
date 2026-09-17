@@ -14,30 +14,27 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "https://api.mblox.com/xms/v1"
-	maxMsgLength = 459
-)
+const sendURL = "https://api.mblox.com/xms/v1"
+
+var maxMsgLength = 459
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("MB"), "Mblox")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("MB"), "Mblox")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindAny, handlers.JSONPayload(h.receiveAny))
+	return h
 }
 
 type eventPayload struct {
@@ -60,50 +57,45 @@ var statusMapping = map[string]models.MsgStatus{
 	"Expired":    models.MsgStatusFailed,
 }
 
-// receiveEvent is our HTTP handler function for incoming messages
-func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *eventPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveAny is our receive function for the single URL Mblox delivers both messages and delivery reports through
+func (h *handler) receiveAny(ctx context.Context, channel *models.Channel, r *http.Request, payload *eventPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.Type == "recipient_delivery_report_sms" {
-		clog.Type = models.ChannelLogTypeMsgStatus
+		in.As(channels.ReceiveKindStatus)
 
 		if payload.BatchID == "" || payload.Status == "" {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing one of 'batch_id' or 'status' in request body"))
+			return fmt.Errorf("missing one of 'batch_id' or 'status' in request body")
 		}
 
 		msgStatus, found := statusMapping[payload.Status]
 		if !found {
-			return nil, fmt.Errorf(`unknown status '%s', must be one of 'Delivered', 'Dispatched', 'Aborted', 'Rejected', 'Failed'  or 'Expired'`, payload.Status)
+			return handlers.UnknownStatusError(statusMapping, payload.Status)
 		}
 
-		// write our status
-		status := models.NewStatusUpdateByExternalID(channel, payload.BatchID, msgStatus, clog)
-		return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+		in.Status(models.NewStatusUpdateByExternalID(channel, payload.BatchID, msgStatus, clog))
+		return nil
 
 	} else if payload.Type == "mo_text" {
-		clog.Type = models.ChannelLogTypeMsgReceive
+		in.As(channels.ReceiveKindMsg)
 
 		if payload.ID == "" || payload.From == "" || payload.To == "" || payload.Body == "" || payload.ReceivedAt == "" {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing one of 'id', 'from', 'to', 'body' or 'received_at' in request body"))
+			return fmt.Errorf("missing one of 'id', 'from', 'to', 'body' or 'received_at' in request body")
 		}
 
 		date, err := time.Parse("2006-01-02T15:04:05.000Z", payload.ReceivedAt)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return err
 		}
 
-		// create our URN
 		urn, err := urns.ParsePhone(payload.From, channel.Country(), true, false)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return err
 		}
 
-		// build our Message
-		msg := models.NewIncomingMsg(channel, urn, payload.Body, payload.ID, clog).WithReceivedOn(date.UTC())
-
-		// and finally write our message
-		return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+		in.Msg(models.NewIncomingMsg(channel, urn, payload.Body, payload.ID, clog).WithReceivedOn(date.UTC()))
+		return nil
 	}
 
-	return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("not handled, unknown type: %s", payload.Type))
+	return fmt.Errorf("not handled, unknown type: %s", payload.Type)
 }
 
 type mtPayload struct {

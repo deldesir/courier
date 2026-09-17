@@ -22,6 +22,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 
 	"github.com/nyaruka/gocommon/urns"
@@ -29,7 +30,7 @@ import (
 )
 
 func init() {
-	channels.RegisterHandler(NewHandler())
+	channels.RegisterHandler(NewHandler)
 }
 
 // WuzapiHandler is the handler for Wuzapi
@@ -120,23 +121,23 @@ type WuzapiMediaMessage struct {
 	FileLength    uint64 `json:"fileLength"`
 }
 
-func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *models.Channel, payload *WuzapiPayload, clog *models.ChannelLog, w http.ResponseWriter, r *http.Request) ([]channels.Event, error) {
+func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *models.Channel, payload *WuzapiPayload, in *channels.Received, clog *models.ChannelLog) error {
 	// Try parsing "Event" first (Standard Wuzapi)
 	var event WuzapiEvent
 	if len(payload.Event) > 0 {
 		if err := json.Unmarshal(payload.Event, &event); err != nil {
 			fmt.Printf("Wuzapi ERROR: invalid event payload: %s\n", err) // Debug log
-			return nil, nil                                              // Return 200 to clear queue
+			return nil                                                   // Return 200 to clear queue
 		}
 	} else if len(payload.Payload) > 0 {
 		// Fallback: Maybe payload has the event data directly?
 		if err := json.Unmarshal(payload.Payload, &event); err != nil {
 			fmt.Printf("Wuzapi ERROR: invalid payload (fallback): %s\n", err) // Debug log
-			return nil, nil                                                   // Return 200 to clear queue
+			return nil                                                        // Return 200 to clear queue
 		}
 	} else {
 		fmt.Printf("Wuzapi ERROR: empty event and payload\n")
-		return nil, nil // Return 200 to clear queue
+		return nil // Return 200 to clear queue
 	}
 
 	// Extract Sender & Chat
@@ -148,17 +149,17 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *mode
 
 	if event.Info.IsFromMe {
 		log.Printf("Wuzapi DEBUG: Ignoring IsFromMe message (Self)")
-		return nil, nil
+		return nil
 	}
 
 	if event.Info.IsGroup {
 		log.Printf("Wuzapi DEBUG: Ignoring Group Message (IsGroup=true)")
-		return nil, nil
+		return nil
 	}
 
 	if strings.HasSuffix(senderStr, "@g.us") || strings.Contains(senderStr, "-") {
 		log.Printf("Wuzapi DEBUG: Ignoring Group Message (Suffix Check)")
-		return nil, nil // Group message
+		return nil // Group message
 	}
 
 	// Filter Broadcast / Status Updates
@@ -166,11 +167,11 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *mode
 	// Broadcast Lists: '1234567890@broadcast'
 	if strings.Contains(senderStr, "@broadcast") || strings.Contains(chatStr, "@broadcast") {
 		log.Printf("Wuzapi DEBUG: Ignoring Broadcast/Status: Sender=%s Chat=%s", senderStr, chatStr)
-		return nil, nil
+		return nil
 	}
 
 	if senderStr == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing sender"))
+		return fmt.Errorf("missing sender")
 	}
 
 	// Prefer SenderAlt if it looks like a real phone number JID
@@ -194,12 +195,12 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *mode
 	// Wuzapi sometimes passes Broadcast JIDs as numbers if we aren't careful.
 	if len(phone) > 15 {
 		log.Printf("Wuzapi DEBUG: Ignoring suspiciously long number (Legacy/Broadcast Group ID?): %s", phone)
-		return nil, nil
+		return nil
 	}
 
 	urn, err := urns.New(urns.WhatsApp, phone)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid whatsapp urn: %w", err))
+		return fmt.Errorf("invalid whatsapp urn: %w", err)
 	}
 
 	// Unnest Ephemeral/ViewOnce
@@ -357,7 +358,7 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *mode
 	// Final check for text
 	if text == "" && mediaURL == "" {
 		log.Printf("Wuzapi DEBUG: Empty text and no media. Ignoring event.")
-		return nil, nil
+		return nil
 	}
 
 	// best-effort read receipt: mark the message read in WhatsApp as soon as
@@ -381,35 +382,36 @@ func (h *WuzapiHandler) handleMessageInternal(ctx context.Context, channel *mode
 		msg.WithAttachment(fmt.Sprintf("%s:%s", mimePrefix, mediaURL))
 	}
 
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
-}
-
-// NewHandler creates a new handler
-func NewHandler() channels.Handler {
-	return &WuzapiHandler{
-		handlers.NewBaseHandler(models.ChannelType("WZ"), "Wuzapi", handlers.WithRedactConfigKeys("wuzapi_token", "hmac_key")),
-	}
-}
-
-// Initialize is called by the engine once everything is loaded
-func (h *WuzapiHandler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.handleWebhook)
+	in.Msg(msg)
 	return nil
 }
 
-// handleWebhook is our HTTP handler function for incoming messages
-func (h *WuzapiHandler) handleWebhook(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// NewHandler creates a new handler
+func NewHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &WuzapiHandler{
+		handlers.NewBaseHandler(rt, models.ChannelType("WZ"), "Wuzapi", handlers.WithRedactConfigKeys("wuzapi_token", "hmac_key")),
+	}
+
+	// one webhook URL delivers both messages and read receipts, so the route starts as "any" and each
+	// branch narrows it once it knows which it's dealing with
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindAny, h.handleWebhook)
+	return h
+}
+
+// handleWebhook is our receive function for incoming webhooks. Anything we can't parse or don't handle just
+// returns - the empty batch is answered 200 "ignored", which is what stops WuzAPI re-queueing it.
+func (h *WuzapiHandler) handleWebhook(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
 	// 1. HMAC Verification - TEMPORARILY DISABLED due to Key Rotation Issue
 	// hmacKey := channel.StringConfigForKey("hmac_key", "")
 	// if hmacKey != "" {
 	// 	if err := h.verifySignature(r, hmacKey); err != nil {
-	// 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+	// 		return channels.Unauthenticated(err)
 	// 	}
 	// }
 
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("failed to read body: %w", err))
+		return fmt.Errorf("failed to read body: %w", err)
 	}
 	// Restore body for any subsequent needs (though we parsed it)
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
@@ -426,27 +428,29 @@ func (h *WuzapiHandler) handleWebhook(ctx context.Context, channel *models.Chann
 			jsonData := query.Get("jsonData")
 			if jsonData == "" {
 				fmt.Printf("Wuzapi ERROR: empty jsonData fallback\n")
-				return nil, nil // Return 200 to clear queue
+				return nil // Return 200 to clear queue
 			}
 			fmt.Printf("Wuzapi DEBUG: jsonData Fallback: %s\n", jsonData)
 			if jsonErr := json.Unmarshal([]byte(jsonData), &payload); jsonErr != nil {
 				log.Printf("Wuzapi ERROR: invalid json in jsonData: %s | DATA: %s", jsonErr, jsonData)
-				return nil, nil // Return 200 to clear queue
+				return nil // Return 200 to clear queue
 			}
 		} else {
 			// Original error if fallback didn't match
 			log.Printf("Wuzapi ERROR: invalid json: %s | BODY: %s", err, string(bodyBytes))
-			return nil, nil // Return 200 to clear queue
+			return nil // Return 200 to clear queue
 		}
 	}
 
 	if strings.EqualFold(payload.Type, "Message") {
-		return h.handleMessageInternal(ctx, channel, &payload, clog, w, r)
+		in.As(channels.ReceiveKindMsg)
+		return h.handleMessageInternal(ctx, channel, &payload, in, clog)
 	} else if strings.EqualFold(payload.Type, "ReadReceipt") {
-		return h.handleReceiptInternal(ctx, channel, &payload, clog, w, r)
+		in.As(channels.ReceiveKindStatus)
+		return h.handleReceiptInternal(ctx, channel, &payload, in, clog)
 	}
 
-	return nil, nil // Ignored event
+	return nil // Ignored event
 }
 
 func (h *WuzapiHandler) verifySignature(r *http.Request, key string) error {
@@ -544,7 +548,7 @@ func (h *WuzapiHandler) downloadMedia(ctx context.Context, channel *models.Chann
 	return raw, respDec.Mimetype, err
 }
 
-func (h *WuzapiHandler) handleReceiptInternal(ctx context.Context, channel *models.Channel, payload *WuzapiPayload, clog *models.ChannelLog, w http.ResponseWriter, r *http.Request) ([]channels.Event, error) {
+func (h *WuzapiHandler) handleReceiptInternal(ctx context.Context, channel *models.Channel, payload *WuzapiPayload, in *channels.Received, clog *models.ChannelLog) error {
 	// Map Status
 	var status models.MsgStatus
 
@@ -563,18 +567,18 @@ func (h *WuzapiHandler) handleReceiptInternal(ctx context.Context, channel *mode
 		status = models.MsgStatusSent
 	default:
 		// Ignore others or map to sent
-		return nil, nil
+		return nil
 	}
 
 	// ID might be in payload.ID or nested in event? Wuzapi usually puts it in top level for receipts
 	id := payload.ID
 
 	if id == "" {
-		return nil, nil // No ID
+		return nil // No ID
 	}
 
-	event := models.NewStatusUpdateByExternalID(channel, id, status, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, event, w, r)
+	in.Status(models.NewStatusUpdateByExternalID(channel, id, status, clog))
+	return nil
 }
 
 // Send implements the channels.Handler interface

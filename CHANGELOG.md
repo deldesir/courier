@@ -1,3 +1,68 @@
+v26.3.54 (2026-09-15)
+-------------------------
+ * Run tests against SeaweedFS instead of localstack
+
+v26.3.53 (2026-09-14)
+-------------------------
+ * Clear next_attempt whenever a message is no longer errored
+ * Update to latest goflow
+
+v26.3.52 (2026-09-11)
+-------------------------
+ * Write each message status change to the history table as its own item
+ * Update to latest gocommon and goflow
+
+v26.3.51 (2026-09-10)
+-------------------------
+ * Make the metrics reporter extendable by deployments and recover from panics so a failing hook only loses its own metrics for the period
+ * Move config loading into cmd.LoadConfig so apps built on top of courier can embed the runtime config
+
+v26.3.50 (2026-09-10)
+-------------------------
+ * Only ever move message status forward so out of order status updates can't undo one that already landed
+ * Make the contact creation and received message checks replaceable by deployments
+ * Add inbound attachment support to webchat channels
+
+v26.3.49 (2026-09-09)
+-------------------------
+ * Add history endpoint to webchat channels so clients can fetch recent messages
+ * Add enforcement of per-workspace contact limit with a default of 10 million
+ * Update to latest gocommon and goflow
+
+v26.3.48 (2026-09-08)
+-------------------------
+ * Make handler endpoint URLs and other fixed literals constants
+ * Use shared config key constants where handlers had declared their own
+ * Update from Go 1.26 to 1.27
+
+v26.3.47 (2026-09-02)
+-------------------------
+ * Convert all handler tests to JSON case files under testdata/ and remove the legacy test runners
+ * Bound the channel-by-UUID and Turn failed media caches so unknown keys can't grow them without limit
+ * Update to latest gocommon
+
+v26.3.46 (2026-09-01)
+-------------------------
+ * Cache a channel's absence for lookups by UUID so a dead callback URL doesn't query per request
+ * Stop a MessageBird field we can't convert discarding the whole status report
+ * Record a Nexmo request we couldn't fully decode instead of discarding the error
+ * Replace handler SetRuntime/Initialize with runtime-aware constructors
+
+v26.3.45 (2026-08-31)
+-------------------------
+ * Answer a failed signature check on an incoming request as unauthorized
+ * Separate what an incoming request is answered as from what it's logged as
+ * Share the WhatsApp payload parser between Cloud API and 360dialog handlers
+ * Simplify channel receive route registration and request payload parsing
+ * Update dependencies
+
+v26.3.44 (2026-08-31)
+-------------------------
+ * Include attachments and quick replies in webchat msg_out events
+ * Add maximum text length to webchat receive endpoint
+ * Combine multiple contents in an incoming Zenvia payload into a single message
+ * Update dependencies
+
 v26.3.43 (2026-08-27)
 -------------------------
  * Don't store channel logs for channel types whose traffic is internal to the platform

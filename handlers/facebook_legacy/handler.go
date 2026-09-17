@@ -15,19 +15,24 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
 // Endpoints we hit
-var (
+const (
 	sendURL      = "https://graph.facebook.com/v3.3/me/messages"
 	subscribeURL = "https://graph.facebook.com/v3.3/me/subscribed_apps"
-	graphURL     = "https://graph.facebook.com/v3.3/"
 
 	// How long we want after the subscribe callback to register the page for events
 	subscribeTimeout = time.Second * 2
+)
+
+var (
+	// not a const because tests point it at a mock graph server
+	graphURL = "https://graph.facebook.com/v3.3/"
 
 	// Facebook API says 640 is max for the body
 	maxMsgLength = 640
@@ -51,22 +56,19 @@ const (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("FB"), "Facebook")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("FB"), "Facebook")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMultiReceive, handlers.JSONPayload(h, h.receiveEvents))
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindAny, handlers.JSONPayload(h.receiveAny))
 	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeWebhookVerify, h.receiveVerify)
-	return nil
+	return h
 }
 
 // receiveVerify handles Facebook's webhook verification callback
@@ -75,19 +77,19 @@ func (h *handler) receiveVerify(ctx context.Context, channel *models.Channel, w 
 
 	// this isn't a subscribe verification, that's an error
 	if mode != "subscribe" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown request"))
+		return nil, channels.RespondRequestError(ctx, h, w, r, channel, fmt.Errorf("unknown request"))
 	}
 
 	// verify the token against our secret, if the same return the challenge FB sent us
 	secret := r.URL.Query().Get("hub.verify_token")
 	if !utils.SecretEqual(secret, channel.StringConfigForKey(models.ConfigSecret, "")) {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("token does not match secret"))
+		return nil, channels.RespondRequestError(ctx, h, w, r, channel, fmt.Errorf("token does not match secret"))
 	}
 
 	// make sure we have an auth token
 	authToken := channel.StringConfigForKey(models.ConfigAuthToken, "")
 	if authToken == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing auth token for FB channel"))
+		return nil, channels.RespondRequestError(ctx, h, w, r, channel, fmt.Errorf("missing auth token for FB channel"))
 	}
 
 	// everything looks good, we will subscribe to this page's messages asynchronously
@@ -206,23 +208,32 @@ type moPayload struct {
 	} `json:"entry"`
 }
 
-// receiveEvents is our HTTP handler function for incoming messages and status updates
-func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveAny is our receive function for the single URL Facebook delivers messages, status updates and events
+// through
+func (h *handler) receiveAny(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	// not a page object? ignore
 	if payload.Object != "page" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring non-page request")
+		return channels.Ignore("ignoring non-page request")
 	}
 
 	// no entries? ignore this request
 	if len(payload.Entry) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, no entries")
+		return channels.Ignore("ignoring request, no entries")
 	}
 
-	// the list of events we deal with
-	events := make([]channels.Event, 0, 2)
+	// a failure here is in the payload itself, so asking for it again wouldn't get any further. The seam writes
+	// whatever was parsed ahead of it rather than dropping it.
+	return h.parseEvents(channel, payload, in, clog)
+}
 
-	// the list of data we will return in our response
-	data := make([]any, 0, 2)
+// parseEvents turns a payload into the set of things it contained, without writing any of them - which is what
+// lets the whole batch be written together, and keeps a failure part way through it from leaving a response
+// that describes more than we actually did.
+//
+// It matters most here because this handler creates channel events, which have no duplicate detection of their
+// own: a parse failure used to leave the events before it written and then ask the provider to resend the whole
+// batch, which wrote them a second time.
+func (h *handler) parseEvents(channel *models.Channel, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 
 	seenMsgIDs := make(map[string]bool, 2)
 
@@ -247,7 +258,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w 
 		// create our URN
 		urn, err := urns.New(urns.Facebook, msg.Sender.ID)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid facebook id"))
+			return errors.New("invalid facebook id")
 		}
 		if msg.OptIn != nil {
 			event := models.NewChannelEvent(channel, models.EventTypeReferral, urn, clog).WithOccurredOn(date)
@@ -256,13 +267,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w 
 			extra := map[string]string{referrerIDKey: msg.OptIn.Ref}
 			event = event.WithExtra(extra)
 
-			err := models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
-			if err != nil {
-				return nil, err
-			}
-
-			events = append(events, event)
-			data = append(data, channels.NewEventReceiveData(event))
+			in.Event(event)
 
 		} else if msg.Postback != nil {
 			// by default postbacks are treated as new conversations, unless we have referral information
@@ -291,13 +296,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w 
 
 			event = event.WithExtra(extra)
 
-			err := models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
-			if err != nil {
-				return nil, err
-			}
-
-			events = append(events, event)
-			data = append(data, channels.NewEventReceiveData(event))
+			in.Event(event)
 
 		} else if msg.Referral != nil {
 			// this is an incoming referral
@@ -317,13 +316,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w 
 			}
 			event = event.WithExtra(extra)
 
-			err := models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
-			if err != nil {
-				return nil, err
-			}
-
-			events = append(events, event)
-			data = append(data, channels.NewEventReceiveData(event))
+			in.Event(event)
 
 		} else if msg.Message != nil {
 			// this is an incoming message
@@ -333,7 +326,7 @@ func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w 
 
 			// ignore echos
 			if msg.Message.IsEcho {
-				data = append(data, channels.NewInfoData("ignoring echo"))
+				in.Ignored("ignoring echo")
 				continue
 			}
 
@@ -377,34 +370,21 @@ func (h *handler) receiveEvents(ctx context.Context, channel *models.Channel, w 
 				event.WithAttachment(attURL)
 			}
 
-			err := models.WriteMsg(ctx, h.Runtime(), event, clog)
-			if err != nil {
-				return nil, err
-			}
-
-			events = append(events, event)
-			data = append(data, channels.NewMsgReceiveData(event))
+			in.Msg(event)
 			seenMsgIDs[msg.Message.MID] = true
 
 		} else if msg.Delivery != nil {
 			// this is a delivery report
 			for _, mid := range msg.Delivery.MIDs {
-				event := models.NewStatusUpdateByExternalID(channel, mid, models.MsgStatusDelivered, clog)
-				err := models.WriteStatusUpdate(ctx, h.Runtime(), event)
-				if err != nil {
-					return nil, err
-				}
-
-				events = append(events, event)
-				data = append(data, channels.NewStatusData(event))
+				in.Status(models.NewStatusUpdateByExternalID(channel, mid, models.MsgStatusDelivered, clog))
 			}
 
 		} else {
-			data = append(data, channels.NewInfoData("ignoring unknown entry type"))
+			in.Ignored("ignoring unknown entry type")
 		}
 	}
 
-	return events, channels.WriteDataResponse(w, http.StatusOK, "Events Handled", data)
+	return nil
 }
 
 //	{
