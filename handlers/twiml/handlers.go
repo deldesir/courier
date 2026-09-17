@@ -25,6 +25,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
@@ -38,20 +39,19 @@ import (
 const (
 	configAccountSID          = "account_sid"
 	configMessagingServiceSID = "messaging_service_sid"
-	configSendURL             = "send_url"
-	configBaseURL             = "base_url"
 	configIgnoreDLRs          = "ignore_dlrs"
 	configLinkShortening      = "link_shortening"
 
 	signatureHeader     = "X-Twilio-Signature"
 	forwardedPathHeader = "X-Forwarded-Path"
-)
 
-var (
-	maxMsgLength  = 1600
 	twilioBaseURL = "https://api.twilio.com"
 
 	typingIndicatorURL = "https://messaging.twilio.com/v3/Indicators/Typing.json"
+)
+
+var (
+	maxMsgLength = 1600
 
 	//go:embed errors.json
 	errorCodes []byte
@@ -74,8 +74,13 @@ type handler struct {
 	validateSignatures bool
 }
 
-func newTWIMLHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.Handler {
-	return &handler{handlers.NewBaseHandler(channelType, name), validateSignatures}
+func newTWIMLHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.NewHandlerFunc {
+	return func(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+		h := &handler{handlers.NewBaseHandler(rt, channelType, name), validateSignatures}
+		r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, h.receiveMessage)
+		r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, h.receiveStatus)
+		return h
+	}
 }
 
 func init() {
@@ -84,13 +89,6 @@ func init() {
 	channels.RegisterHandler(newTWIMLHandler("TMS", "Twilio Messaging Service", true))
 	channels.RegisterHandler(newTWIMLHandler("TWA", "Twilio Whatsapp", true))
 	channels.RegisterHandler(newTWIMLHandler("SW", "SignalWire", false))
-}
-
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	return nil
 }
 
 type moForm struct {
@@ -122,23 +120,21 @@ var statusMapping = map[string]models.MsgStatus{
 	"undelivered": models.MsgStatusFailed,
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := h.validateSignature(channel, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+	if err := h.validateSignature(channel, r); err != nil {
+		return channels.Unauthenticated(err)
 	}
 
 	// get our params
 	form := &moForm{}
-	err = handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+	if err := handlers.DecodeAndValidateForm(form, r); err != nil {
+		return err
 	}
 
 	urn, err := h.parseURN(channel, form.From, i18n.Country(form.FromCountry))
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	if form.Body != "" {
@@ -172,31 +168,30 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		mediaURL := r.PostForm.Get(fmt.Sprintf("MediaUrl%d", i))
 		msg.WithAttachment(mediaURL)
 	}
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
-// receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := h.validateSignature(channel, r)
-	if err != nil {
-		return nil, err
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+	if err := h.validateSignature(channel, r); err != nil {
+		return channels.Unauthenticated(err)
 	}
 
 	// get our params
 	form := &statusForm{}
-	err = handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "no msg status, ignoring")
+	if err := handlers.DecodeAndValidateForm(form, r); err != nil {
+		return channels.Ignore("no msg status, ignoring")
 	}
 
 	msgStatus, found := statusMapping[form.MessageStatus]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown status '%s', must be one of 'queued', 'failed', 'sent', 'delivered', or 'undelivered'", form.MessageStatus))
+		return handlers.UnknownStatusError(statusMapping, form.MessageStatus)
 	}
 
 	// if we are ignoring delivery reports and this isn't failed then move on
 	if channel.BoolConfigForKey(configIgnoreDLRs, false) && msgStatus != models.MsgStatusFailed {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring non error delivery report")
+		return channels.Ignore("ignoring non error delivery report")
 	}
 
 	var status *models.StatusUpdate
@@ -207,22 +202,16 @@ func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w 
 		status = models.NewStatusUpdateByExternalID(channel, form.MessageSID, msgStatus, clog)
 	}
 
-	var stopEvent *models.ChannelEvent
-
 	errorCode, _ := strconv.ParseInt(form.ErrorCode, 10, 64)
 	if errorCode != 0 {
 		if errorCode == errorStopped {
 			urn, err := h.parseURN(channel, form.To, "")
 			if err != nil {
-				return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+				return err
 			}
 
-			// create a stop channel event
-			stopEvent = models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
-			err = models.WriteChannelEvent(ctx, h.Runtime(), stopEvent, clog)
-			if err != nil {
-				return nil, err
-			}
+			// the contact has asked to stop, which we record alongside the status that told us
+			in.Event(models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog))
 		}
 		clog.Error(twilioError(errorCode))
 		if errorCode == errorThrottled {
@@ -230,11 +219,9 @@ func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w 
 		}
 	}
 
-	events, err := handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
-	if stopEvent != nil {
-		events = append(events, stopEvent)
-	}
-	return events, err
+	in.Status(status)
+
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
@@ -574,7 +561,7 @@ func (h *handler) baseURL(c *models.Channel) string {
 		return twilioBaseURL
 	}
 
-	return c.StringConfigForKey(configSendURL, c.StringConfigForKey(configBaseURL, ""))
+	return c.StringConfigForKey(models.ConfigSendURL, c.StringConfigForKey(models.ConfigBaseURL, ""))
 }
 
 // see https://www.twilio.com/docs/api/security
@@ -648,16 +635,16 @@ func twCalculateSignature(url string, form url.Values, authToken string) ([]byte
 	return encoded, nil
 }
 
-// WriteMsgSuccessResponse writes our response in TWIML format
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
+// RespondMsgs writes our response in TWIML format
+func (h *handler) RespondMsgs(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.Header().Set("Content-Type", "text/xml")
 	w.WriteHeader(200)
 	_, err := fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><Response/>`)
 	return err
 }
 
-// WriteRequestIgnored writes our response in TWIML format
-func (h *handler) WriteRequestIgnored(ctx context.Context, w http.ResponseWriter, details string) error {
+// RespondIgnored writes our response in TWIML format
+func (h *handler) RespondIgnored(ctx context.Context, w http.ResponseWriter, details string) error {
 	w.Header().Set("Content-Type", "text/xml")
 	w.WriteHeader(200)
 	_, err := fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><!-- %s --><Response/>`, details)

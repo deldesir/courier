@@ -3,7 +3,6 @@ package wavy
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -12,32 +11,29 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL = "https://api-messaging.movile.com/v1/send-sms"
-)
+const sendURL = "https://api-messaging.movile.com/v1/send-sms"
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("WV"), "Wavy")}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("WV"), "Wavy")}
+
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodPost, "sent", channels.ReceiveKindStatus, handlers.JSONPayload(h.receiveSentStatus))
+	r.AddReceive(h, http.MethodPost, "delivered", channels.ReceiveKindStatus,
+		handlers.JSONPayload(h.receiveDeliveredStatus))
+	return h
 }
 
 func init() {
-	channels.RegisterHandler(newHandler())
-}
-
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	r.Add(h, http.MethodPost, "sent", models.ChannelLogTypeMsgStatus, handlers.JSONPayload(h, h.sentStatusMessage))
-	r.Add(h, http.MethodPost, "delivered", models.ChannelLogTypeMsgStatus, handlers.JSONPayload(h, h.deliveredStatusMessage))
-	return nil
+	channels.RegisterHandler(newHandler)
 }
 
 var statusMapping = map[int]models.MsgStatus{
@@ -61,16 +57,17 @@ type sentStatusPayload struct {
 	SentStatusCode int    `json:"sentStatusCode"   validate:"required"`
 }
 
-// sentStatusMessage is our HTTP handler function for status updates
-func (h *handler) sentStatusMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *sentStatusPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveSentStatus is our receive function for the sent callback, which Wavy delivers separately from the
+// delivered one below
+func (h *handler) receiveSentStatus(ctx context.Context, channel *models.Channel, r *http.Request, payload *sentStatusPayload, in *channels.Received, clog *models.ChannelLog) error {
 	msgStatus, found := statusMapping[payload.SentStatusCode]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown sent status code '%d', must be one of 2, 101, 102, 103, 201, 202, 203, 204, 205, 207 or 301 ", payload.SentStatusCode))
+		return handlers.UnknownStatusError(statusMapping, payload.SentStatusCode)
 	}
 
-	// write our status
 	status := models.NewStatusUpdateByExternalID(channel, payload.CollerationID, msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 type deliveredStatusPayload struct {
@@ -78,16 +75,17 @@ type deliveredStatusPayload struct {
 	DeliveredStatusCode int    `json:"deliveredStatusCode"    validate:"required"`
 }
 
-// sentStatusMessage is our HTTP handler function for status updates
-func (h *handler) deliveredStatusMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *deliveredStatusPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveDeliveredStatus is our receive function for the delivered callback, which carries a different payload
+// from the sent one above
+func (h *handler) receiveDeliveredStatus(ctx context.Context, channel *models.Channel, r *http.Request, payload *deliveredStatusPayload, in *channels.Received, clog *models.ChannelLog) error {
 	msgStatus, found := statusMapping[payload.DeliveredStatusCode]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown delivered status code '%d', must be 4 or 104", payload.DeliveredStatusCode))
+		return handlers.UnknownStatusError(statusMapping, payload.DeliveredStatusCode)
 	}
 
-	// write our status
 	status := models.NewStatusUpdateByExternalID(channel, payload.CollerationID, msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 type moPayload struct {
@@ -98,20 +96,20 @@ type moPayload struct {
 	Timestamp int64  `json:"receivedAt"    validate:"required"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	date := time.Unix(0, int64(payload.Timestamp*1000000)).UTC()
 
 	// create our URN
 	urn, err := urns.ParsePhone(payload.From, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 	// build our msg
 	msg := models.NewIncomingMsg(channel, urn, payload.Message, payload.ID, clog).WithReceivedOn(date.UTC())
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 
 }
 

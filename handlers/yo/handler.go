@@ -15,6 +15,8 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/urns"
 )
 
@@ -28,20 +30,18 @@ var (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("YO"), "YO!")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("YO"), "YO!")}
 
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
+	r.AddReceive(h, http.MethodGet, "receive", channels.ReceiveKindMsg, handlers.FormPayload(h.receiveMessage))
+	return h
 }
 
 type moForm struct {
@@ -52,21 +52,15 @@ type moForm struct {
 	Time    string `name:"time"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &moForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, form *moForm, in *channels.Received, clog *models.ChannelLog) error {
 	// must have one of from or sender set, error if neither
 	sender := form.Sender
 	if sender == "" {
 		sender = form.From
 	}
 	if sender == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("must have one of 'sender' or 'from'"))
+		return errors.New("must have one of 'sender' or 'from'")
 	}
 
 	// if we have a date, parse it
@@ -75,25 +69,26 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		dateString = form.Time
 	}
 
-	date := time.Now()
+	date := dates.Now()
 	if dateString != "" {
+		var err error
 		date, err = time.Parse(time.RFC3339Nano, dateString)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid date format, must be RFC 3339"))
+			return errors.New("invalid date format, must be RFC 3339")
 		}
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(sender, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// build our msg
 	dbMsg := models.NewIncomingMsg(channel, urn, form.Message, "", clog).WithReceivedOn(date)
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{dbMsg}, w, r, clog)
+	in.Msg(dbMsg)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {

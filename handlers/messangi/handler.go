@@ -12,6 +12,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 )
 
@@ -20,30 +21,26 @@ const (
 	configPrivateKey = "private_key"
 	configInstanceId = "instance_id"
 	configCarrierId  = "carrier_id"
+
+	sendURL = "https://flow.messangi.me/mmc/rest/api/sendMT"
 )
 
-var (
-	maxMsgLength = 160
-	sendURL      = "https://flow.messangi.me/mmc/rest/api/sendMT"
-)
+var maxMsgLength = 160
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("MG"), "Messangi")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("MG"), "Messangi")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	receiveHandler := handlers.NewTelReceiveHandler(h, "mobile", "mo")
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, receiveHandler)
-	return nil
+	receiveHandler := handlers.NewTelReceiveHandler("mobile", "mo")
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, receiveHandler)
+	return h
 }
 
 // <response>

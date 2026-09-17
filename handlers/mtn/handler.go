@@ -17,17 +17,18 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
+const (
 	apiHostURL      = "https://api.mtn.com"
 	configAPIHost   = "api_host"
 	configCPAddress = "cp_address"
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
@@ -36,17 +37,14 @@ type handler struct {
 	fetchTokenMutex sync.Mutex
 }
 
-func newHandler() channels.Handler {
-	return &handler{
-		BaseHandler:     handlers.NewBaseHandler(models.ChannelType("MTN"), "MTN Developer Portal"),
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{
+		BaseHandler:     handlers.NewBaseHandler(rt, models.ChannelType("MTN"), "MTN Developer Portal"),
 		fetchTokenMutex: sync.Mutex{},
 	}
-}
 
-// Initialize implements channels.Handler
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindAny, handlers.JSONPayload(h.receiveAny))
+	return h
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -74,41 +72,40 @@ type moPayload struct {
 	DeliveryStatus string `json:"deliveryStatus"`
 }
 
-// receiveEvent is our HTTP handler function for incoming messages
-func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveAny is our receive function for the single URL MTN delivers both messages and status reports through
+func (h *handler) receiveAny(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.Message != "" {
-		clog.Type = models.ChannelLogTypeMsgReceive
+		in.As(channels.ReceiveKindMsg)
 
 		date := time.Unix(payload.Created/1000, payload.Created%1000*1000000).UTC()
 		urn, err := urns.ParsePhone(payload.From, channel.Country(), true, false)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return err
 		}
 
-		// create and write the message
 		msg := models.NewIncomingMsg(channel, urn, payload.Message, "", clog).WithReceivedOn(date)
-		return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+		in.Msg(msg)
+		return nil
 
 	} else {
-		clog.Type = models.ChannelLogTypeMsgStatus
+		in.As(channels.ReceiveKindStatus)
 
 		if payload.TransactionID == "" {
-			return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "missing transactionId, ignored")
+			return channels.Ignore("missing transactionId, ignored")
 		}
 
 		msgStatus, found := statusMapping[payload.DeliveryStatus]
 		if !found {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r,
-				fmt.Errorf("unknown status '%s'", payload.DeliveryStatus))
+			return handlers.UnknownStatusError(statusMapping, payload.DeliveryStatus)
 		}
 
 		if msgStatus == models.MsgStatusWired {
-			return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "no status changed, ignored")
+			return channels.Ignore("no status changed, ignored")
 		}
 
-		// write our status
 		status := models.NewStatusUpdateByExternalID(channel, payload.TransactionID, msgStatus, clog)
-		return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+		in.Status(status)
+		return nil
 	}
 }
 

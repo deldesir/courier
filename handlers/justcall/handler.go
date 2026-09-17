@@ -14,32 +14,30 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "https://api.justcall.io/v1/texts/new"
-	maxMsgLength = 160
-)
+const sendURL = "https://api.justcall.io/v1/texts/new"
+
+var maxMsgLength = 160
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("JCL"), "JustCall")}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("JCL"), "JustCall")}
+
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, handlers.JSONPayload(h.receiveStatus))
+	return h
 }
 
 func init() {
-	channels.RegisterHandler(newHandler())
-}
-
-// Initialize implements channels.Handler
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, handlers.JSONPayload(h, h.statusMessage))
-	return nil
+	channels.RegisterHandler(newHandler)
 }
 
 //	{
@@ -94,25 +92,25 @@ type moPayload struct {
 	} `json:"data"`
 }
 
-func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.Data.Type != "sms" || payload.Data.Direction != "I" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "Ignoring request, no message")
+		return channels.Ignore("Ignoring request, no message")
 	}
 
 	dateString := payload.Data.Datetime
-	date := time.Now()
+	date := dates.Now()
 	var err error
 	if dateString != "" {
 		date, err = time.Parse("2006-01-02 15:04:05", dateString)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, errors.New("invalid date format, must be RFC 3339"))
+			return errors.New("invalid date format, must be RFC 3339")
 		}
 		date = date.UTC()
 	}
 
 	urn, err := urns.ParsePhone(payload.Data.From, c.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+		return err
 	}
 
 	// build our msg
@@ -122,8 +120,8 @@ func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.
 		msg.WithAttachment(payload.Data.MMS[0].MediaURL)
 	}
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -133,18 +131,18 @@ var statusMapping = map[string]models.MsgStatus{
 	"failed":      models.MsgStatusFailed,
 }
 
-func (h *handler) statusMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+func (h *handler) receiveStatus(ctx context.Context, c *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.Data.Type != "sms" || payload.Data.Direction != "O" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "Ignoring request, no message")
+		return channels.Ignore("Ignoring request, no message")
 	}
 
 	msgStatus, found := statusMapping[payload.Data.Status]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("unknown status '%s', must be one of send, delivered, undelivered, failed", payload.Data.Status))
+		return handlers.UnknownStatusError(statusMapping, payload.Data.Status)
 	}
-	// write our status
 	status := models.NewStatusUpdateByExternalID(c, fmt.Sprint(payload.Data.MessageID), msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, c, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 type mtPayload struct {

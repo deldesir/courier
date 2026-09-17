@@ -12,6 +12,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/gsm7"
 	"github.com/nyaruka/gocommon/urns"
 
@@ -23,11 +24,12 @@ const (
 	configNexmoAPISecret     = "nexmo_api_secret"
 	configNexmoAppID         = "nexmo_app_id"
 	configNexmoAppPrivateKey = "nexmo_app_private_key"
+
+	sendURL = "https://rest.nexmo.com/sms/json"
 )
 
 var (
 	maxMsgLength = 1600
-	sendURL      = "https://rest.nexmo.com/sms/json"
 	throttledRE  = regexp.MustCompile(`.*Throughput Rate Exceeded - please wait \[ (\d+) \] and retry.*`)
 
 	// https://developer.vonage.com/messaging/sms/guides/troubleshooting-sms#sms-api-error-codes
@@ -81,24 +83,21 @@ var (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("NX"), "Nexmo", handlers.WithRedactConfigKeys(configNexmoAPISecret, configNexmoAppPrivateKey))}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("NX"), "Nexmo", handlers.WithRedactConfigKeys(configNexmoAPISecret, configNexmoAppPrivateKey))}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	r.Add(h, http.MethodGet, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	return nil
+	r.AddReceive(h, http.MethodGet, "receive", channels.ReceiveKindMsg, h.receiveMessage)
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, h.receiveMessage)
+	r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, h.receiveStatus)
+	r.AddReceive(h, http.MethodGet, "status", channels.ReceiveKindStatus, h.receiveStatus)
+	return h
 }
 
 // https://developer.vonage.com/messaging/sms/guides/delivery-receipts
@@ -119,18 +118,24 @@ var statusMappings = map[string]models.MsgStatus{
 	"delivered": models.MsgStatusDelivered,
 }
 
-// receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+	// this one decodes for itself rather than using FormPayload, because it tolerates a partial decode - it
+	// checks the fields it needs below and ignores the request if they're missing. Answering a decode failure
+	// as an error instead would have Vonage retry a body we can never parse, once a minute for 24 hours, so
+	// the failure is recorded on the log rather than returned.
 	form := &statusForm{}
-	handlers.DecodeAndValidateForm(form, r)
+	if err := handlers.DecodeAndValidateForm(form, r); err != nil {
+		clog.Error(models.ErrorRequestUnparseable(err))
+	}
 
 	if form.MessageID == "" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "no messageId parameter, ignored")
+		return channels.Ignore("no messageId parameter, ignored")
 	}
 
 	msgStatus, found := statusMappings[form.Status]
 	if !found {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring unknown status report")
+		return channels.Ignore("ignoring unknown status report")
 	}
 
 	if form.ErrCode != 0 {
@@ -139,7 +144,8 @@ func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w 
 
 	status := models.NewStatusUpdateByExternalID(channel, form.MessageID, msgStatus, clog)
 
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 type moForm struct {
@@ -149,24 +155,27 @@ type moForm struct {
 	MessageID string `name:"messageId"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+	// decodes for itself for the same reason as receiveStatus above
 	form := &moForm{}
-	handlers.DecodeAndValidateForm(form, r)
+	if err := handlers.DecodeAndValidateForm(form, r); err != nil {
+		clog.Error(models.ErrorRequestUnparseable(err))
+	}
 
 	if form.To == "" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "no to parameter, ignored")
+		return channels.Ignore("no to parameter, ignored")
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(form.From, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
-	// create and write the message
 	msg := models.NewIncomingMsg(channel, urn, form.Text, form.MessageID, clog)
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {

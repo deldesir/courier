@@ -21,11 +21,12 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
+const (
 	apiURL          = "https://api.freshchat.com/v2"
 	signatureHeader = "X-FreshChat-Signature"
 )
@@ -39,40 +40,36 @@ type handler struct {
 	validateSignatures bool
 }
 
-func newHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("FC"), "FreshChat"), validateSignatures}
+func newHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.NewHandlerFunc {
+	return func(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+		h := &handler{handlers.NewBaseHandler(rt, channelType, name), validateSignatures}
+		r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+		return h
+	}
 }
-
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	return nil
-}
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := h.validateSignature(channel, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
+	if err := h.validateSignature(channel, r); err != nil {
+		return channels.Unauthenticated(err)
 	}
 
 	// no message? ignore this
 	if payload.Data.Message == nil || payload.Data.Message.ActorID == "" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "Ignoring request, no message")
+		return channels.Ignore("Ignoring request, no message")
 	}
 
 	// something we sent? ignore this
 	if payload.Data.Message.ActorType == "agent" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "Ignoring request, Agent Message")
+		return channels.Ignore("Ignoring request, Agent Message")
 	}
 
 	// create our date from the timestamp
 	date := payload.Data.Message.CreatedTime
 
 	// create our URN
-	urn := urns.NilURN
 	urnstring := fmt.Sprintf("%s/%s", payload.Data.Message.ChannelID, payload.Data.Message.ActorID)
-	urn, err = urns.New(urns.FreshChat, urnstring)
+	urn, err := urns.New(urns.FreshChat, urnstring)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 	text := ""
 	mediaURL := ""
@@ -92,8 +89,8 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 	if mediaURL != "" {
 		msg.WithAttachment(mediaURL)
 	}
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {

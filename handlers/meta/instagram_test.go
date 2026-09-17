@@ -3,15 +3,9 @@ package meta
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
-	"net/url"
-	"strings"
 	"testing"
-	"time"
 
-	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
-	. "github.com/nyaruka/courier/v26/handlers"
 	. "github.com/nyaruka/courier/v26/handlers/handlertest"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
@@ -25,442 +19,34 @@ var instgramTestChannels = []*models.Channel{
 	test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c568c", "IG", "1234567890", "", []string{urns.Instagram.Prefix}, map[string]any{models.ConfigAuthToken: "a123"}),
 }
 
-var instagramIncomingTests = []IncomingTestCase{
-	{
-		Label:                 "Receive Message",
-		URL:                   "/c/ig/receive",
-		Data:                  string(test.ReadFile("./testdata/ig/hello_msg.json")),
-		ExpectedRespStatus:    200,
-		ExpectedBodyContains:  "Handled",
-		NoInvalidChannelCheck: true,
-		ExpectedMsgText:       Sp("Hello World"),
-		ExpectedURN:           "instagram:5678",
-		ExpectedExternalID:    "external_id",
-		ExpectedDate:          time.Date(2016, 4, 7, 1, 11, 27, 970000000, time.UTC),
-		PrepRequest:           addValidSignature,
-	},
-	{
-		Label:                "Receive Invalid Signature",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/hello_msg.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "invalid request signature",
-		PrepRequest:          addInvalidSignature,
-	},
-	{
-		Label:                "No Duplicate Receive Message",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/duplicate_msg.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		ExpectedMsgText:      Sp("Hello World"),
-		ExpectedURN:          "instagram:5678",
-		ExpectedExternalID:   "external_id",
-		ExpectedDate:         time.Date(2016, 4, 7, 1, 11, 27, 970000000, time.UTC),
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Receive Attachment",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/attachment.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		ExpectedMsgText:      Sp(""),
-		ExpectedAttachments:  []string{"https://image-url/foo.png"},
-		ExpectedURN:          "instagram:5678",
-		ExpectedExternalID:   "external_id",
-		ExpectedDate:         time.Date(2016, 4, 7, 1, 11, 27, 970000000, time.UTC),
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Receive Like Heart",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/like_heart.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		ExpectedMsgText:      Sp("❤️"),
-		ExpectedURN:          "instagram:5678",
-		ExpectedExternalID:   "external_id",
-		ExpectedDate:         time.Date(2016, 4, 7, 1, 11, 27, 970000000, time.UTC),
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Receive Icebreaker Get Started",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/icebreaker_get_started.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		ExpectedEvents: []ExpectedEvent{
-			{Type: models.EventTypeNewConversation, URN: "instagram:5678", Time: time.Date(2016, 4, 7, 1, 11, 27, 970000000, time.UTC), Extra: map[string]string{"title": "icebreaker question", "payload": "get_started"}},
-		},
-		PrepRequest: addValidSignature,
-	},
-	{
-		Label:                "Different Page",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/different_page.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: `"data":[]`,
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Echo",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/echo.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: `ignoring echo`,
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "No Entries",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/no_entries.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "no entries found",
-		NoLogsExpected:       true,
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Not Instagram",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/not_instagram.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "object expected 'page', 'instagram' or 'whatsapp_business_account', found notinstagram",
-		NoLogsExpected:       true,
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "No Messaging Entries",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/no_messaging_entries.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Unknown Messaging Entry",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/unknown_messaging_entry.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "Handled",
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Not JSON",
-		URL:                  "/c/ig/receive",
-		Data:                 "not JSON",
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "unable to parse request JSON",
-		NoLogsExpected:       true,
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Invalid URN",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/invalid_urn.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: "invalid instagram id",
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Story Mention",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/story_mention.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: `ignoring story_mention`,
-		PrepRequest:          addValidSignature,
-	},
-	{
-		Label:                "Message unsent",
-		URL:                  "/c/ig/receive",
-		Data:                 string(test.ReadFile("./testdata/ig/unsent_msg.json")),
-		ExpectedRespStatus:   200,
-		ExpectedBodyContains: `msg deleted`,
-		PrepRequest:          addValidSignature,
-	},
-}
-
 func TestInstagramIncoming(t *testing.T) {
-	graphURL = createMockGraphAPI().URL
-
-	RunIncomingTestCases(t, instgramTestChannels, newHandler("IG", "Instagram"), instagramIncomingTests)
-}
-
-var instagramOutgoingTests = []OutgoingTestCase{
-	{
-		Label:     "Text only chat message",
-		MsgText:   "Simple Message",
-		MsgURN:    "instagram:12345",
-		MsgOrigin: models.MsgOriginChat,
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"MESSAGE_TAG","tag":"HUMAN_AGENT","recipient":{"id":"12345"},"message":{"text":"Simple Message"}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
-		Label:     "Text only broadcast message",
-		MsgText:   "Simple Message",
-		MsgURN:    "instagram:12345",
-		MsgOrigin: models.MsgOriginBroadcast,
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"text":"Simple Message"}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
-		Label:                   "Text only flow response",
-		MsgText:                 "Simple Message",
-		MsgURN:                  "instagram:12345",
-		MsgOrigin:               models.MsgOriginFlow,
-		MsgResponseToExternalID: "23526",
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"RESPONSE","recipient":{"id":"12345"},"message":{"text":"Simple Message"}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
-		Label:           "Quick replies on a broadcast message",
-		MsgText:         "Are you happy?",
-		MsgURN:          "instagram:12345",
-		MsgOrigin:       models.MsgOriginBroadcast,
-		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"text":"Are you happy?","quick_replies":[{"title":"Yes","payload":"Yes","content_type":"text"},{"title":"No","payload":"No","content_type":"text"}]}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
-		Label:           "Message that exceeds max text length",
-		MsgText:         "This is a long message which spans more than one part, what will actually be sent in the end if we exceed the max length?",
-		MsgURN:          "instagram:12345",
-		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{
-			{
-				Params: url.Values{"access_token": {"a123"}},
-				Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"text":"This is a long message which spans more than one part, what will actually be sent in the end if"}}`,
-			},
-			{
-				Params: url.Values{"access_token": {"a123"}},
-				Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"text":"we exceed the max length?","quick_replies":[{"title":"Yes","payload":"Yes","content_type":"text"},{"title":"No","payload":"No","content_type":"text"}]}}`,
-			},
-		},
-		ExpectedExtIDs: []string{"mid.133", "mid.133"},
-	},
-	{
-		Label:          "Image attachment",
-		MsgURN:         "instagram:12345",
-		MsgAttachments: []string{"image/jpeg:https://foo.bar/image.jpg"},
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"attachment":{"type":"image","payload":{"url":"https://foo.bar/image.jpg","is_reusable":true}}}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
-		Label:           "Text, image attachment and quick replies",
-		MsgText:         "This is some text.",
-		MsgURN:          "instagram:12345",
-		MsgAttachments:  []string{"image/jpeg:https://foo.bar/image.jpg"},
-		MsgQuickReplies: []models.QuickReply{{Type: "text", Text: "Yes"}, {Type: "text", Text: "No"}},
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{
-			{
-				Params: url.Values{"access_token": {"a123"}},
-				Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"attachment":{"type":"image","payload":{"url":"https://foo.bar/image.jpg","is_reusable":true}}}}`,
-			},
-			{
-				Params: url.Values{"access_token": {"a123"}},
-				Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"text":"This is some text.","quick_replies":[{"title":"Yes","payload":"Yes","content_type":"text"},{"title":"No","payload":"No","content_type":"text"}]}}`,
-			},
-		},
-		ExpectedExtIDs: []string{"mid.133", "mid.133"},
-	},
-	{
-		Label:   "Explicit human agent tag",
-		MsgText: "Simple Message",
-		MsgURN:  "instagram:12345",
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"text":"Simple Message"}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
-		Label:          "Document attachment",
-		MsgURN:         "instagram:12345",
-		MsgAttachments: []string{"application/pdf:https://foo.bar/document.pdf"},
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{"message_id": "mid.133"}`)),
-			},
-		},
-		ExpectedRequests: []ExpectedRequest{{
-			Params: url.Values{"access_token": {"a123"}},
-			Body:   `{"messaging_type":"UPDATE","recipient":{"id":"12345"},"message":{"attachment":{"type":"file","payload":{"url":"https://foo.bar/document.pdf","is_reusable":true}}}}`,
-		}},
-		ExpectedExtIDs: []string{"mid.133"},
-	},
-	{
-		Label:   "Response doesn't contain message id",
-		MsgText: "ID Error",
-		MsgURN:  "instagram:12345",
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{ "is_error": true }`)),
-			},
-		},
-		ExpectedError: channels.ErrResponseUnexpected,
-	},
-	{
-		Label:   "Response status code is non-200",
-		MsgText: "Error",
-		MsgURN:  "instagram:12345",
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(403, nil, []byte(`{ "is_error": true }`)),
-			},
-		},
-		ExpectedError: channels.ErrResponseStatus,
-	},
-	{
-		Label:   "Throttled",
-		MsgText: "Error",
-		MsgURN:  "instagram:12345",
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(429, nil, []byte(`{ "is_error": true }`)),
-			},
-		},
-		ExpectedError: channels.ErrConnectionThrottled,
-	},
-	{
-		Label:   "Response is invalid JSON",
-		MsgText: "Error",
-		MsgURN:  "instagram:12345",
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`bad json`)),
-			},
-		},
-		ExpectedError: channels.ErrResponseUnparseable,
-	},
-	{
-		Label:   "Response is channel specific error",
-		MsgText: "Error",
-		MsgURN:  "instagram:12345",
-		MockResponses: map[string][]*httpx.MockResponse{
-			"https://graph.facebook.com/v25.0/me/messages*": {
-				httpx.NewMockResponse(200, nil, []byte(`{ "error": {"message": "The image size is too large.","code": 36000 }}`)),
-			},
-		},
-		ExpectedError: channels.ErrFailedWithReason("36000", "The image size is too large."),
-	},
+	RunIncomingTests(t, instgramTestChannels, newHandler("IG", "Instagram"), "testdata/instagram_incoming.json", &IncomingOptions{Sign: addValidSignature, NoInvalidChannelCheck: true})
 }
 
 func TestInstagramOutgoing(t *testing.T) {
 	// shorter max msg length for testing
 	maxMsgLength = 100
 
-	var channel = test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "IG", "12345", "", []string{urns.Instagram.Prefix}, map[string]any{models.ConfigAuthToken: "a123"})
+	ch := test.NewMockChannel("8eb23e93-5ecb-45ba-b726-3b064e0c56ab", "IG", "12345", "", []string{urns.Instagram.Prefix}, map[string]any{models.ConfigAuthToken: "a123"})
 
 	checkRedacted := []string{"wac_admin_system_user_token", "missing_facebook_app_secret", "missing_facebook_webhook_secret", "a123"}
 
-	RunOutgoingTestCases(t, channel, newHandler("IG", "Instagram"), instagramOutgoingTests, checkRedacted, nil)
-}
-
-func TestInstgramVerify(t *testing.T) {
-	RunIncomingTestCases(t, instgramTestChannels, newHandler("IG", "Instagram"), []IncomingTestCase{
-		{
-			Label:                 "Valid Secret",
-			URL:                   "/c/ig/receive?hub.mode=subscribe&hub.verify_token=fb_webhook_secret&hub.challenge=yarchallenge",
-			ExpectedRespStatus:    200,
-			ExpectedBodyContains:  "yarchallenge",
-			NoLogsExpected:        true,
-			NoInvalidChannelCheck: true,
-		},
-		{
-			Label:                "Verify No Mode",
-			URL:                  "/c/ig/receive",
-			ExpectedRespStatus:   200,
-			ExpectedBodyContains: "unknown request",
-			NoLogsExpected:       true,
-		},
-		{
-			Label:                "Verify No Secret",
-			URL:                  "/c/ig/receive?hub.mode=subscribe",
-			ExpectedRespStatus:   200,
-			ExpectedBodyContains: "token does not match secret",
-			NoLogsExpected:       true,
-		},
-		{
-			Label:                "Invalid Secret",
-			URL:                  "/c/ig/receive?hub.mode=subscribe&hub.verify_token=blah",
-			ExpectedRespStatus:   200,
-			ExpectedBodyContains: "token does not match secret",
-			NoLogsExpected:       true,
-		},
-		{
-			Label:                "Valid Secret",
-			URL:                  "/c/ig/receive?hub.mode=subscribe&hub.verify_token=fb_webhook_secret&hub.challenge=yarchallenge",
-			ExpectedRespStatus:   200,
-			ExpectedBodyContains: "yarchallenge",
-			NoLogsExpected:       true,
-		},
-	})
+	RunOutgoingTests(t, ch, newHandler("IG", "Instagram"), "testdata/instagram_outgoing.json", &OutgoingOptions{CheckRedacted: checkRedacted})
 }
 
 func TestInstagramDescribeURN(t *testing.T) {
-	fbGraph := buildMockFBGraphIG(instagramIncomingTests)
-	defer fbGraph.Close()
+	rt := runtime.NewTestRuntime(runtime.NewDefaultConfig())
+	rt.HTTP.Default.Transport = test.MockTransport(map[string][]*httpx.MockResponse{
+		"https://graph.facebook.com/1337?access_token=a123": {
+			httpx.NewMockResponse(200, nil, []byte(`{"name": "John Doe"}`)),
+		},
+		"https://graph.facebook.com/4567?access_token=a123": {
+			httpx.NewMockResponse(200, nil, []byte(`{"name": ""}`)),
+		},
+	})
 
 	channel := instgramTestChannels[0]
-	handler := newHandler("IG", "Instagram")
-	web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig())).MountHandler(handler)
+	handler := web.NewServer(rt).MountHandler(newHandler("IG", "Instagram"))
 	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, handler.RedactValues(channel))
 
 	tcs := []struct {
@@ -482,34 +68,8 @@ func TestInstagramDescribeURN(t *testing.T) {
 func TestInstagramBuildAttachmentRequest(t *testing.T) {
 	s := web.NewServer(runtime.NewTestRuntime(runtime.NewDefaultConfig()))
 
-	handler := &handler{NewBaseHandler(models.ChannelType("IG"), "Instagram", DisableUUIDRouting())}
-	s.MountHandler(handler)
+	handler := s.MountHandler(newHandler("IG", "Instagram")).(*handler)
 	req, _ := handler.BuildAttachmentRequest(context.Background(), facebookTestChannels[0], "https://example.org/v1/media/41", nil)
 	assert.Equal(t, "https://example.org/v1/media/41", req.URL.String())
 	assert.Equal(t, http.Header{}, req.Header)
-}
-
-// mocks the call to the Facebook graph API
-func buildMockFBGraphIG(testCases []IncomingTestCase) *httptest.Server {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		accessToken := r.URL.Query().Get("access_token")
-		defer r.Body.Close()
-
-		// invalid auth token
-		if accessToken != "a123" {
-			http.Error(w, "invalid auth token", http.StatusForbidden)
-		}
-
-		// user has a name
-		if strings.HasSuffix(r.URL.Path, "1337") {
-			w.Write([]byte(`{ "name": "John Doe"}`))
-			return
-		}
-
-		// no name
-		w.Write([]byte(`{ "name": ""}`))
-	}))
-	graphURL = server.URL
-
-	return server
 }

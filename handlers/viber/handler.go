@@ -17,16 +17,20 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
 const (
 	configViberWelcomeMessage = "welcome_message"
+	configButtonLayout        = "button_layout"
+
+	viberSignatureHeader = "X-Viber-Content-Signature"
+	sendURL              = "https://chatapi.viber.com/pa/send_message"
 )
 
 var (
-	viberSignatureHeader = "X-Viber-Content-Signature"
-	sendURL              = "https://chatapi.viber.com/pa/send_message"
 	maxMsgLength         = 7000
 	descriptionMaxLength = 512
 
@@ -60,21 +64,18 @@ var (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("VP"), "Viber")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("VP"), "Viber")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindAny, handlers.JSONPayload(h.receiveAny))
+	return h
 }
 
 type eventPayload struct {
@@ -115,26 +116,26 @@ type welcomeMessagePayload struct {
 	Sender       map[string]string `json:"sender,omitempty"`
 }
 
-// receiveEvent is our HTTP handler function for incoming messages
-func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *eventPayload, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := h.validateSignature(channel, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+// receiveAny is our receive function for the single URL Viber delivers messages, statuses, contact events and
+// its verification handshake through
+func (h *handler) receiveAny(ctx context.Context, channel *models.Channel, r *http.Request, payload *eventPayload, in *channels.Received, clog *models.ChannelLog) error {
+	if err := h.validateSignature(channel, r); err != nil {
+		return channels.Unauthenticated(err)
 	}
 
 	event := payload.Event
 	switch event {
 	case "webhook":
-		clog.Type = models.ChannelLogTypeWebhookVerify
+		in.As(channels.ReceiveKindVerify)
 
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "webhook valid")
+		return channels.Ignore("webhook valid")
 
 	case "conversation_started":
-		clog.Type = models.ChannelLogTypeEventReceive
+		in.As(channels.ReceiveKindEvent)
 
 		msgText := channel.StringConfigForKey(configViberWelcomeMessage, "")
 		if msgText == "" {
-			return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignored conversation start")
+			return channels.Ignore("ignored conversation start")
 		}
 
 		viberID := payload.User.ID
@@ -143,20 +144,17 @@ func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w h
 		// build the URN
 		urn, err := urns.New(urns.Viber, viberID)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid viber id"))
+			return errors.New("invalid viber id")
 		}
 		// build the channel event
 		channelEvent := models.NewChannelEvent(channel, models.EventTypeWelcomeMessage, urn, clog).WithContactName(ContactName)
+		in.Event(channelEvent)
 
-		err = models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
-		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-		}
-
-		return []channels.Event{channelEvent}, writeWelcomeMessageResponse(w, channel, channelEvent)
+		// the response to this is itself the welcome message, so the standard responses can't say it
+		return welcomeMessageReply(channel, channelEvent)
 
 	case "subscribed":
-		clog.Type = models.ChannelLogTypeEventReceive
+		in.As(channels.ReceiveKindEvent)
 
 		viberID := payload.User.ID
 		ContactName := payload.User.Name
@@ -164,57 +162,44 @@ func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w h
 		// build the URN
 		urn, err := urns.New(urns.Viber, viberID)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid viber id"))
+			return errors.New("invalid viber id")
 		}
 
-		// build the channel event
-		channelEvent := models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(ContactName)
-
-		err = models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
-		if err != nil {
-			return nil, err
-		}
-
-		return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
+		in.Event(models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(ContactName))
+		return nil
 
 	case "unsubscribed":
-		clog.Type = models.ChannelLogTypeEventReceive
+		in.As(channels.ReceiveKindEvent)
 
 		viberID := payload.UserID
 
 		// build the URN
 		urn, err := urns.New(urns.Viber, viberID)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid viber id"))
-		}
-		// build the channel event
-		channelEvent := models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
-
-		err = models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
-		if err != nil {
-			return nil, err
+			return errors.New("invalid viber id")
 		}
 
-		return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
+		in.Event(models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog))
+		return nil
 
 	case "failed":
-		clog.Type = models.ChannelLogTypeMsgStatus
+		in.As(channels.ReceiveKindStatus)
 
-		msgStatus := models.NewStatusUpdateByExternalID(channel, fmt.Sprintf("%d", payload.MessageToken), models.MsgStatusFailed, clog)
-		return handlers.WriteMsgStatusAndResponse(ctx, h, channel, msgStatus, w, r)
+		in.Status(models.NewStatusUpdateByExternalID(channel, fmt.Sprintf("%d", payload.MessageToken), models.MsgStatusFailed, clog))
+		return nil
 
 	case "delivered":
-		clog.Type = models.ChannelLogTypeMsgStatus
+		in.As(channels.ReceiveKindStatus)
 
 		// we ignore delivered events for viber as they send these for incoming messages too and its not worth the db hit to verify that
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring delivered status")
+		return channels.Ignore("ignoring delivered status")
 
 	case "message":
-		clog.Type = models.ChannelLogTypeMsgReceive
+		in.As(channels.ReceiveKindMsg)
 
 		sender := payload.Sender.ID
 		if sender == "" {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing required sender id"))
+			return fmt.Errorf("missing required sender id")
 		}
 
 		contactName := payload.Sender.Name
@@ -222,7 +207,7 @@ func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w h
 		// create our URN
 		urn, err := urns.New(urns.Viber, sender)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid viber id"))
+			return errors.New("invalid viber id")
 		}
 
 		text := payload.Message.Text
@@ -254,11 +239,11 @@ func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w h
 			text = payload.Message.Text
 
 		default:
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown message type: %s", messageType))
+			return fmt.Errorf("unknown message type: %s", messageType)
 		}
 
 		if text == "" && mediaURL == "" {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing text or media in message in request body"))
+			return fmt.Errorf("missing text or media in message in request body")
 		}
 
 		// build our msg
@@ -266,15 +251,14 @@ func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w h
 		if mediaURL != "" {
 			msg.WithAttachment(mediaURL)
 		}
-		// and finally write our message
-		return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+		in.Msg(msg)
+		return nil
 	}
 
-	return nil, channels.WriteError(w, http.StatusBadRequest, fmt.Errorf("not handled, unknown event: %s", event))
+	return fmt.Errorf("not handled, unknown event: %s", event)
 }
 
-func writeWelcomeMessageResponse(w http.ResponseWriter, channel *models.Channel, event channels.Event) error {
-
+func welcomeMessageReply(channel *models.Channel, event channels.Event) error {
 	authToken := channel.StringConfigForKey(models.ConfigAuthToken, "")
 	msgText := channel.StringConfigForKey(configViberWelcomeMessage, "")
 	payload := welcomeMessagePayload{
@@ -284,15 +268,7 @@ func writeWelcomeMessageResponse(w http.ResponseWriter, channel *models.Channel,
 		TrackingData: string(event.EventUUID()),
 	}
 
-	responseBody := &bytes.Buffer{}
-	err := json.NewEncoder(responseBody).Encode(payload)
-	if err != nil {
-		return nil
-	}
-
-	w.WriteHeader(200)
-	_, err = fmt.Fprint(w, responseBody)
-	return err
+	return channels.Reply("application/json", jsonx.MustMarshal(payload))
 }
 
 // see https://developers.viber.com/docs/api/rest-bot-api/#callbacks
@@ -359,7 +335,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 	var keyboard *Keyboard
 
 	if len(qrs) > 0 {
-		buttonLayout := msg.Channel().ConfigForKey("button_layout", map[string]any{}).(map[string]any)
+		buttonLayout := msg.Channel().ConfigForKey(configButtonLayout, map[string]any{}).(map[string]any)
 		keyboard = NewKeyboardFromReplies(qrs, buttonLayout)
 	}
 

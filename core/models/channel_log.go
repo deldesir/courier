@@ -12,19 +12,34 @@ import (
 )
 
 const (
-	ChannelLogTypeUnknown         svclogs.Type = "unknown"
-	ChannelLogTypeMsgSend         svclogs.Type = "msg_send"
+	ChannelLogTypeUnknown svclogs.Type = "unknown"
+	ChannelLogTypeMsgSend svclogs.Type = "msg_send"
+
+	// ChannelLogTypeReceive covers everything a provider sends us about a contact - a message, a channel event,
+	// or a request carrying several of those. Which it was is visible in the log's own request and response, so
+	// splitting it further only gave the log viewer labels too alike to tell apart.
+	ChannelLogTypeReceive svclogs.Type = "receive"
+
+	// ChannelLogTypeMsgStatus is a provider reporting on a message we sent, which is worth its own type because
+	// it's the one an operator filters for when chasing a message that never left 'sent'.
+	ChannelLogTypeMsgStatus svclogs.Type = "msg_status"
+
 	ChannelLogTypeEventSend       svclogs.Type = "event_send"
-	ChannelLogTypeMsgStatus       svclogs.Type = "msg_status"
-	ChannelLogTypeMsgReceive      svclogs.Type = "msg_receive"
-	ChannelLogTypeEventReceive    svclogs.Type = "event_receive"
-	ChannelLogTypeMultiReceive    svclogs.Type = "multi_receive"
 	ChannelLogTypeAttachmentFetch svclogs.Type = "attachment_fetch"
 	ChannelLogTypeTokenRefresh    svclogs.Type = "token_refresh"
 	ChannelLogTypePageSubscribe   svclogs.Type = "page_subscribe"
 	ChannelLogTypeWebhookVerify   svclogs.Type = "webhook_verify"
 	ChannelLogTypeChatStart       svclogs.Type = "chat_start"
+	ChannelLogTypeChatHistory     svclogs.Type = "chat_history"
+	ChannelLogTypeChatUpload      svclogs.Type = "chat_upload"
 )
+
+// ErrorRequestUnparseable is used when we couldn't fully decode an incoming request but carried on with what
+// we could read - the failure is recorded here rather than answered, so that it's visible without the provider
+// being told to retry a body we'll never be able to parse.
+func ErrorRequestUnparseable(err error) *svclogs.Error {
+	return &svclogs.Error{Code: "request_unparseable", Message: fmt.Sprintf("Unable to parse request: %s.", err)}
+}
 
 func ErrorResponseStatusCode() *svclogs.Error {
 	return &svclogs.Error{Code: "response_status_code", Message: "Unexpected response status code."}
@@ -49,6 +64,10 @@ func ErrorMediaUnsupported(contentType string) *svclogs.Error {
 // ErrorMediaUnresolveable is used when media is unresolveable due to the channel's specific requirements
 func ErrorMediaUnresolveable(contentType string) *svclogs.Error {
 	return &svclogs.Error{Code: "media_unresolveable", Message: fmt.Sprintf("Unable to find version of %s attachment compatible with channel.", contentType)}
+}
+
+func ErrorContactLimitReached(limit int) *svclogs.Error {
+	return &svclogs.Error{Code: "contact_limit_reached", Message: fmt.Sprintf("Workspace has reached its limit of %d contacts so no new contact could be created.", limit)}
 }
 
 func ErrorAttachmentNotDecodable() *svclogs.Error {

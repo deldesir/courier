@@ -18,13 +18,14 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/goflow/core/events"
 )
 
-var (
+const (
 	// callback API events
 	eventTypeServerVerification = "confirmation"
 	eventTypeNewMessage         = "message_new"
@@ -82,20 +83,18 @@ var (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("VK"), "VK")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("VK"), "VK")}
 
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeUnknown, handlers.JSONPayload(h, h.receiveEvent))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindAny, handlers.JSONPayload(h.receiveAny))
+	return h
 }
 
 // base body to callback API event
@@ -196,52 +195,44 @@ type mediaUploadInfoPayload struct {
 	OwnerId int64 `json:"owner_id"`
 }
 
-// receiveEvent handles request event type
-func (h *handler) receiveEvent(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveAny is our receive function for the single URL VK delivers both messages and its verification
+// handshake through
+func (h *handler) receiveAny(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	// check shared secret key before proceeding
 	secret := channel.StringConfigForKey(models.ConfigSecret, "")
 
 	if !utils.SecretEqual(payload.SecretKey, secret) {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("wrong secret key"))
+		return channels.Unauthenticated(errors.New("wrong secret key"))
 	}
 	// check event type and decode body to correspondent struct
 	switch payload.Type {
 	case eventTypeServerVerification:
-		clog.Type = models.ChannelLogTypeWebhookVerify
+		in.As(channels.ReceiveKindVerify)
 
-		return h.verifyServer(channel, w)
+		return channels.Reply("text/plain", []byte(channel.StringConfigForKey(configServerVerificationString, "")))
 
 	case eventTypeNewMessage:
-		clog.Type = models.ChannelLogTypeMsgReceive
+		in.As(channels.ReceiveKindMsg)
 
 		newMessage := &moNewMessagePayload{}
 
 		if err := handlers.DecodeAndValidateJSON(newMessage, r); err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return err
 		}
-		return h.receiveMessage(ctx, channel, w, r, newMessage, clog)
+		return h.receiveMessage(channel, newMessage, in, clog)
 
 	default:
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, no message or server verification event")
+		return channels.Ignore("ignoring request, no message or server verification event")
 	}
 }
 
-// verifyServer handles VK's callback verification
-func (h *handler) verifyServer(channel *models.Channel, w http.ResponseWriter) ([]channels.Event, error) {
-	verificationString := channel.StringConfigForKey(configServerVerificationString, "")
-	// write required response
-	_, err := fmt.Fprint(w, verificationString)
-
-	return nil, err
-}
-
 // receiveMessage handles new message event
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moNewMessagePayload, clog *models.ChannelLog) ([]channels.Event, error) {
+func (h *handler) receiveMessage(channel *models.Channel, payload *moNewMessagePayload, in *channels.Received, clog *models.ChannelLog) error {
 	userId := payload.Object.Message.UserId
 	urn, err := urns.New(urns.VK, strconv.FormatInt(userId, 10))
 
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 	date := time.Unix(payload.Object.Message.Date, 0).UTC()
 	text := payload.Object.Message.Text
@@ -253,16 +244,17 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 	}
 	// check for empty content
 	if msg.Text() == "" && len(msg.Attachments()) == 0 {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("no text or attachment"))
+		return errors.New("no text or attachment")
 	}
-	// save message to our backend
-	if err := models.WriteMsg(ctx, h.Runtime(), msg, clog); err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-	// write required response
-	_, err = fmt.Fprint(w, responseIncomingMessage)
 
-	return []channels.Event{msg}, err
+	in.Msg(msg)
+	return nil
+}
+
+// RespondMsgs writes the body VK requires for a message it delivered
+func (h *handler) RespondMsgs(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
+	_, err := fmt.Fprint(w, responseIncomingMessage)
+	return err
 }
 
 // DescribeURN handles VK contact details

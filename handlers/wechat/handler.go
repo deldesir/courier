@@ -20,15 +20,15 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/goflow/core/events"
 )
 
-var (
-	sendURL      = "https://api.weixin.qq.com/cgi-bin"
-	maxMsgLength = 1600
-)
+const sendURL = "https://api.weixin.qq.com/cgi-bin"
+
+var maxMsgLength = 1600
 
 const (
 	configAppID     = "wechat_app_id"
@@ -36,7 +36,7 @@ const (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
@@ -45,18 +45,15 @@ type handler struct {
 	fetchTokenMutex sync.Mutex
 }
 
-func newHandler() channels.Handler {
-	return &handler{
-		BaseHandler:     handlers.NewBaseHandler(models.ChannelType("WC"), "WeChat"),
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{
+		BaseHandler:     handlers.NewBaseHandler(rt, models.ChannelType("WC"), "WeChat"),
 		fetchTokenMutex: sync.Mutex{},
 	}
-}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
 	r.Add(h, http.MethodGet, "", models.ChannelLogTypeWebhookVerify, h.VerifyURL)
-	r.Add(h, http.MethodPost, "", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
+	r.AddReceive(h, http.MethodPost, "", channels.ReceiveKindMsg, handlers.XMLPayload(h.receiveMessage))
+	return h
 }
 
 type verifyForm struct {
@@ -71,7 +68,7 @@ func (h *handler) VerifyURL(ctx context.Context, channel *models.Channel, w http
 	form := &verifyForm{}
 	err := handlers.DecodeAndValidateForm(form, r)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return nil, channels.RespondRequestError(ctx, h, w, r, channel, err)
 	}
 
 	dictOrder := []string{channel.StringConfigForKey(models.ConfigSecret, ""), form.Timestamp, form.Nonce}
@@ -107,43 +104,33 @@ type moPayload struct {
 	MediaID      string `xml:"MediaId"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	payload := &moPayload{}
-	err := handlers.DecodeAndValidateXML(payload, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.MsgID == "" && payload.Event == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing parameters, must have either 'MsgId' or 'Event'"))
+		return fmt.Errorf("missing parameters, must have either 'MsgId' or 'Event'")
 	}
 
 	date := time.Unix(payload.CreateTime/1000, payload.CreateTime%1000*1000000).UTC()
 	urn, err := urns.New(urns.WeChat, payload.FromUsername)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// subscribe event, trigger a new conversation
 	if payload.MsgType == "event" && payload.Event == "subscribe" {
-		clog.Type = models.ChannelLogTypeEventReceive
+		in.As(channels.ReceiveKindEvent)
 
 		channelEvent := models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog)
 
-		err := models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
-		if err != nil {
-			return nil, err
-		}
-
-		return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
+		in.Event(channelEvent)
+		return nil
 	}
 
 	// unknown event type (we only deal with subscribe)
 	if payload.MsgType == "event" {
-		clog.Type = models.ChannelLogTypeEventReceive
+		in.As(channels.ReceiveKindEvent)
 
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "unknown event type")
+		return channels.Ignore("unknown event type")
 	}
 
 	// create our message
@@ -153,12 +140,12 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		msg.WithAttachment(mediaURL)
 	}
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
-// WriteMsgSuccessResponse writes our response
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
+// RespondMsgs writes our response
+func (h *handler) RespondMsgs(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.WriteHeader(200)
 	_, err := fmt.Fprint(w, "") // WeChat expected empty string to not retry looking for passive reply
 	return err

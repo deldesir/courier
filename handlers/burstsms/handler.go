@@ -11,11 +11,13 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/httpx"
 )
 
+const sendURL = "https://api.transmitsms.com/send-sms.json"
+
 var (
-	sendURL      = "https://api.transmitsms.com/send-sms.json"
 	maxMsgLength = 612
 	statusMap    = map[string]models.MsgStatus{
 		"delivered":   models.MsgStatusDelivered,
@@ -26,25 +28,22 @@ var (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("BS"), "Burst SMS")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("BS"), "Burst SMS")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	receiveHandler := handlers.NewTelReceiveHandler(h, "mobile", "response")
-	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeMsgReceive, receiveHandler)
+	receiveHandler := handlers.NewTelReceiveHandler("mobile", "response")
+	r.AddReceive(h, http.MethodGet, "receive", channels.ReceiveKindMsg, receiveHandler)
 
-	statusHandler := handlers.NewExternalIDStatusHandler(h, statusMap, "message_id", "status")
-	r.Add(h, http.MethodGet, "status", models.ChannelLogTypeMsgStatus, statusHandler)
-	return nil
+	statusHandler := handlers.NewExternalIDStatusHandler(statusMap, "message_id", "status")
+	r.AddReceive(h, http.MethodGet, "status", channels.ReceiveKindStatus, statusHandler)
+	return h
 }
 
 //	{

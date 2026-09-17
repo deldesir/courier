@@ -1,76 +1,105 @@
 package handlers
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
-	"time"
+	"slices"
+	"strings"
 
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-// NewTelReceiveHandler creates a new receive handler given the passed in text and from fields
-func NewTelReceiveHandler(h channels.Handler, fromField string, bodyField string) channels.HandleFunc {
-	return func(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-		err := r.ParseForm()
-		if err != nil {
-			return nil, WriteAndLogRequestError(ctx, h, c, w, r, err)
+// UnknownStatusError creates the error for a status value that isn't in the given mapping, listing the values
+// that are - from the mapping itself, so the message can't drift from the map.
+func UnknownStatusError[K cmp.Ordered](statuses map[K]models.MsgStatus, value K) error {
+	vals := make([]string, 0, len(statuses))
+	for _, k := range slices.Sorted(maps.Keys(statuses)) {
+		vals = append(vals, fmt.Sprintf("'%v'", k))
+	}
+	return fmt.Errorf("unknown status '%v', must be one of %s", value, strings.Join(vals, ", "))
+}
+
+// NewTelReceiveHandler creates a new receive function given the passed in text and from fields
+func NewTelReceiveHandler(fromField string, bodyField string) channels.ReceiveFunc {
+	return func(ctx context.Context, c *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+		if err := r.ParseForm(); err != nil {
+			return err
 		}
 
 		body := r.Form.Get(bodyField)
 		from := r.Form.Get(fromField)
 		if from == "" {
-			return nil, WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("missing required field '%s'", fromField))
+			return fmt.Errorf("missing required field '%s'", fromField)
 		}
-		// create our URN
+
 		urn, err := urns.ParsePhone(from, c.Country(), true, false)
 		if err != nil {
-			return nil, WriteAndLogRequestError(ctx, h, c, w, r, err)
+			return err
 		}
-		// build our msg
-		msg := models.NewIncomingMsg(c, urn, body, "", clog).WithReceivedOn(time.Now().UTC())
-		return WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+
+		in.Msg(models.NewIncomingMsg(c, urn, body, "", clog).WithReceivedOn(dates.Now().UTC()))
+		return nil
 	}
 }
 
-// NewExternalIDStatusHandler creates a new status handler given the passed in status map and fields
-func NewExternalIDStatusHandler(h channels.Handler, statuses map[string]models.MsgStatus, externalIDField string, statusField string) channels.HandleFunc {
-	return func(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-		err := r.ParseForm()
-		if err != nil {
-			return nil, WriteAndLogRequestError(ctx, h, c, w, r, err)
+// NewExternalIDStatusHandler creates a new status receive function given the passed in status map and fields
+func NewExternalIDStatusHandler(statuses map[string]models.MsgStatus, externalIDField string, statusField string) channels.ReceiveFunc {
+	return func(ctx context.Context, c *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+		if err := r.ParseForm(); err != nil {
+			return err
 		}
 
 		externalID := r.Form.Get(externalIDField)
 		if externalID == "" {
-			return nil, WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("missing required field '%s'", externalIDField))
+			return fmt.Errorf("missing required field '%s'", externalIDField)
 		}
 
 		s := r.Form.Get(statusField)
 		sValue, found := statuses[s]
 		if !found {
-			return nil, WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("unknown status value '%s'", s))
+			return UnknownStatusError(statuses, s)
 		}
 
-		// create our status
-		status := models.NewStatusUpdateByExternalID(c, externalID, sValue, clog)
-		return WriteMsgStatusAndResponse(ctx, h, c, status, w, r)
+		in.Status(models.NewStatusUpdateByExternalID(c, externalID, sValue, clog))
+		return nil
 	}
 }
 
-type JSONHandlerFunc[T any] func(context.Context, *models.Channel, http.ResponseWriter, *http.Request, *T, *models.ChannelLog) ([]channels.Event, error)
+// PayloadReceiveFunc is a receive function for a provider whose request body is decoded and validated into a
+// payload struct before the handler sees it. JSONPayload, FormPayload and XMLPayload each adapt one into a
+// plain receive function, differing only in how they decode.
+type PayloadReceiveFunc[T any] func(context.Context, *models.Channel, *http.Request, *T, *channels.Received, *models.ChannelLog) error
 
-func JSONPayload[T any](h channels.Handler, handlerFunc JSONHandlerFunc[T]) channels.HandleFunc {
-	return func(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// JSONPayload adapts a receive function for a provider that sends JSON, decoding and validating it first
+func JSONPayload[T any](fn PayloadReceiveFunc[T]) channels.ReceiveFunc {
+	return withPayload(fn, DecodeAndValidateJSON)
+}
+
+// FormPayload adapts a receive function for a provider that sends form values, decoding and validating them
+// first. Handlers that must check a signature over the raw body decode for themselves instead.
+func FormPayload[T any](fn PayloadReceiveFunc[T]) channels.ReceiveFunc {
+	return withPayload(fn, DecodeAndValidateForm)
+}
+
+// XMLPayload adapts a receive function for a provider that sends XML, decoding and validating it first
+func XMLPayload[T any](fn PayloadReceiveFunc[T]) channels.ReceiveFunc {
+	return withPayload(fn, DecodeAndValidateXML)
+}
+
+// withPayload is the shared shape of the three adapters above: decode into a new T, then hand it to the
+// receive function - which never has to consider a request it couldn't be parsed from.
+func withPayload[T any](fn PayloadReceiveFunc[T], decode func(any, *http.Request) error) channels.ReceiveFunc {
+	return func(ctx context.Context, c *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
 		payload := new(T)
-
-		err := DecodeAndValidateJSON(payload, r)
-		if err != nil {
-			return nil, WriteAndLogRequestError(ctx, h, c, w, r, err)
+		if err := decode(payload, r); err != nil {
+			return err
 		}
-
-		return handlerFunc(ctx, c, w, r, payload, clog)
+		return fn(ctx, c, r, payload, in, clog)
 	}
 }

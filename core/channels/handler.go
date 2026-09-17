@@ -17,7 +17,10 @@ type Event interface {
 	EventUUID() uuids.UUID
 }
 
-// HandleFunc is the interface handlers must satisfy to handle incoming requests.
+// HandleFunc is the raw form of a route: it owns the whole exchange, writing the response itself and
+// returning the events it created. Routes that receive events don't implement this directly - they register
+// a ReceiveFunc with AddReceive and the seam handles the exchange for them - so this is the form for routes
+// that aren't receiving anything: verification handshakes, CORS preflights, contact registration.
 // The server takes care of looking up the channel by UUID before passing it to this function.
 // Errors in format of the request or by the caller should be handled and logged internally. Errors in
 // execution or in courier itself should be passed back.
@@ -25,11 +28,6 @@ type HandleFunc func(context.Context, *models.Channel, http.ResponseWriter, *htt
 
 // Handler is the interface all channel handlers must satisfy
 type Handler interface {
-	// SetRuntime is called before Initialize to give the handler the runtime it should use. Handlers embedding
-	// handlers.BaseHandler get it from there rather than implementing it themselves.
-	SetRuntime(*runtime.Runtime)
-
-	Initialize(*Routes) error
 	Runtime() *runtime.Runtime
 	ChannelType() models.ChannelType
 	ChannelName() string
@@ -51,10 +49,10 @@ type Handler interface {
 	SendableEvents(*models.Channel) map[string]time.Duration
 	SendEvent(context.Context, *models.Channel, events.Event, *models.ChannelLog) error
 
-	WriteStatusSuccessResponse(context.Context, http.ResponseWriter, []*models.StatusUpdate) error
-	WriteMsgSuccessResponse(context.Context, http.ResponseWriter, []*models.MsgIn) error
-	WriteRequestError(context.Context, http.ResponseWriter, error) error
-	WriteRequestIgnored(context.Context, http.ResponseWriter, string) error
+	RespondStatuses(context.Context, http.ResponseWriter, []*models.StatusUpdate) error
+	RespondMsgs(context.Context, http.ResponseWriter, []*models.MsgIn) error
+	RespondError(context.Context, http.ResponseWriter, error) error
+	RespondIgnored(context.Context, http.ResponseWriter, string) error
 }
 
 // AttachmentRequestBuilder is the interface handlers which can allow a custom way to download attachment media for messages should satisfy
@@ -62,9 +60,25 @@ type AttachmentRequestBuilder interface {
 	BuildAttachmentRequest(context.Context, *models.Channel, string, *models.ChannelLog) (*http.Request, error)
 }
 
-// RegisterHandler adds a new handler for a channel type, this is called by individual handlers when they are initialized
-func RegisterHandler(handler Handler) {
-	registeredHandlers[handler.ChannelType()] = handler
+// NewHandlerFunc constructs a handler with the runtime it should use, registering the routes it serves as it goes.
+// Handlers register one from their package init(), and the server invokes them all at startup once the runtime
+// exists.
+type NewHandlerFunc func(*runtime.Runtime, *Routes) Handler
+
+// RegisterHandler adds a new handler constructor, called by individual handler packages from init()
+func RegisterHandler(newFn NewHandlerFunc) {
+	registeredHandlerFuncs = append(registeredHandlerFuncs, newFn)
+}
+
+// RegisteredHandlerFuncs returns the handler constructors compiled into this build, for the server to invoke at startup
+func RegisteredHandlerFuncs() []NewHandlerFunc {
+	return registeredHandlerFuncs
+}
+
+// ActivateHandler marks a constructed handler as one this instance is serving, making it available to lookups
+// by channel type
+func ActivateHandler(handler Handler) {
+	activeHandlers[handler.ChannelType()] = handler
 
 	// handlers which can describe URNs are registered with the models package so contact creation can use them
 	if describer, ok := handler.(models.URNDescriber); ok {
@@ -72,32 +86,13 @@ func RegisterHandler(handler Handler) {
 	}
 }
 
-// GetHandler returns the handler for the passed in channel type, or nil if not found
+// GetHandler returns the handler this instance is serving for the given channel type, or nil if not found -
+// which is how sending fails fast for a channel this instance doesn't handle.
 func GetHandler(ct models.ChannelType) Handler {
-	return registeredHandlers[ct]
-}
-
-// RegisteredHandlers returns all the handlers compiled into this build, for the server to initialize
-func RegisteredHandlers() []Handler {
-	hs := make([]Handler, 0, len(registeredHandlers))
-	for _, h := range registeredHandlers {
-		hs = append(hs, h)
-	}
-	return hs
-}
-
-// ActivateHandler marks a handler as one this instance is serving, i.e. it was included by config and initialized
-func ActivateHandler(handler Handler) {
-	activeHandlers[handler.ChannelType()] = handler
-}
-
-// GetActiveHandler returns the handler this instance is serving for the given channel type, or nil if that channel
-// type isn't being served - which is how sending fails fast for a channel this instance doesn't handle.
-func GetActiveHandler(ct models.ChannelType) Handler {
 	return activeHandlers[ct]
 }
 
-var registeredHandlers = make(map[models.ChannelType]Handler)
+var registeredHandlerFuncs []NewHandlerFunc
 var activeHandlers = make(map[models.ChannelType]Handler)
 
 // Route is an HTTP route a channel handler serves, added during its initialization

@@ -10,35 +10,32 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 )
 
 const (
 	configServiceID     = "service_id"
 	configChargingLevel = "charging_level"
+
+	sendURL = "https://acsdp.arabiacell.net"
 )
 
-var (
-	sendURL      = "https://acsdp.arabiacell.net"
-	maxMsgLength = 1530
-)
+var maxMsgLength = 1530
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("AC"), "Arabia Cell")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("AC"), "Arabia Cell")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	receiveHandler := handlers.NewTelReceiveHandler(h, "M", "B")
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, receiveHandler)
-	return nil
+	receiveHandler := handlers.NewTelReceiveHandler("M", "B")
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, receiveHandler)
+	return h
 }
 
 // <response>

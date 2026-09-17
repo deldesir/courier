@@ -9,31 +9,28 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/jsonx"
 )
 
-var (
-	maxMsgLength = 1224
-	sendURL      = "https://rest.clicksend.com/v3/sms/send"
-)
+const sendURL = "https://rest.clicksend.com/v3/sms/send"
+
+var maxMsgLength = 1224
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("CS"), "ClickSend")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("CS"), "ClickSend")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.NewTelReceiveHandler(h, "from", "body"))
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.NewTelReceiveHandler("from", "body"))
+	return h
 }
 
 //	{

@@ -12,39 +12,33 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
 const (
-	configBaseURL          = "base_url"
-	configUsername         = "username"
-	configPassword         = "password"
 	configIncomingPrefixes = "incoming_prefixes"
+
+	sendURL = "%s/broker-api/send"
 )
 
-var (
-	maxMsgLength = 640
-	sendURL      = "%s/broker-api/send"
-)
+var maxMsgLength = 640
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("PM"), "Play Mobile")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("PM"), "Play Mobile")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.XMLPayload(h.receiveMessage))
+	return h
 }
 
 // {
@@ -93,31 +87,22 @@ type mtResponse struct {
 	} `xml:"message"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	payload := &mtResponse{}
-	err := handlers.DecodeAndValidateXML(payload, r)
-
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, r *http.Request, payload *mtResponse, in *channels.Received, clog *models.ChannelLog) error {
 	if len(payload.Message) == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "no messages, ignored")
+		return channels.Ignore("no messages, ignored")
 	}
-
-	msgs := make([]*models.MsgIn, 0, 1)
 
 	// parse each inbound message
 	for _, pmMsg := range payload.Message {
 		if pmMsg.MSIDSN == "" || pmMsg.ID == "" {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("missing required fields msidsn or id"))
+			return fmt.Errorf("missing required fields msidsn or id")
 		}
 
 		// create our URN
 		urn, err := urns.ParsePhone(pmMsg.MSIDSN, c.Country(), true, false)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+			return err
 		}
 
 		// remove message prefix according to a list of possible prefixes, useful for free accounts. Channel config is
@@ -139,21 +124,20 @@ func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, w http.
 
 		// build our msg
 		if pmMsg.Content.Text == "" {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, errors.New("no text"))
+			return errors.New("no text")
 		}
 		msg := models.NewIncomingMsg(c, urn, pmMsg.Content.Text, pmMsg.ID, clog)
-		msgs = append(msgs, msg)
+		in.Msg(msg)
 	}
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, msgs, w, r, clog)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
-	username := msg.Channel().StringConfigForKey(configUsername, "")
-	password := msg.Channel().StringConfigForKey(configPassword, "")
+	username := msg.Channel().StringConfigForKey(models.ConfigUsername, "")
+	password := msg.Channel().StringConfigForKey(models.ConfigPassword, "")
 	shortCode := msg.Channel().Address()
-	baseURL := msg.Channel().StringConfigForKey(configBaseURL, "")
+	baseURL := msg.Channel().StringConfigForKey(models.ConfigBaseURL, "")
 	if username == "" || password == "" || shortCode == "" || baseURL == "" {
 		return channels.ErrChannelConfig
 	}

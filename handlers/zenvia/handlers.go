@@ -13,15 +13,17 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	maxMsgLength    = 1152
+const (
 	whatsappSendURL = "https://api.zenvia.com/v2/channels/whatsapp/messages"
 	smsSendURL      = "https://api.zenvia.com/v2/channels/sms/messages"
 )
+
+var maxMsgLength = 1152
 
 func init() {
 	channels.RegisterHandler(newHandler("ZVW", "Zenvia WhatsApp"))
@@ -32,15 +34,13 @@ type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler(channelType models.ChannelType, name string) channels.Handler {
-	return &handler{handlers.NewBaseHandler(channelType, name)}
-}
-
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, handlers.JSONPayload(h, h.receiveStatus))
-	return nil
+func newHandler(channelType models.ChannelType, name string) channels.NewHandlerFunc {
+	return func(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+		h := &handler{handlers.NewBaseHandler(rt, channelType, name)}
+		r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+		r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, handlers.JSONPayload(h.receiveStatus))
+		return h
+	}
 }
 
 type moContent struct {
@@ -75,59 +75,63 @@ type moPayload struct {
 	}
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if strings.ToUpper(payload.Type) != "MESSAGE" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unsupported event type: %s", payload.Type))
+		return fmt.Errorf("unsupported event type: %s", payload.Type)
 	}
 
 	// create our date from the timestamp
 	// 2017-05-03T06:04:45Z
 	date, err := time.Parse("2006-01-02T15:04:05Z", payload.Timestamp)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid date format: %s", payload.Timestamp))
+		return fmt.Errorf("invalid date format: %s", payload.Timestamp)
 	}
 
 	if strings.ToUpper(payload.Message.Direction) != "IN" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, not incoming messages")
+		return channels.Ignore("ignoring request, not incoming messages")
 	}
 
 	// create our URN
 	urn, err := urns.New(urns.WhatsApp, payload.Message.From)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid whatsapp id"))
+		return errors.New("invalid whatsapp id")
 	}
 
 	contactName := payload.Visitor.Name
 
-	msgs := []*models.MsgIn{}
+	// the contents of a payload are the parts of a single message and so share its id - we combine them into one
+	// msg with attachments rather than creating a msg per part, which would see all but the first part discarded
+	// as duplicates of the first
+	texts := make([]string, 0, len(payload.Message.Contents))
+	attachments := make([]string, 0, len(payload.Message.Contents))
 
 	for _, content := range payload.Message.Contents {
-
-		text := ""
-		mediaURL := ""
-
-		if content.Type == "text" {
-			text = content.Text
-		} else if content.Type == "location" {
-			mediaURL = fmt.Sprintf("geo:%f,%f", content.Latitude, content.Longitude)
-		} else if content.Type == "file" {
-			mediaURL = content.FileURL
-		} else {
+		switch content.Type {
+		case "text":
+			if content.Text != "" {
+				texts = append(texts, content.Text)
+			}
+		case "location":
+			attachments = append(attachments, fmt.Sprintf("geo:%f,%f", content.Latitude, content.Longitude))
+		case "file":
+			if content.FileURL != "" {
+				attachments = append(attachments, content.FileURL)
+			}
+		default:
 			// we received a message type we do not support.
 			channels.LogRequestError(r, channel, fmt.Errorf("unsupported message type %s", content.Type))
 		}
-
-		// build our msg
-		msg := models.NewIncomingMsg(channel, urn, text, payload.Message.ID, clog).WithReceivedOn(date.UTC()).WithContactName(contactName)
-		if mediaURL != "" {
-			msg.WithAttachment(mediaURL)
-		}
-		msgs = append(msgs, msg)
 	}
 
-	// and finally write our messages
-	return handlers.WriteMsgsAndResponse(ctx, h, msgs, w, r, clog)
+	// build our msg
+	msg := models.NewIncomingMsg(channel, urn, strings.Join(texts, "\n"), payload.Message.ID, clog).WithReceivedOn(date.UTC()).WithContactName(contactName)
+	for _, attachment := range attachments {
+		msg.WithAttachment(attachment)
+	}
+
+	in.Msg(msg)
+	return nil
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -148,10 +152,10 @@ type statusPayload struct {
 	} `json:"messageStatus"`
 }
 
-// receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *statusPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, payload *statusPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if strings.ToUpper(payload.Type) != "MESSAGE_STATUS" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unsupported event type: %s", payload.Type))
+		return fmt.Errorf("unsupported event type: %s", payload.Type)
 	}
 
 	msgStatus, found := statusMapping[strings.ToUpper(payload.MessageStatus.Code)]
@@ -159,9 +163,9 @@ func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w 
 		msgStatus = models.MsgStatusErrored
 	}
 
-	// write our status
 	status := models.NewStatusUpdateByExternalID(channel, payload.MessageID, msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 type mtContent struct {

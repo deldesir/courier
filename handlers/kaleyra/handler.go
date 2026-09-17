@@ -17,35 +17,30 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/urns"
 )
 
 const (
 	configAccountSID = "account_sid"
-	configApiKey     = "api_key"
-)
 
-var (
 	baseURL = "https://api.kaleyra.io"
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("KWA"), "Kaleyra WhatsApp")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("KWA"), "Kaleyra WhatsApp")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeMsgReceive, h.receiveMsg)
-	r.Add(h, http.MethodGet, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	return nil
+	r.AddReceive(h, http.MethodGet, "receive", channels.ReceiveKindMsg, handlers.FormPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodGet, "status", channels.ReceiveKindStatus, handlers.FormPayload(h.receiveStatus))
+	return h
 }
 
 type moMsgForm struct {
@@ -62,33 +57,27 @@ type moStatusForm struct {
 	Status string `name:"status" validate:"required"`
 }
 
-// receiveMsg is our HTTP handler function for incoming messages
-func (h *handler) receiveMsg(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &moMsgForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, form *moMsgForm, in *channels.Received, clog *models.ChannelLog) error {
 	// invalid type? ignore this
 	if form.Type != "text" && form.Type != "image" && form.Type != "video" && form.Type != "voice" && form.Type != "document" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "ignoring request, unknown message type")
+		return channels.Ignore("ignoring request, unknown message type")
 	}
 	// check empty content
 	if form.Body == "" && form.MediaURL == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("no text or media"))
+		return errors.New("no text or media")
 	}
 
 	// build urn
 	urn, err := urns.New(urns.WhatsApp, form.From)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid whatsapp id"))
+		return errors.New("invalid whatsapp id")
 	}
 
 	// parse created_at timestamp
 	ts, err := strconv.ParseInt(form.CreatedAt, 10, 64)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid created_at: %s", form.CreatedAt))
+		return fmt.Errorf("invalid created_at: %s", form.CreatedAt)
 	}
 
 	// build msg
@@ -99,8 +88,8 @@ func (h *handler) receiveMsg(ctx context.Context, channel *models.Channel, w htt
 		msg.WithAttachment(form.MediaURL)
 	}
 
-	// write msg
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -110,33 +99,21 @@ var statusMapping = map[string]models.MsgStatus{
 	"read":      models.MsgStatusRead,
 }
 
-// receiveStatus is our HTTP handler function for outgoing messages statuses
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &moStatusForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, form *moStatusForm, in *channels.Received, clog *models.ChannelLog) error {
 	// unknown status? ignore this
 	msgStatus, found := statusMapping[form.Status]
 	if !found {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, fmt.Sprintf("unknown status: %s", form.Status))
+		return channels.Ignore("unknown status: %s", form.Status)
 	}
 
-	// msg not found? ignore this
-	status := models.NewStatusUpdateByExternalID(channel, form.ID, msgStatus, clog)
-	if status == nil {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, fmt.Sprintf("ignoring request, message %s not found", form.ID))
-	}
-
-	// write status
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(models.NewStatusUpdateByExternalID(channel, form.ID, msgStatus, clog))
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
 	accountSID := msg.Channel().StringConfigForKey(configAccountSID, "")
-	apiKey := msg.Channel().StringConfigForKey(configApiKey, "")
+	apiKey := msg.Channel().StringConfigForKey(models.ConfigAPIKey, "")
 
 	if accountSID == "" || apiKey == "" {
 		return channels.ErrChannelConfig
@@ -239,7 +216,7 @@ func (h *handler) newSendForm(channel *models.Channel, msgType, toContact string
 	statusURL := fmt.Sprintf("https://%s/c/kwa/%s/status", callbackDomain, channel.UUID())
 
 	return map[string]string{
-		"api-key":      channel.StringConfigForKey(configApiKey, ""),
+		"api-key":      channel.StringConfigForKey(models.ConfigAPIKey, ""),
 		"channel":      "WhatsApp",
 		"from":         channel.Address(),
 		"callback_url": statusURL,

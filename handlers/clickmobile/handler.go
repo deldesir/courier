@@ -13,35 +13,35 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "http://206.225.81.36/ucm_api/index.php"
-	maxMsgLength = 160
+const (
+	sendURL = "http://206.225.81.36/ucm_api/index.php"
 
 	configAppID = "app_id"
 	configOrgID = "org_id"
 )
 
+var maxMsgLength = 160
+
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("CM"), "Click Mobile")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("CM"), "Click Mobile")}
 
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodGet, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	return nil
+	r.AddReceive(h, http.MethodGet, "receive", channels.ReceiveKindMsg, handlers.XMLPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.XMLPayload(h.receiveMessage))
+	return h
 }
 
 //  <request>
@@ -59,29 +59,23 @@ type moPayload struct {
 	Text        string   `xml:"text"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	payload := &moPayload{}
-	err := handlers.DecodeAndValidateXML(payload, r)
-	if err != nil {
-		return nil, err
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.Mobile == "" || payload.Shortcode == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing parameters, must have 'mobile' and 'shortcode'"))
+		return fmt.Errorf("missing parameters, must have 'mobile' and 'shortcode'")
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(payload.Mobile, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// build our msg
 	msg := models.NewIncomingMsg(channel, urn, payload.Text, payload.ReferenceID, clog)
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 type mtPayload struct {

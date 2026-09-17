@@ -12,31 +12,29 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "https://highpushfastapi-v2.hcnx.eu/api"
-	maxMsgLength = 1500
-)
+const sendURL = "https://highpushfastapi-v2.hcnx.eu/api"
+
+var maxMsgLength = 1500
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("HX"), "High Connection")}
-}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("HX"), "High Connection")}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodGet, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	return nil
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.FormPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodGet, "status", channels.ReceiveKindStatus, handlers.FormPayload(h.receiveStatus))
+	return h
 }
 
 type moForm struct {
@@ -47,26 +45,21 @@ type moForm struct {
 	ReceiveDate string `name:"RECEPTION_DATE"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &moForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
-	date := time.Now()
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, form *moForm, in *channels.Received, clog *models.ChannelLog) error {
+	date := dates.Now()
 	if form.ReceiveDate != "" {
+		var err error
 		date, err = time.Parse("2006-01-02T15:04:05", form.ReceiveDate)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return err
 		}
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(form.From, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// Hign connection URL encodes escapes ISO 8859 escape sequences
@@ -83,8 +76,8 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 	// build our Message
 	msg := models.NewIncomingMsg(channel, urn, text, msgID, clog).WithReceivedOn(date.UTC())
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 type statusForm struct {
@@ -104,22 +97,16 @@ var statusMapping = map[int]models.MsgStatus{
 	16: models.MsgStatusFailed,
 }
 
-// receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	form := &statusForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, form *statusForm, in *channels.Received, clog *models.ChannelLog) error {
 	msgStatus, found := statusMapping[form.Status]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown status '%d', must be one of 2, 4, 6, 11, 12, 13, 14, 15  or 16", form.Status))
+		return handlers.UnknownStatusError(statusMapping, form.Status)
 	}
 
-	// write our status
 	status := models.NewStatusUpdate(channel, models.MsgUUID(form.RetID), msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {

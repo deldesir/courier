@@ -17,6 +17,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/svclogs"
@@ -24,7 +25,7 @@ import (
 	"github.com/nyaruka/goflow/core/events"
 )
 
-var apiURL = "https://api.telegram.org"
+const apiURL = "https://api.telegram.org"
 
 // see https://core.telegram.org/bots/api#sending-files
 var mediaSupport = map[handlers.MediaType]handlers.MediaTypeSupport{
@@ -35,28 +36,25 @@ var mediaSupport = map[handlers.MediaType]handlers.MediaTypeSupport{
 }
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("TG"), "Telegram")}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("TG"), "Telegram")}
+
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
+	return h
 }
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	return nil
-}
-
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	// no message? ignore this
 	if payload.Message.MessageID == 0 {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "Ignoring request, no message")
+		return channels.Ignore("Ignoring request, no message")
 	}
 
 	// create our date from the timestamp
@@ -65,7 +63,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 	// create our URN
 	urn, err := urns.NewFromParts(urns.Telegram.Prefix, strconv.FormatInt(payload.Message.From.ContactID, 10), nil, strings.ToLower(payload.Message.From.Username))
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// build our name from first and last
@@ -76,12 +74,9 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 
 	// this is a start command, trigger a new conversation
 	if text == "/start" {
-		event := models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(name).WithOccurredOn(date)
-		err = models.WriteChannelEvent(ctx, h.Runtime(), event, clog)
-		if err != nil {
-			return nil, err
-		}
-		return []channels.Event{event}, channels.WriteChannelEventSuccess(w, event)
+		in.As(channels.ReceiveKindEvent)
+		in.Event(models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog).WithContactName(name).WithOccurredOn(date))
+		return nil
 	}
 
 	// normal message of some kind
@@ -137,7 +132,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 
 	// we had an error downloading media
 	if err != nil && text == "" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, fmt.Sprintf("unable to resolve file: %s", err.Error()))
+		return channels.Ignore("unable to resolve file: %s", err.Error())
 	}
 
 	// build our msg
@@ -150,8 +145,8 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		msg.WithPayload(webAppPayload)
 	}
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 // isValidButtonURL approximates Telegram's validation of inline keyboard button URLs, which accepts HTTP(S) and

@@ -20,15 +20,15 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "https://channels.jiochat.com"
-	maxMsgLength = 1600
-)
+const sendURL = "https://channels.jiochat.com"
+
+var maxMsgLength = 1600
 
 const (
 	configAppID     = "jiochat_app_id"
@@ -36,7 +36,7 @@ const (
 )
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
@@ -45,20 +45,17 @@ type handler struct {
 	fetchTokenMutex sync.Mutex
 }
 
-func newHandler() channels.Handler {
-	return &handler{
-		BaseHandler:     handlers.NewBaseHandler(models.ChannelType("JC"), "Jiochat"),
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{
+		BaseHandler:     handlers.NewBaseHandler(rt, models.ChannelType("JC"), "Jiochat"),
 		fetchTokenMutex: sync.Mutex{},
 	}
-}
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
 	r.Add(h, http.MethodGet, "", models.ChannelLogTypeWebhookVerify, h.VerifyURL)
-	r.Add(h, http.MethodPost, "rcv/msg/message", models.ChannelLogTypeMsgReceive, handlers.JSONPayload(h, h.receiveMessage))
-	r.Add(h, http.MethodPost, "rcv/event/menu", models.ChannelLogTypeEventReceive, handlers.JSONPayload(h, h.receiveMessage))
-	r.Add(h, http.MethodPost, "rcv/event/follow", models.ChannelLogTypeEventReceive, handlers.JSONPayload(h, h.receiveMessage))
-	return nil
+	r.AddReceive(h, http.MethodPost, "rcv/msg/message", channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveAny))
+	r.AddReceive(h, http.MethodPost, "rcv/event/menu", channels.ReceiveKindEvent, handlers.JSONPayload(h.receiveAny))
+	r.AddReceive(h, http.MethodPost, "rcv/event/follow", channels.ReceiveKindEvent, handlers.JSONPayload(h.receiveAny))
+	return h
 }
 
 type verifyForm struct {
@@ -73,7 +70,7 @@ func (h *handler) VerifyURL(ctx context.Context, channel *models.Channel, w http
 	form := &verifyForm{}
 	err := handlers.DecodeAndValidateForm(form, r)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return nil, channels.RespondRequestError(ctx, h, w, r, channel, err)
 	}
 
 	dictOrder := []string{channel.StringConfigForKey(configAppSecret, ""), form.Timestamp, form.Nonce}
@@ -109,44 +106,39 @@ type moPayload struct {
 	MediaID      string `json:"MediaId"`
 }
 
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, payload *moPayload, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveAny serves all three of this channel's receive routes, sorting messages from events by payload type
+func (h *handler) receiveAny(ctx context.Context, channel *models.Channel, r *http.Request, payload *moPayload, in *channels.Received, clog *models.ChannelLog) error {
 	if payload.MsgID == "" && payload.Event == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing parameters, must have either 'MsgId' or 'Event'"))
+		return fmt.Errorf("missing parameters, must have either 'MsgId' or 'Event'")
 	}
 
 	date := time.Unix(payload.CreateTime/1000, payload.CreateTime%1000*1000000).UTC()
 	urn, err := urns.New(urns.JioChat, payload.FromUsername)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("invalid jiochat id"))
+		return errors.New("invalid jiochat id")
 	}
 
-	// subscribe event, trigger a new conversation
-	if payload.MsgType == "event" && payload.Event == "subscribe" {
-		channelEvent := models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog)
+	if payload.MsgType == "event" {
+		in.As(channels.ReceiveKindEvent)
 
-		err := models.WriteChannelEvent(ctx, h.Runtime(), channelEvent, clog)
-		if err != nil {
-			return nil, err
+		// subscribe event, trigger a new conversation
+		if payload.Event == "subscribe" {
+			in.Event(models.NewChannelEvent(channel, models.EventTypeNewConversation, urn, clog))
+			return nil
 		}
 
-		return []channels.Event{channelEvent}, channels.WriteChannelEventSuccess(w, channelEvent)
-	}
-
-	// unknown event type (we only deal with subscribe)
-	if payload.MsgType == "event" {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "unknown event type")
+		// unknown event type (we only deal with subscribe)
+		return channels.Ignore("unknown event type")
 	}
 
 	// create our message
 	msg := models.NewIncomingMsg(channel, urn, payload.Content, payload.MsgID, clog).WithReceivedOn(date)
 	if payload.MsgType == "image" || payload.MsgType == "video" || payload.MsgType == "voice" {
-		mediaURL := buildMediaURL(payload.MediaID)
-		msg.WithAttachment(mediaURL)
+		msg.WithAttachment(buildMediaURL(payload.MediaID))
 	}
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 func buildMediaURL(mediaID string) string {

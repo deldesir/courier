@@ -21,12 +21,13 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
 )
 
-var (
+const (
 	smsURL                    = "https://rest.messagebird.com/messages"
 	mmsURL                    = "https://rest.messagebird.com/mms"
 	signatureHeader           = "Messagebird-Signature-Jwt"
@@ -44,14 +45,17 @@ type Message struct {
 	MediaURLs  []string `json:"mediaUrls,omitempty"`
 }
 
+// the decoder is configured to read `name` tags, so these have to be `name` rather than the `schema` that
+// gorilla/schema uses by default - tagged the other way they're inert, and the field names alone are what
+// the form gets matched against
 type ReceivedStatus struct {
-	ID              string    `schema:"id"`
-	Reference       string    `schema:"reference"`
-	Recipient       string    `schema:"recipient,required"`
-	Status          string    `schema:"status,required"`
-	StatusReason    string    `schema:"statusReason"`
-	StatusDatetime  time.Time `schema:"statusDatetime"`
-	StatusErrorCode int       `schema:"statusErrorCode"`
+	ID              string    `name:"id"`
+	Reference       string    `name:"reference"`
+	Recipient       string    `name:"recipient"`
+	Status          string    `name:"status"`
+	StatusReason    string    `name:"statusReason"`
+	StatusDatetime  time.Time `name:"statusDatetime"`
+	StatusErrorCode int       `name:"statusErrorCode"`
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -85,37 +89,40 @@ type handler struct {
 	validateSignatures bool
 }
 
-func newHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("MBD"), "Messagebird"), validateSignatures}
+func newHandler(channelType models.ChannelType, name string, validateSignatures bool) channels.NewHandlerFunc {
+	return func(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+		h := &handler{handlers.NewBaseHandler(rt, channelType, name), validateSignatures}
+		r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, h.receiveMessage)
+		r.AddReceive(h, http.MethodGet, "status", channels.ReceiveKindStatus, h.receiveStatus)
+		return h
+	}
 }
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodGet, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-
-	return nil
-}
-
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-
-	// get our params
+// this one decodes for itself rather than using FormPayload, because it tolerates a partial decode - a field
+// we can't convert costs us that field rather than the whole report, and the failure is recorded on the log
+// rather than answered. Answering it as an error instead would have MessageBird retry a body we can never
+// parse, and an endpoint that keeps failing is eventually paused at their end.
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
 	receivedStatus := &ReceivedStatus{}
-	err := handlers.DecodeAndValidateForm(receivedStatus, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestIgnored(ctx, h, channel, w, r, "no msg status, ignoring")
+	if err := handlers.DecodeAndValidateForm(receivedStatus, r); err != nil {
+		clog.Error(models.ErrorRequestUnparseable(err))
+	}
+
+	// a callback carrying no status at all - a URL check, typically - is asking nothing of us
+	if receivedStatus.Status == "" {
+		return channels.Ignore("no msg status, ignoring")
 	}
 
 	msgStatus, found := statusMapping[receivedStatus.Status]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unknown status '%s', must be one of 'queued', 'failed', 'sent', 'delivered', or 'undelivered'", receivedStatus.Status))
+		return handlers.UnknownStatusError(statusMapping, receivedStatus.Status)
 	}
 
 	// if the message id was passed explicitely, use that
 	var status *models.StatusUpdate
 	if receivedStatus.Reference != "" {
 		if !uuids.Is(receivedStatus.Reference) {
-			slog.Error("error converting Messagebird status reference to UUID", "error", err, "uuid", receivedStatus.Reference)
+			slog.Error("error converting Messagebird status reference to UUID", "uuid", receivedStatus.Reference)
 		} else {
 			status = models.NewStatusUpdate(channel, models.MsgUUID(receivedStatus.Reference), msgStatus, clog)
 		}
@@ -126,44 +133,35 @@ func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w 
 		status = models.NewStatusUpdateByExternalID(channel, receivedStatus.ID, msgStatus, clog)
 	}
 
-	var stopEvent *models.ChannelEvent
-
 	if receivedStatus.StatusErrorCode == errorStopped {
 		urn, err := urns.ParsePhone(receivedStatus.Recipient, "", true, false)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return err
 		}
-		// create a stop channel event
-		stopEvent = models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog)
-		err = models.WriteChannelEvent(ctx, h.Runtime(), stopEvent, clog)
-		if err != nil {
-			return nil, err
-		}
+		// the contact has asked to stop, which we record alongside the status that told us
+		in.Event(models.NewChannelEvent(channel, models.EventTypeStopContact, urn, clog))
 		clog.Error(models.ErrorExternal(fmt.Sprint(receivedStatus.StatusErrorCode), "Contact has sent 'stop'"))
 	}
 
-	events, err := handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
-	if stopEvent != nil {
-		events = append(events, stopEvent)
-	}
-	return events, err
+	in.Status(status)
+
+	return nil
 }
 
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	err := h.validateSignature(channel, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
+	if err := h.validateSignature(channel, r); err != nil {
+		return channels.Unauthenticated(err)
 	}
 
 	payload := &formMessage{}
-	err = handlers.DecodeAndValidateForm(payload, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+	if err := handlers.DecodeAndValidateForm(payload, r); err != nil {
+		return err
 	}
 
 	text := ""
 	messageID := ""
-	date := time.Time{}
+	var date time.Time
+	var err error
 	//chechk if shortcode or regular
 	if payload.Shortcode != "" {
 		text = payload.MessageBody
@@ -171,7 +169,7 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		shortCodeDateLayout := "20060102150405"
 		date, err = time.Parse(shortCodeDateLayout, payload.ReceiveDatetime)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unable to parse date '%s': %v", payload.ReceiveDatetime, err))
+			return fmt.Errorf("unable to parse date '%s': %v", payload.ReceiveDatetime, err)
 		}
 	} else {
 		text = payload.Body
@@ -179,19 +177,19 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 		standardDateLayout := "2006-01-02T15:04:05+00:00"
 		date, err = time.Parse(standardDateLayout, payload.CreatedDatetime)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unable to parse date '%s': %v", payload.CreatedDatetime, err))
+			return fmt.Errorf("unable to parse date '%s': %v", payload.CreatedDatetime, err)
 		}
 	}
 
 	// no message? ignore this
 	if text == "" && len(payload.MediaURLs) == 0 {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.New("no text or media"))
+		return errors.New("no text or media")
 	}
 
 	// create our URN
 	urn, err := urns.ParsePhone(payload.Originator, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 
 	// build our msg
@@ -203,8 +201,8 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 			msg.WithAttachment(mediaURL)
 		}
 	}
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
@@ -334,8 +332,8 @@ func (h *handler) validateSignature(c *models.Channel, r *http.Request) error {
 	return nil
 }
 
-// WriteMsgSuccessResponse writes a success response for the messages, MB expects an 'OK' body in our response
-func (h *handler) WriteMsgSuccessResponse(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
+// RespondMsgs writes a success response for the messages, MB expects an 'OK' body in our response
+func (h *handler) RespondMsgs(ctx context.Context, w http.ResponseWriter, msgs []*models.MsgIn) error {
 	w.Header().Add("Content-type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, err := w.Write([]byte("OK"))

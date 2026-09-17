@@ -1,0 +1,244 @@
+package channels_test
+
+import (
+	"context"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+
+	"github.com/nyaruka/courier/v26/core/channels"
+	"github.com/nyaruka/courier/v26/core/models"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/courier/v26/test"
+	"github.com/nyaruka/courier/v26/testsuite"
+	"github.com/nyaruka/gocommon/dbutil/assertdb"
+	"github.com/nyaruka/gocommon/svclogs"
+	"github.com/nyaruka/gocommon/urns"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestKindLogType(t *testing.T) {
+	// everything a provider tells us about a contact shares one log type, however the handler classified it -
+	// what it actually was is visible in the log's own request and response
+	assert.Equal(t, models.ChannelLogTypeReceive, channels.ReceiveKindMsg.LogType())
+	assert.Equal(t, models.ChannelLogTypeReceive, channels.ReceiveKindEvent.LogType())
+	assert.Equal(t, models.ChannelLogTypeReceive, channels.ReceiveKindAny.LogType())
+
+	// these two keep their own, being the ones worth picking out of a channel's logs
+	assert.Equal(t, models.ChannelLogTypeMsgStatus, channels.ReceiveKindStatus.LogType())
+	assert.Equal(t, models.ChannelLogTypeWebhookVerify, channels.ReceiveKindVerify.LogType())
+}
+
+func TestReceivedResponse(t *testing.T) {
+	ch := test.NewMockChannel("dbc126ed-66bc-4e28-b67b-81dc3327c95d", "KN", "2020", "US", []string{urns.Phone.Prefix}, nil)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, ch, nil, nil)
+
+	msg := models.NewIncomingMsg(ch, "tel:+12065551212", "hello", "ext1", clog)
+	status := models.NewStatusUpdateByExternalID(ch, "ext2", models.MsgStatusDelivered, clog)
+	event := models.NewChannelEvent(ch, models.EventTypeStopContact, "tel:+12065551212", clog)
+
+	// a response describes each part of the request in the order the handler added it, including the parts
+	// that weren't written
+	w := httptest.NewRecorder()
+	err := channels.RespondReceived(w, []channels.WriteResult{
+		{Event: msg, Outcome: channels.OutcomeWritten},
+		{Event: status, Outcome: channels.OutcomeWritten},
+		{Event: event, Outcome: channels.OutcomeWritten},
+		{Details: "ignoring echo", Outcome: channels.OutcomeIgnored},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 200, w.Code)
+
+	body := w.Body.String()
+	assert.Contains(t, body, `"message":"Events Handled"`)
+	assert.Contains(t, body, `"type":"msg"`)
+	assert.Contains(t, body, `"type":"status"`)
+	assert.Contains(t, body, `"type":"event"`)
+	assert.Contains(t, body, `{"type":"info","info":"ignoring echo"}`)
+
+	// an empty set of items still gets a well formed response
+	w = httptest.NewRecorder()
+	assert.NoError(t, channels.RespondReceived(w, nil))
+	assert.Equal(t, "{\"message\":\"Events Handled\",\"data\":[]}\n", w.Body.String())
+}
+
+func TestWriteReceived(t *testing.T) {
+	ctx, rt := testsuite.Runtime(t)
+	testsuite.ResetDB(t, rt)
+	testsuite.ResetValkey(t, rt)
+
+	ch, err := models.GetChannel(ctx, "KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	require.NoError(t, err)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, ch, nil, nil)
+
+	// a mixed batch is written in the order it was added, and each item reports what became of it
+	in := channels.NewReceived(ch)
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12065551212", "hello", "ext1", clog))
+	in.Ignored("ignoring echo")
+	in.Status(models.NewStatusUpdateByExternalID(ch, "ext2", models.MsgStatusDelivered, clog))
+	in.Event(models.NewChannelEvent(ch, models.EventTypeStopContact, "tel:+12065551313", clog))
+	assert.Equal(t, 4, in.Len())
+
+	results, err := channels.WriteReceived(ctx, rt, in, clog)
+	assert.NoError(t, err)
+	require.Len(t, results, 4)
+	assert.Equal(t, channels.OutcomeWritten, results[0].Outcome)
+	assert.Equal(t, channels.OutcomeIgnored, results[1].Outcome)
+	assert.Equal(t, "ignoring echo", results[1].Details)
+	assert.Equal(t, channels.OutcomeWritten, results[2].Outcome)
+	assert.Equal(t, channels.OutcomeWritten, results[3].Outcome)
+
+	// the ignored item isn't an event because nothing was written for it
+	assert.Len(t, channels.AcceptedEvents(results), 3)
+
+	// and the things that reported themselves as written really were - a database failure would have been
+	// absorbed by the spool and still reported as written, so check the rows rather than trusting the outcome
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'hello' AND external_identifier = 'ext1'`).Returns(1)
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM channels_channelevent WHERE event_type = 'stop_contact'`).Returns(1)
+
+	// a message the provider deleted is acted on as part of the batch, and described in the response
+	in = channels.NewReceived(ch)
+	in.DeletedMsg("ext1")
+
+	results, err = channels.WriteReceived(ctx, rt, in, clog)
+	assert.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, channels.OutcomeWritten, results[0].Outcome)
+	assert.Equal(t, "msg deleted", results[0].Details)
+
+	// it isn't an event, having not been received - it's something we did to one we already had
+	assert.Empty(t, channels.AcceptedEvents(results))
+
+	// a message we've already received is reported as a duplicate rather than written again
+	in = channels.NewReceived(ch)
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12065551212", "hello", "ext1", clog))
+
+	results, err = channels.WriteReceived(ctx, rt, in, clog)
+	assert.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, channels.OutcomeDuplicate, results[0].Outcome)
+
+	// but it's still an event, because it's something we received and recognized
+	assert.Len(t, channels.AcceptedEvents(results), 1)
+
+	// writing stops at the first item that fails, so the results describe the prefix we got through
+	in = channels.NewReceived(ch)
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12065551212", "first", "ext3", clog))
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12065551212", "second", "ext4", clog).WithAttachment("data:....."))
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12065551212", "third", "ext5", clog))
+
+	results, err = channels.WriteReceived(ctx, rt, in, clog)
+	assert.EqualError(t, err, "unable to decode attachment data: illegal base64 data at input byte 0")
+	require.Len(t, results, 2)
+	assert.Equal(t, channels.OutcomeWritten, results[0].Outcome)
+	assert.Equal(t, channels.OutcomeFailed, results[1].Outcome)
+	assert.Error(t, results[1].Err)
+
+	// the item that failed isn't an event, but the one written before it is
+	events := channels.AcceptedEvents(results)
+	require.Len(t, events, 1)
+	assert.Equal(t, "first", events[0].(*models.MsgIn).Text())
+}
+
+func TestWriteReceivedAtContactLimit(t *testing.T) {
+	ctx, rt := testsuite.Runtime(t)
+	testsuite.ResetDB(t, rt)
+	testsuite.ResetValkey(t, rt)
+
+	defer testsuite.ResetDB(t, rt)
+
+	// org 1 has one contact (tel:+12067799192) so record a count for it and cap the org at that
+	rt.DB.MustExec(`INSERT INTO contacts_contactgroupcount(group_id, count, is_squashed) VALUES(1, 1, TRUE)`)
+	rt.DB.MustExec(`UPDATE orgs_org SET limits = '{"contacts": 1}' WHERE id = 1`)
+	models.FlushChannelCache()
+	models.FlushContactCounts()
+
+	ch, err := models.GetChannel(ctx, "KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	require.NoError(t, err)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, ch, nil, nil)
+
+	// a message and an event from a new contact are dropped as ignored, and the rest of the batch is still written
+	in := channels.NewReceived(ch)
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12067799192", "from existing", "ext1", clog))
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12065551212", "from new", "ext2", clog))
+	in.Status(models.NewStatusUpdateByExternalID(ch, "ext3", models.MsgStatusDelivered, clog))
+	in.Event(models.NewChannelEvent(ch, models.EventTypeStopContact, "tel:+12065551313", clog))
+
+	results, err := channels.WriteReceived(ctx, rt, in, clog)
+	assert.NoError(t, err)
+	require.Len(t, results, 4)
+	assert.Equal(t, channels.OutcomeWritten, results[0].Outcome)
+	assert.Equal(t, channels.OutcomeIgnored, results[1].Outcome)
+	assert.Equal(t, "workspace has reached its limit of 1 contacts", results[1].Details)
+	assert.Nil(t, results[1].Event)
+	assert.Equal(t, channels.OutcomeWritten, results[2].Outcome)
+	assert.Equal(t, channels.OutcomeIgnored, results[3].Outcome)
+	assert.Equal(t, "workspace has reached its limit of 1 contacts", results[3].Details)
+
+	// the dropped items aren't events we accepted
+	assert.Len(t, channels.AcceptedEvents(results), 2)
+
+	// and they weren't written to the database or spooled for retry - a retry can't succeed
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'from existing'`).Returns(1)
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'from new'`).Returns(0)
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM channels_channelevent`).Returns(0)
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM contacts_contact WHERE org_id = 1`).Returns(1)
+	for _, dir := range []string{"msgs", "events"} {
+		spooled, err := filepath.Glob(filepath.Join(rt.Config.SpoolDir, dir, "*.jsonl"))
+		require.NoError(t, err)
+		assert.Empty(t, spooled, "unexpected spooled %s", dir)
+	}
+
+	// the refusals are recorded on the channel log
+	require.Len(t, clog.Errors, 2)
+	assert.Equal(t, "contact_limit_reached", clog.Errors[0].Code)
+}
+
+func TestWriteReceivedRefusedMsg(t *testing.T) {
+	ctx, rt := testsuite.Runtime(t)
+	testsuite.ResetDB(t, rt)
+	testsuite.ResetValkey(t, rt)
+
+	defer testsuite.ResetDB(t, rt)
+
+	// a deployment's incoming message check can refuse a message
+	defer func() { models.IncomingMsgCheck = models.CheckDuplicateMsg }()
+	models.IncomingMsgCheck = func(ctx context.Context, rt *runtime.Runtime, m *models.MsgIn, clog *models.ChannelLog) error {
+		if m.Text() == "spam" {
+			clog.Error(&svclogs.Error{Code: "test_refused", Message: "Refused by test."})
+			return &models.LimitReachedError{Limit: "test messages", Max: 1}
+		}
+		return models.CheckDuplicateMsg(ctx, rt, m, clog)
+	}
+
+	ch, err := models.GetChannel(ctx, "KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	require.NoError(t, err)
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, ch, nil, nil)
+
+	in := channels.NewReceived(ch)
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12067799192", "hello", "ext1", clog))
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12067799192", "spam", "ext2", clog))
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12067799192", "hello", "ext1", clog)) // redelivery of the first
+	in.Msg(models.NewIncomingMsg(ch, "tel:+12065551212", "from another", "ext3", clog))
+
+	results, err := channels.WriteReceived(ctx, rt, in, clog)
+	assert.NoError(t, err)
+	require.Len(t, results, 4)
+
+	// the refused message is dropped as ignored, and the rest of the batch is still written or deduplicated
+	assert.Equal(t, channels.OutcomeWritten, results[0].Outcome)
+	assert.Equal(t, channels.OutcomeIgnored, results[1].Outcome)
+	assert.Equal(t, "workspace has reached its limit of 1 test messages", results[1].Details)
+	assert.Nil(t, results[1].Event)
+	assert.Equal(t, channels.OutcomeDuplicate, results[2].Outcome)
+	assert.Equal(t, channels.OutcomeWritten, results[3].Outcome)
+
+	assert.Len(t, channels.AcceptedEvents(results), 3)
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM msgs_msg WHERE text IN ('hello', 'from another')`).Returns(2)
+	assertdb.Query(t, rt.DB, `SELECT count(*) FROM msgs_msg WHERE text = 'spam'`).Returns(0)
+
+	// the refusal is recorded on the channel log
+	require.Len(t, clog.Errors, 1)
+	assert.Equal(t, "test_refused", clog.Errors[0].Code)
+}

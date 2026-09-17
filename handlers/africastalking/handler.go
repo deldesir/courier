@@ -12,24 +12,31 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
 const configIsShared = "is_shared"
 
-var defaultSendURL = "https://api.africastalking.com/version1/messaging"
+const defaultSendURL = "https://api.africastalking.com/version1/messaging"
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("AT"), "Africas Talking")}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("AT"), "Africas Talking")}
+
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, handlers.FormPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodPost, "callback", channels.ReceiveKindMsg, handlers.FormPayload(h.receiveMessage))
+	r.AddReceive(h, http.MethodPost, "delivery", channels.ReceiveKindStatus, handlers.FormPayload(h.receiveStatus))
+	r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, handlers.FormPayload(h.receiveStatus))
+	return h
 }
 
 type moForm struct {
@@ -40,31 +47,15 @@ type moForm struct {
 	Date string `name:"date" validate:"required"`
 }
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "callback", models.ChannelLogTypeMsgReceive, h.receiveMessage)
-	r.Add(h, http.MethodPost, "delivery", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, h.receiveStatus)
-	return nil
-}
-
-// receiveMessage is our HTTP handler function for incoming messages
-func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	// get our params
-	form := &moForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveMessage is our receive function for incoming messages
+func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r *http.Request, form *moForm, in *channels.Received, clog *models.ChannelLog) error {
 	// create our date from the timestamp
 	// 2017-05-03T06:04:45Z
 	date, err := time.Parse("2006-01-02T15:04:05Z", form.Date)
 	if err != nil {
 		date, err = time.Parse("2006-01-02 15:04:05", form.Date)
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("invalid date format: %s", form.Date))
+			return fmt.Errorf("invalid date format: %s", form.Date)
 		}
 		date = date.UTC()
 	}
@@ -72,13 +63,13 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, w
 	// create our URN
 	urn, err := urns.ParsePhone(form.From, channel.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+		return err
 	}
 	// build our msg
 	msg := models.NewIncomingMsg(channel, urn, form.Text, form.ID, clog).WithReceivedOn(date)
 
-	// and finally write our message
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	in.Msg(msg)
+	return nil
 }
 
 type statusForm struct {
@@ -95,24 +86,16 @@ var statusMapping = map[string]models.MsgStatus{
 	"Expired":  models.MsgStatusFailed,
 }
 
-// receiveStatus is our HTTP handler function for status updates
-func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	// get our params
-	form := &statusForm{}
-	err := handlers.DecodeAndValidateForm(form, r)
-	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
-	}
-
+// receiveStatus is our receive function for status updates
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, form *statusForm, in *channels.Received, clog *models.ChannelLog) error {
 	msgStatus, found := statusMapping[form.Status]
 	if !found {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r,
-			fmt.Errorf("unknown status '%s', must be one of 'Success','Sent','Buffered','Rejected', 'Failed', or 'Expired'", form.Status))
+		return handlers.UnknownStatusError(statusMapping, form.Status)
 	}
 
-	// write our status
 	status := models.NewStatusUpdateByExternalID(channel, form.ID, msgStatus, clog)
-	return handlers.WriteMsgStatusAndResponse(ctx, h, channel, status, w, r)
+	in.Status(status)
+	return nil
 }
 
 // Send sends the given message, logging any HTTP calls or errors

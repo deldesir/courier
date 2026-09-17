@@ -7,31 +7,37 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/buger/jsonparser"
 	"github.com/gomodule/redigo/redis"
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
+	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-var (
-	sendURL      = "https://api-public.mtarget.fr/api-sms.json"
-	maxMsgLength = 765
-)
+const sendURL = "https://api-public.mtarget.fr/api-sms.json"
+
+var maxMsgLength = 765
 
 func init() {
-	channels.RegisterHandler(newHandler())
+	channels.RegisterHandler(newHandler)
 }
 
 type handler struct {
 	handlers.BaseHandler
 }
 
-func newHandler() channels.Handler {
-	return &handler{handlers.NewBaseHandler(models.ChannelType("MT"), "Mtarget")}
+func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
+	h := &handler{handlers.NewBaseHandler(rt, models.ChannelType("MT"), "Mtarget")}
+
+	r.AddReceive(h, http.MethodPost, "receive", channels.ReceiveKindMsg, h.receiveMessage)
+
+	statusHandler := handlers.NewExternalIDStatusHandler(statusMapping, "MsgId", "Status")
+	r.AddReceive(h, http.MethodPost, "status", channels.ReceiveKindStatus, statusHandler)
+	return h
 }
 
 var statusMapping = map[string]models.MsgStatus{
@@ -43,20 +49,11 @@ var statusMapping = map[string]models.MsgStatus{
 	"6": models.MsgStatusFailed,
 }
 
-// Initialize is called by the engine once everything is loaded
-func (h *handler) Initialize(r *channels.Routes) error {
-	r.Add(h, http.MethodPost, "receive", models.ChannelLogTypeMsgReceive, h.receiveMsg)
-
-	statusHandler := handlers.NewExternalIDStatusHandler(h, statusMapping, "MsgId", "Status")
-	r.Add(h, http.MethodPost, "status", models.ChannelLogTypeMsgStatus, statusHandler)
-	return nil
-}
-
-// ReceiveMsg handles both MO messages and Stop commands
-func (h *handler) receiveMsg(ctx context.Context, c *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
+// receiveMessage handles both MO messages and Stop commands
+func (h *handler) receiveMessage(ctx context.Context, c *models.Channel, r *http.Request, in *channels.Received, clog *models.ChannelLog) error {
 	err := r.ParseForm()
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+		return err
 	}
 
 	text := r.Form.Get("Content")
@@ -65,10 +62,10 @@ func (h *handler) receiveMsg(ctx context.Context, c *models.Channel, w http.Resp
 	msgID := r.Form.Get("MsgId")
 
 	if from == "" {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("missing required field 'Msisdn'"))
+		return fmt.Errorf("missing required field 'Msisdn'")
 	}
 
-	// if we have a long message id, then this is part of a multipart message, we don't write the message until
+	// if we have a long message id, then this is part of a multipart message, we don't create the message until
 	// we have received all parts, which we buffer in Redis
 	longID := r.Form.Get("msglong.id")
 	if longID != "" {
@@ -76,11 +73,11 @@ func (h *handler) receiveMsg(ctx context.Context, c *models.Channel, w http.Resp
 		longRef, _ := strconv.Atoi(r.Form.Get("msglong.msgref"))
 
 		if longCount == 0 || longRef == 0 {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("invalid or missing 'msglong.msgcount' or 'msglong.msgref' parameters"))
+			return fmt.Errorf("invalid or missing 'msglong.msgcount' or 'msglong.msgref' parameters")
 		}
 
 		if longRef < 1 || longRef > longCount {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, fmt.Errorf("'msglong.msgref' needs to be between 1 and 'msglong.msgcount' inclusive"))
+			return fmt.Errorf("'msglong.msgref' needs to be between 1 and 'msglong.msgcount' inclusive")
 		}
 
 		rc := h.Runtime().VK.Get()
@@ -93,18 +90,18 @@ func (h *handler) receiveMsg(ctx context.Context, c *models.Channel, w http.Resp
 		rc.Send("EXPIRE", mapKey, 300)
 		_, err := rc.Do("EXEC")
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		// see if we have all the parts we need
 		count, err := redis.Int(rc.Do("HLEN", mapKey))
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		// we don't have all the parts yet, say we received the message
 		if count != longCount {
-			return nil, handlers.WriteAndLogRequestIgnored(ctx, h, c, w, r, "Message part received")
+			return channels.Ignore("Message part received")
 		}
 
 		// we have all our parts, grab them and put them together
@@ -117,7 +114,7 @@ func (h *handler) receiveMsg(ctx context.Context, c *models.Channel, w http.Resp
 
 		segments, err := redis.Strings(rc.Do("HMGET", keys...))
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		// join our segments in our text
@@ -130,22 +127,21 @@ func (h *handler) receiveMsg(ctx context.Context, c *models.Channel, w http.Resp
 	// create our URN
 	urn, err := urns.ParsePhone(from, c.Country(), true, false)
 	if err != nil {
-		return nil, handlers.WriteAndLogRequestError(ctx, h, c, w, r, err)
+		return err
 	}
 
 	// if this a stop command, shortcut stopping that contact
 	if keyword == "Stop" {
+		in.As(channels.ReceiveKindEvent)
+
 		stop := models.NewChannelEvent(c, models.EventTypeStopContact, urn, clog)
-		err := models.WriteChannelEvent(ctx, h.Runtime(), stop, clog)
-		if err != nil {
-			return nil, err
-		}
-		return []channels.Event{stop}, channels.WriteChannelEventSuccess(w, stop)
+		in.Event(stop)
+		return nil
 	}
 
-	// otherwise, create and write the message
-	msg := models.NewIncomingMsg(c, urn, text, msgID, clog).WithReceivedOn(time.Now().UTC())
-	return handlers.WriteMsgsAndResponse(ctx, h, []*models.MsgIn{msg}, w, r, clog)
+	msg := models.NewIncomingMsg(c, urn, text, msgID, clog).WithReceivedOn(dates.Now().UTC())
+	in.Msg(msg)
+	return nil
 }
 
 func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.SendResult, clog *models.ChannelLog) error {
