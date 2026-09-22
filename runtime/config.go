@@ -32,6 +32,7 @@ type Config struct {
 
 	S3Endpoint          string `help:"S3 service endpoint, e.g. https://s3.amazonaws.com"`
 	S3AttachmentsBucket string `help:"S3 bucket to write attachments to"`
+	S3PublicBucket      string `help:"S3 bucket the platform keeps public files such as user avatars in"`
 	S3PathStyle         bool   `help:"S3 should use path style URLs"`
 
 	CentrifugoEndpoint string `validate:"url" help:"the endpoint of the Centrifugo server"`
@@ -85,6 +86,7 @@ func NewDefaultConfig() *Config {
 
 		S3Endpoint:          "https://s3.amazonaws.com",
 		S3AttachmentsBucket: "", // nanoRP default: no S3; set to re-enable (upstream: temba-attachments)
+		S3PublicBucket:      "temba-default",
 		S3PathStyle:         false,
 
 		CentrifugoEndpoint: "http://localhost:8000/api",
