@@ -659,25 +659,34 @@ func (h *WuzapiHandler) Send(ctx context.Context, msg *models.MsgOut, res *chann
 				Rows  []listItem `json:"rows"`
 			}
 
-			rows := make([]listItem, len(qrs))
+			// A quick reply written "Section|Title" opens (or continues) a named
+			// section of the list; the channel config may set the button label
+			// ("list_button"), the default section title ("list_section") and a
+			// footer ("list_footer"), so a mission's line can speak its language.
+			buttonText := msg.Channel().StringConfigForKey("list_button", "Select")
+			defaultSection := msg.Channel().StringConfigForKey("list_section", "Menu")
+			footer := msg.Channel().StringConfigForKey("list_footer", "")
+			sections := []section{}
 			for i, qr := range qrs {
-				rows[i] = listItem{
-					Title: qr.Text,
-					Desc:  qr.Extra,
-					RowId: fmt.Sprint(i),
+				title, sectionTitle := qr.Text, defaultSection
+				if k := strings.Index(title, "|"); k > 0 && k < len(title)-1 {
+					sectionTitle, title = strings.TrimSpace(title[:k]), strings.TrimSpace(title[k+1:])
 				}
+				if len(sections) == 0 || sections[len(sections)-1].Title != sectionTitle {
+					sections = append(sections, section{Title: sectionTitle})
+				}
+				last := &sections[len(sections)-1]
+				last.Rows = append(last.Rows, listItem{Title: title, Desc: qr.Extra, RowId: fmt.Sprint(i)})
 			}
 
 			payload := map[string]interface{}{
 				"Phone":      phone,
 				"Desc":       body,
-				"ButtonText": "Select",
-				"Sections": []section{
-					{
-						Title: "Menu",
-						Rows:  rows,
-					},
-				},
+				"ButtonText": buttonText,
+				"Sections":   sections,
+			}
+			if footer != "" {
+				payload["FooterText"] = footer
 			}
 			jsonBody, _ = json.Marshal(payload)
 		} else {
