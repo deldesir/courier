@@ -28,8 +28,18 @@ func TestConfigParse(t *testing.T) {
 		}
 	}
 
-	// parsing a valid config fills in the values which can't be used in their configured form
+	// a local attachments directory needs a media domain to serve it from, and a path under it
 	cfg := runtime.NewDefaultConfig()
+	cfg.AttachmentsDir = "/tmp/attachments"
+	assert.EqualError(t, cfg.Parse(), "'AttachmentsDir' requires 'MediaDomain' to be set")
+	cfg.MediaDomain = "example.com"
+	cfg.AttachmentsURLPath = "media"
+	assert.EqualError(t, cfg.Parse(), "'AttachmentsURLPath' must be an absolute path")
+	cfg.AttachmentsURLPath = "/rp/media"
+	assert.NoError(t, cfg.Parse())
+
+	// parsing a valid config fills in the values which can't be used in their configured form
+	cfg = runtime.NewDefaultConfig()
 	cfg.SendProxyURL = "http://proxy.example.com:3128"
 	require.NoError(t, cfg.Parse())
 

@@ -3,9 +3,11 @@ package models
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -123,25 +125,77 @@ func stripS3Region(rt *runtime.Runtime, s string) string {
 	return strings.Replace(s, fmt.Sprintf("%s.", rt.S3.Region), "", -1)
 }
 
-// SaveAttachment saves an attachment to storage
+// ErrNoAttachmentStorage is returned when an attachment can't be saved because neither S3 nor a local attachments
+// directory is configured
+var ErrNoAttachmentStorage = errors.New("no attachment storage configured")
+
+// extensions we'll put in a local filename - anything else is dropped rather than trusted on the filesystem
+var safeExtension = regexp.MustCompile(`^[a-zA-Z0-9]{1,10}$`)
+
+// SaveAttachment saves an attachment to storage and returns the URL it can be fetched from. Storage is S3 when it's
+// configured, and otherwise the local attachments directory - which is served under the media domain, at the
+// attachments URL path.
 func SaveAttachment(ctx context.Context, rt *runtime.Runtime, ch *Channel, contentType string, data []byte, extension string) (string, error) {
 	// create our filename
-	filename := string(uuids.NewV4())
+	uuid := string(uuids.NewV4())
+	filename := uuid
 	if extension != "" {
-		filename = fmt.Sprintf("%s.%s", filename, extension)
+		filename = fmt.Sprintf("%s.%s", uuid, extension)
 	}
 
 	orgID := ch.OrgID()
 
-	path := filepath.Join("attachments", strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
+	if rt.S3 != nil {
+		path := filepath.Join("attachments", strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
 
-	if rt.S3 == nil {
-		return "", fmt.Errorf("error saving attachment: S3 storage is disabled (nanoRP mode)")
+		storageURL, err := rt.S3.PutObject(ctx, rt.Config.S3AttachmentsBucket, path, contentType, data, s3types.ObjectCannedACLPublicRead)
+		if err != nil {
+			return "", fmt.Errorf("error saving attachment to storage (bytes=%d): %w", len(data), err)
+		}
+		return storageURL, nil
 	}
-	storageURL, err := rt.S3.PutObject(ctx, rt.Config.S3AttachmentsBucket, path, contentType, data, s3types.ObjectCannedACLPublicRead)
+
+	if rt.Config.AttachmentsDir != "" {
+		if !safeExtension.MatchString(extension) {
+			filename = uuid
+		}
+		return saveLocalAttachment(rt, orgID, filename, data)
+	}
+
+	return "", ErrNoAttachmentStorage
+}
+
+// saveLocalAttachment writes an attachment to <AttachmentsDir>/attachments/<org id>/<filename> and returns the URL
+// it's served at: https://<MediaDomain><AttachmentsURLPath>/attachments/<org id>/<filename>
+func saveLocalAttachment(rt *runtime.Runtime, orgID OrgID, filename string, data []byte) (string, error) {
+	dir := filepath.Join(rt.Config.AttachmentsDir, "attachments", strconv.Itoa(int(orgID)))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("error creating attachments directory: %w", err)
+	}
+
+	// written to a temporary file and renamed into place so that whatever serves the directory never sees a partial file
+	tmp, err := os.CreateTemp(dir, "."+filename+".*")
 	if err != nil {
-		return "", fmt.Errorf("error saving attachment to storage (bytes=%d): %w", len(data), err)
+		return "", fmt.Errorf("error creating attachment file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("error writing attachment (bytes=%d): %w", len(data), err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("error writing attachment (bytes=%d): %w", len(data), err)
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("error setting attachment permissions: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), filepath.Join(dir, filename)); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("error saving attachment: %w", err)
 	}
 
-	return storageURL, nil
+	urlPath := strings.TrimSuffix(rt.Config.AttachmentsURLPath, "/")
+	return fmt.Sprintf("https://%s%s/attachments/%d/%s", rt.Config.MediaDomain, urlPath, orgID, filename), nil
 }

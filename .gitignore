@@ -16,14 +16,13 @@ AGENTS.md
 # Go
 coverage.text
 
-# Build outputs — binaries belong in GitHub Releases, not in git
+# Build outputs - binaries belong in GitHub Releases, not in git
 /courier
-courier
-dist/
-*-linux-amd64
-*-linux-arm64
-*.upx
+/dist/
+/*-linux-amd64
+/*-linux-arm64
+/*.upx
 
 /_test_spool
 /_spool
-_storage
+/_storage
