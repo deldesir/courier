@@ -1,0 +1,748 @@
+[
+    {
+        "label": "Plain Send",
+        "msg": {
+            "text": "Simple Message",
+            "urn": "whatsapp:12065551212"
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/text": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0ABC123",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/text",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "Simple Message"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0ABC123"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "URL Quick Reply",
+        "msg": {
+            "text": "See our site",
+            "urn": "whatsapp:12065551212",
+            "quick_replies": [
+                {
+                    "type": "url",
+                    "text": "Site",
+                    "extra": "https://example.com"
+                }
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/text": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0ABC123",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/text",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "See our site\n\nSite: https://example.com"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0ABC123"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "Buttons",
+        "msg": {
+            "text": "Are you sure?",
+            "urn": "whatsapp:12065551212",
+            "quick_replies": [
+                {
+                    "type": "text",
+                    "text": "Yes"
+                },
+                {
+                    "type": "text",
+                    "text": "No"
+                },
+                {
+                    "type": "text",
+                    "text": "Maybe"
+                }
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/buttons": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0ABC123",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/buttons",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "Are you sure?",
+                    "Buttons": [
+                        {
+                            "type": "reply",
+                            "title": "Yes",
+                            "id": "0"
+                        },
+                        {
+                            "type": "reply",
+                            "title": "No",
+                            "id": "1"
+                        },
+                        {
+                            "type": "reply",
+                            "title": "Maybe",
+                            "id": "2"
+                        }
+                    ]
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0ABC123"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "Buttons With Image Header",
+        "msg": {
+            "text": "This one?",
+            "urn": "whatsapp:12065551212",
+            "attachments": [
+                "image/jpeg:https://files.example.org/photo.jpg"
+            ],
+            "quick_replies": [
+                {
+                    "type": "text",
+                    "text": "Yes"
+                },
+                {
+                    "type": "text",
+                    "text": "No"
+                }
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/buttons": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0ABC123",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/buttons",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "This one?",
+                    "Buttons": [
+                        {
+                            "type": "reply",
+                            "title": "Yes",
+                            "id": "0"
+                        },
+                        {
+                            "type": "reply",
+                            "title": "No",
+                            "id": "1"
+                        }
+                    ],
+                    "Image": "https://files.example.org/photo.jpg"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0ABC123"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "List With Sections",
+        "msg": {
+            "text": "Pick one",
+            "urn": "whatsapp:12065551212",
+            "quick_replies": [
+                {
+                    "type": "text",
+                    "text": "Fruit|Apple",
+                    "extra": "Red"
+                },
+                {
+                    "type": "text",
+                    "text": "Fruit|Pear"
+                },
+                {
+                    "type": "text",
+                    "text": "Veg|Kale"
+                },
+                {
+                    "type": "text",
+                    "text": "Other"
+                }
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/list": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0ABC123",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/list",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Desc": "Pick one",
+                    "ButtonText": "Choose",
+                    "Sections": [
+                        {
+                            "title": "Fruit",
+                            "rows": [
+                                {
+                                    "title": "Apple",
+                                    "desc": "Red",
+                                    "rowId": "0"
+                                },
+                                {
+                                    "title": "Pear",
+                                    "desc": "",
+                                    "rowId": "1"
+                                }
+                            ]
+                        },
+                        {
+                            "title": "Veg",
+                            "rows": [
+                                {
+                                    "title": "Kale",
+                                    "desc": "",
+                                    "rowId": "2"
+                                }
+                            ]
+                        },
+                        {
+                            "title": "Options",
+                            "rows": [
+                                {
+                                    "title": "Other",
+                                    "desc": "",
+                                    "rowId": "3"
+                                }
+                            ]
+                        }
+                    ],
+                    "FooterText": "Reply with a number"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0ABC123"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "Image With Caption",
+        "msg": {
+            "text": "Look at this",
+            "urn": "whatsapp:12065551212",
+            "attachments": [
+                "image/jpeg:https://files.example.org/photo.jpg"
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/image": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0ABC123",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/image",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Image": "https://files.example.org/photo.jpg",
+                    "Caption": "Look at this"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0ABC123"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "Two Attachments",
+        "msg": {
+            "text": "Both of these",
+            "urn": "whatsapp:12065551212",
+            "attachments": [
+                "image/png:https://files.example.org/a.png",
+                "application/pdf:https://files.example.org/b.pdf"
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/image": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0FIRST",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ],
+            "http://bridge.example.com/chat/send/document": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0SECOND",
+                            "Timestamp": 1758700001
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/image",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Image": "https://files.example.org/a.png"
+                }
+            },
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/document",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Document": "https://files.example.org/b.pdf",
+                    "FileName": "b.pdf",
+                    "Caption": "Both of these"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0FIRST",
+            "3EB0SECOND"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "Audio Then Text",
+        "msg": {
+            "text": "Listen to this",
+            "urn": "whatsapp:12065551212",
+            "attachments": [
+                "audio/ogg:https://files.example.org/voice.ogg"
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/audio": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0FIRST",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ],
+            "http://bridge.example.com/chat/send/text": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0SECOND",
+                            "Timestamp": 1758700001
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/audio",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Audio": "https://files.example.org/voice.ogg"
+                }
+            },
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/text",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "Listen to this"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0FIRST",
+            "3EB0SECOND"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "Relative Media URL",
+        "msg": {
+            "urn": "whatsapp:12065551212",
+            "attachments": [
+                "image/jpeg:https:///rp/media/attachments/1/photo.jpg"
+            ]
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/image": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0ABC123",
+                            "Timestamp": 1758700000
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/image",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Image": "https://nyaruka.s3.com/rp/media/attachments/1/photo.jpg"
+                }
+            }
+        ],
+        "external_ids": [
+            "3EB0ABC123"
+        ],
+        "log_errors": []
+    },
+    {
+        "label": "Rejected With Reason",
+        "msg": {
+            "text": "Error Message",
+            "urn": "whatsapp:12065551212"
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/text": [
+                {
+                    "status": 400,
+                    "body": {
+                        "code": 400,
+                        "error": "could not parse Phone",
+                        "success": false
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/text",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "Error Message"
+                }
+            }
+        ],
+        "error": {
+            "message": "channel rejected send with reason",
+            "log_error": {
+                "code": "rejected_with_reason",
+                "ext_code": "400",
+                "message": "could not parse Phone"
+            }
+        },
+        "log_errors": []
+    },
+    {
+        "label": "Server Error",
+        "msg": {
+            "text": "Error Message",
+            "urn": "whatsapp:12065551212"
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/text": [
+                {
+                    "status": 500,
+                    "body": {
+                        "code": 500,
+                        "error": "no session",
+                        "success": false
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/text",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "Error Message"
+                }
+            }
+        ],
+        "error": {
+            "message": "channel connection failed",
+            "retryable": true,
+            "log_error": {
+                "code": "connection_failed",
+                "message": "Connection to server failed."
+            }
+        },
+        "log_errors": []
+    },
+    {
+        "label": "Connection Error",
+        "msg": {
+            "text": "Error Message",
+            "urn": "whatsapp:12065551212"
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/text": [
+                {
+                    "status": 0,
+                    "body": ""
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/text",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "Error Message"
+                }
+            }
+        ],
+        "error": {
+            "message": "channel connection failed",
+            "retryable": true,
+            "log_error": {
+                "code": "connection_failed",
+                "message": "Connection to server failed."
+            }
+        },
+        "log_errors": []
+    },
+    {
+        "label": "Missing ID",
+        "msg": {
+            "text": "Simple Message",
+            "urn": "whatsapp:12065551212"
+        },
+        "http_mocks": {
+            "http://bridge.example.com/chat/send/text": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent"
+                        },
+                        "success": true
+                    }
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "POST",
+                "url": "http://bridge.example.com/chat/send/text",
+                "headers": {
+                    "Authorization": "tk_sesame",
+                    "Content-Type": "application/json"
+                },
+                "body": {
+                    "Phone": "12065551212",
+                    "Body": "Simple Message"
+                }
+            }
+        ],
+        "error": {
+            "message": "response not expected values",
+            "loggable": true,
+            "log_error": {
+                "code": "response_unexpected",
+                "message": "Response doesn't match expected values."
+            }
+        },
+        "log_errors": [
+            {
+                "code": "response_value_missing",
+                "message": "Unable to find 'Id' response."
+            }
+        ]
+    },
+    {
+        "label": "Nothing To Send",
+        "msg": {
+            "urn": "whatsapp:12065551212"
+        },
+        "error": {
+            "message": "message invalid",
+            "loggable": true,
+            "log_error": {
+                "code": "message_invalid",
+                "message": "Message is missing required values."
+            }
+        },
+        "log_errors": []
+    }
+]
