@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/nyaruka/courier/v26/utils"
 	"github.com/nyaruka/gocommon/httpx"
@@ -34,6 +35,9 @@ type Config struct {
 	S3AttachmentsBucket string `help:"S3 bucket to write attachments to"`
 	S3PublicBucket      string `help:"S3 bucket the platform keeps public files such as user avatars in"`
 	S3PathStyle         bool   `help:"S3 should use path style URLs"`
+
+	AttachmentsDir     string `help:"local directory to save incoming attachments in when S3 isn't configured, empty disables local storage"`
+	AttachmentsURLPath string `help:"the URL path under MediaDomain at which the attachments directory is served"`
 
 	CentrifugoEndpoint string `validate:"url" help:"the endpoint of the Centrifugo server"`
 	CentrifugoKey      string `help:"the API key for the Centrifugo server"`
@@ -89,6 +93,9 @@ func NewDefaultConfig() *Config {
 		S3PublicBucket:      "temba-default",
 		S3PathStyle:         false,
 
+		AttachmentsDir:     "",
+		AttachmentsURLPath: "/media",
+
 		CentrifugoEndpoint: "http://localhost:8000/api",
 
 		FacebookApplicationSecret:    "missing_facebook_app_secret",
@@ -135,6 +142,16 @@ func (c *Config) Parse() error {
 		return fmt.Errorf("unable to parse 'DisallowedNetworks': %w", err)
 	}
 	c.DisallowedIPs, c.DisallowedNets = ips, nets
+
+	// attachments saved locally are served from the media domain, so their URLs need it to be set
+	if c.AttachmentsDir != "" {
+		if c.MediaDomain == "" {
+			return fmt.Errorf("'AttachmentsDir' requires 'MediaDomain' to be set")
+		}
+		if !strings.HasPrefix(c.AttachmentsURLPath, "/") {
+			return fmt.Errorf("'AttachmentsURLPath' must be an absolute path")
+		}
+	}
 
 	// the validator has already enforced that this is an http(s) URL if set. Cleared rather than left alone when
 	// unset, so that parsing twice can't leave a stale URL behind - same as the networks above.
