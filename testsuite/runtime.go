@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	goruntime "runtime"
+	"sync"
 	"testing"
 
 	"github.com/nyaruka/courier/v26/core/models"
@@ -22,6 +23,13 @@ func testdataPath(file string) string {
 	_, thisFile, _, _ := goruntime.Caller(0)
 	return path.Join(path.Dir(thisFile), "testdata", file)
 }
+
+// NanoRP returns whether the suite is running against Postgres and Valkey alone, with DynamoDB and S3 switched off
+// the way a nanoRP deployment switches them off - so channel logs and history aren't persisted, and attachments are
+// saved to a local directory. It's selected by setting COURIER_TEST_NANORP in the environment.
+var NanoRP = sync.OnceValue(func() bool {
+	return os.Getenv("COURIER_TEST_NANORP") != ""
+})
 
 // Runtime returns a runtime for the test environment with the runtime and models layer started - what most
 // tests want.
@@ -63,6 +71,12 @@ func NewRuntime(t *testing.T) *runtime.Runtime {
 	cfg.DynamoTablePrefix = "Test"
 	cfg.SpoolDir = absPath("./_test_spool")
 
+	if NanoRP() {
+		cfg.DynamoTablePrefix = ""
+		cfg.S3AttachmentsBucket = ""
+		cfg.AttachmentsDir = t.TempDir()
+	}
+
 	// items spooled by a previous test run would be replayed into this run's reset database
 	require.NoError(t, os.RemoveAll(cfg.SpoolDir))
 
@@ -79,7 +93,9 @@ func NewRuntime(t *testing.T) *runtime.Runtime {
 	}
 
 	// create Dynamo tables if necessary
-	dyntest.CreateTables(t, rt.Dynamo.Main.Client(), testdataPath("dynamo.json"), false)
+	if rt.Dynamo.Enabled() {
+		dyntest.CreateTables(t, rt.Dynamo.Main.Client(), testdataPath("dynamo.json"), false)
+	}
 
 	rt.Centrifugo = centrifugo.NewService(centrifugo.NewMockClient(), rt.VK)
 

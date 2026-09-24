@@ -93,8 +93,11 @@ func RunIncomingTests(t *testing.T, chs []*models.Channel, newFn channels.NewHan
 
 	client := installTestClient(rt)
 
-	// data: attachments are saved to storage as they're received so ensure the bucket exists
-	rt.S3.Client.CreateBucket(t.Context(), &s3.CreateBucketInput{Bucket: aws.String(rt.Config.S3AttachmentsBucket)})
+	// data: attachments are saved to storage as they're received so ensure the bucket exists - unless storage is
+	// switched off (see testsuite.NanoRP), in which case they're saved to the runtime's attachments directory
+	if rt.S3 != nil {
+		rt.S3.Client.CreateBucket(t.Context(), &s3.CreateBucketInput{Bucket: aws.String(rt.Config.S3AttachmentsBucket)})
+	}
 
 	if opts.Setup != nil {
 		opts.Setup(t, rt)
