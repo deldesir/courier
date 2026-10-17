@@ -28,6 +28,8 @@ import (
 	"github.com/nyaruka/gocommon/dbutil/assertdb"
 	"github.com/nyaruka/gocommon/random"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -38,6 +40,7 @@ const (
 	receiveURL  = "/c/wch/" + channelUUID + "/receive"
 	historyURL  = "/c/wch/" + channelUUID + "/history"
 	uploadURL   = "/c/wch/" + channelUUID + "/upload"
+	statusURL   = "/c/wch/" + channelUUID + "/status"
 
 	testChatID = "vM0GGhDrqpTQefIEinK0up3C" // what the secure source seeded below generates
 )
@@ -140,7 +143,7 @@ func TestStartRateLimit(t *testing.T) {
 	ttl, err := redis.Int(vc.Do("TTL", "chat-starts:"+channelUUID+"|41.23.45.67"))
 	require.NoError(t, err)
 	assert.Greater(t, ttl, 0)
-	assert.LessOrEqual(t, ttl, startLimitWindow)
+	assert.LessOrEqual(t, ttl, int(startLimitWindow.Seconds()))
 }
 
 // the framework can't assert response headers or make OPTIONS requests, so CORS support is tested directly
@@ -154,7 +157,7 @@ func TestCORS(t *testing.T) {
 	s.MountHandler(newHandler)
 
 	// preflights on all the endpoints are answered without needing the channel
-	for _, path := range []string{startURL, receiveURL, historyURL, uploadURL} {
+	for _, path := range []string{startURL, receiveURL, historyURL, uploadURL, statusURL} {
 		req, _ := http.NewRequest(http.MethodOptions, "https://localhost"+path, nil)
 		rr := httptest.NewRecorder()
 		s.Router().ServeHTTP(rr, req)
@@ -187,6 +190,7 @@ func TestAllowedDomains(t *testing.T) {
 	const cfgChannelUUID = "7d3fb8a2-5c1e-4b9f-a6d4-2e8c0f7b5a19"
 	cfgStartURL := "/c/wch/" + cfgChannelUUID + "/start"
 	cfgReceiveURL := "/c/wch/" + cfgChannelUUID + "/receive"
+	cfgStatusURL := "/c/wch/" + cfgChannelUUID + "/status"
 
 	s := web.NewServer(rt)
 	testsuite.InsertChannel(t, rt, testChannels[0])
@@ -232,10 +236,12 @@ func TestAllowedDomains(t *testing.T) {
 		assert.Empty(t, rr.Header().Get("Access-Control-Allow-Origin"), origin)
 	}
 
-	// on the receive endpoint too
-	rr = request(cfgReceiveURL, "https://evil.com")
-	assert.Equal(t, 403, rr.Code)
-	assert.Empty(t, rr.Header().Get("Access-Control-Allow-Origin"))
+	// on the receive and status endpoints too
+	for _, path := range []string{cfgReceiveURL, cfgStatusURL} {
+		rr = request(path, "https://evil.com")
+		assert.Equal(t, 403, rr.Code, path)
+		assert.Empty(t, rr.Header().Get("Access-Control-Allow-Origin"), path)
+	}
 
 	// and on the history endpoint, whose GET requests get the same treatment
 	getHistory := func(origin string) *httptest.ResponseRecorder {
@@ -468,7 +474,154 @@ func TestHistoryRateLimit(t *testing.T) {
 	ttl, err := redis.Int(vc.Do("TTL", "chat-history:"+channelUUID+"|"+testChatID))
 	require.NoError(t, err)
 	assert.Greater(t, ttl, 0)
-	assert.LessOrEqual(t, ttl, historyLimitWindow)
+	assert.LessOrEqual(t, ttl, int(historyLimitWindow.Seconds()))
+}
+
+func TestStatus(t *testing.T) {
+	_, rt := testsuite.Runtime(t)
+	testsuite.ResetDB(t, rt)
+	testsuite.ResetValkey(t, rt)
+
+	random.SetSecureSource(random.NewSeededSource(1234))
+	defer random.SetSecureSource(random.DefaultSecureSource)
+
+	s := web.NewServer(rt)
+	testsuite.InsertChannel(t, rt, testChannels[0])
+	s.MountHandler(newHandler)
+
+	req, _ := http.NewRequest(http.MethodPost, "https://localhost"+startURL, strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	s.Router().ServeHTTP(rr, req)
+	require.Equal(t, 200, rr.Code)
+
+	var contactID, urnID int64
+	require.NoError(t, rt.DB.Get(&contactID, `SELECT contact_id FROM contacts_contacturn WHERE identity = $1`, "webchat:"+testChatID))
+	require.NoError(t, rt.DB.Get(&urnID, `SELECT id FROM contacts_contacturn WHERE identity = $1`, "webchat:"+testChatID))
+
+	insertMsg := func(uuid, direction, status string) {
+		rt.DB.MustExec(`INSERT INTO msgs_msg(uuid, text, created_on, modified_on, direction, status, visibility, msg_type, is_android, high_priority, msg_count, error_count, channel_id, contact_id, contact_urn_id, org_id)
+			VALUES($1, 'Hi', NOW(), NOW(), $2, $3, 'V', 'T', FALSE, FALSE, 1, 0, $4, $5, $6, 1)`,
+			uuid, direction, status, testChannels[0].ID(), contactID, urnID)
+	}
+
+	insertMsg("11f0a1d2-0000-7000-8000-000000000001", "O", "W")
+	insertMsg("11f0a1d2-0000-7000-8000-000000000002", "O", "W")
+	insertMsg("11f0a1d2-0000-7000-8000-000000000003", "I", "P") // the visitor's own message
+
+	post := func(body string) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(http.MethodPost, "https://localhost"+statusURL, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		s.Router().ServeHTTP(rr, req)
+		return rr
+	}
+
+	// status updates are batched, so flush them by restarting the status writer
+	flushStatuses := func() {
+		models.Stop()
+		require.NoError(t, models.Start(rt))
+	}
+
+	rr = post(`{"chat_id": "` + testChatID + `", "status": "delivered", "msg_uuids": [
+		"11f0a1d2-0000-7000-8000-000000000001", "11f0a1d2-0000-7000-8000-000000000002", "11f0a1d2-0000-7000-8000-000000000003"
+	]}`)
+	assert.Equal(t, 200, rr.Code)
+	assert.Equal(t, "*", rr.Header().Get("Access-Control-Allow-Origin"))
+	assert.Contains(t, rr.Body.String(), "Status Update Accepted")
+	assert.Equal(t, 3, strings.Count(rr.Body.String(), `"status":"D"`))
+	flushStatuses()
+
+	assertdb.Query(t, rt.DB, `SELECT status FROM msgs_msg WHERE uuid = '11f0a1d2-0000-7000-8000-000000000001'`).Returns("D")
+	assertdb.Query(t, rt.DB, `SELECT status FROM msgs_msg WHERE uuid = '11f0a1d2-0000-7000-8000-000000000002'`).Returns("D")
+	assertdb.Query(t, rt.DB, `SELECT status FROM msgs_msg WHERE uuid = '11f0a1d2-0000-7000-8000-000000000003'`).Returns("P")
+
+	rr = post(`{"chat_id": "` + testChatID + `", "status": "read", "msg_uuids": ["11f0a1d2-0000-7000-8000-000000000001"]}`)
+	assert.Equal(t, 200, rr.Code)
+	assert.Contains(t, rr.Body.String(), `"status":"R"`)
+	flushStatuses()
+
+	assertdb.Query(t, rt.DB, `SELECT status FROM msgs_msg WHERE uuid = '11f0a1d2-0000-7000-8000-000000000001'`).Returns("R")
+
+	// a late delivered doesn't take a read message backwards
+	rr = post(`{"chat_id": "` + testChatID + `", "status": "delivered", "msg_uuids": ["11f0a1d2-0000-7000-8000-000000000001"]}`)
+	assert.Equal(t, 200, rr.Code)
+	flushStatuses()
+
+	assertdb.Query(t, rt.DB, `SELECT status FROM msgs_msg WHERE uuid = '11f0a1d2-0000-7000-8000-000000000001'`).Returns("R")
+
+	// a client can report up to a page of history at once
+	pageOfUUIDs := func(n int) string {
+		uuids := make([]string, n)
+		for i := range uuids {
+			uuids[i] = fmt.Sprintf(`"11f0a1d2-0000-7000-8000-0000000001%02d"`, i)
+		}
+		return `{"chat_id": "` + testChatID + `", "status": "read", "msg_uuids": [` + strings.Join(uuids, ",") + `]}`
+	}
+	assert.Equal(t, 200, post(pageOfUUIDs(historyPageSize)).Code)
+
+	// bad requests: an unknown chat, a status a client can't report, and no, too many, malformed or duplicate
+	// message UUIDs
+	for _, body := range []string{
+		pageOfUUIDs(historyPageSize + 1),
+		`{"chat_id": "xxxxxhDrqpTQefIEinK0up3C", "status": "read", "msg_uuids": ["11f0a1d2-0000-7000-8000-000000000002"]}`,
+		`{"chat_id": "` + testChatID + `", "status": "failed", "msg_uuids": ["11f0a1d2-0000-7000-8000-000000000002"]}`,
+		`{"chat_id": "` + testChatID + `", "status": "read", "msg_uuids": []}`,
+		`{"chat_id": "` + testChatID + `", "status": "read", "msg_uuids": ["11f0a1d2"]}`,
+		`{"chat_id": "` + testChatID + `", "status": "read", "msg_uuids": ["11f0a1d2-0000-7000-8000-000000000002", "11f0a1d2-0000-7000-8000-000000000002"]}`,
+	} {
+		assert.Equal(t, 400, post(body).Code, body)
+	}
+	flushStatuses()
+
+	assertdb.Query(t, rt.DB, `SELECT status FROM msgs_msg WHERE uuid = '11f0a1d2-0000-7000-8000-000000000002'`).Returns("D")
+}
+
+func TestStatusRateLimit(t *testing.T) {
+	_, rt := testsuite.Runtime(t)
+	testsuite.ResetDB(t, rt)
+	testsuite.ResetValkey(t, rt)
+
+	random.SetSecureSource(random.NewSeededSource(1234))
+	defer random.SetSecureSource(random.DefaultSecureSource)
+
+	s := web.NewServer(rt)
+	testsuite.InsertChannel(t, rt, testChannels[0])
+	s.MountHandler(newHandler)
+
+	req, _ := http.NewRequest(http.MethodPost, "https://localhost"+startURL, strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	s.Router().ServeHTTP(rr, req)
+	require.Equal(t, 200, rr.Code)
+
+	post := func(chatID string) *httptest.ResponseRecorder {
+		body := `{"chat_id": "` + chatID + `", "status": "read", "msg_uuids": ["11f0a1d2-0000-7000-8000-000000000001"]}`
+		req, _ := http.NewRequest(http.MethodPost, "https://localhost"+statusURL, strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		s.Router().ServeHTTP(rr, req)
+		return rr
+	}
+
+	// a chat can report statuses up to the limit of requests within the window...
+	for i := range statusLimit {
+		assert.Equal(t, 200, post(testChatID).Code, "request %d", i)
+	}
+
+	// ...then gets throttled, with the CORS header still on the error so the widget can read it
+	rr = post(testChatID)
+	assert.Equal(t, 429, rr.Code)
+	assert.Contains(t, rr.Body.String(), "rate limit exceeded")
+	assert.Equal(t, "*", rr.Header().Get("Access-Control-Allow-Origin"))
+
+	// but other chats aren't affected - the limit is per chat (an unknown one just fails its lookup)
+	assert.Equal(t, 400, post("xxxxxhDrqpTQefIEinK0up3C").Code)
+
+	// and the count expires with the window
+	vc := rt.VK.Get()
+	defer vc.Close()
+	ttl, err := redis.Int(vc.Do("TTL", "chat-statuses:"+channelUUID+"|"+testChatID))
+	require.NoError(t, err)
+	assert.Greater(t, ttl, 0)
+	assert.LessOrEqual(t, ttl, int(statusLimitWindow.Seconds()))
 }
 
 // makeUpload posts a multipart upload request from the given IP - a nil file omits the file part entirely
@@ -631,11 +784,11 @@ func TestUploadRateLimit(t *testing.T) {
 	ttl, err := redis.Int(vc.Do("TTL", "chat-uploads:"+channelUUID+"|"+testChatID))
 	require.NoError(t, err)
 	assert.Greater(t, ttl, 0)
-	assert.LessOrEqual(t, ttl, uploadLimitWindow)
+	assert.LessOrEqual(t, ttl, int(uploadLimitWindow.Seconds()))
 	ttl, err = redis.Int(vc.Do("TTL", "chat-uploads-ip:"+channelUUID+"|41.23.45.69"))
 	require.NoError(t, err)
 	assert.Greater(t, ttl, 0)
-	assert.LessOrEqual(t, ttl, uploadIPLimitWindow)
+	assert.LessOrEqual(t, ttl, int(uploadIPLimitWindow.Seconds()))
 }
 
 // sends don't make HTTP requests so the framework's outgoing cases don't fit - instead we test the socket
@@ -752,6 +905,55 @@ func TestOutgoing(t *testing.T) {
 	// a publish failure is returned as a send error
 	rt.Centrifugo.Client.(*centrifugo.MockClient).SetError(errors.New("boom"))
 	assert.EqualError(t, send(), "error publishing message event: boom")
+}
+
+// like sends, user typing is a publish rather than an HTTP request so it's tested directly
+func TestSendEvent(t *testing.T) {
+	ctx, rt := testsuite.Runtime(t)
+	testsuite.ResetDB(t, rt)
+	testsuite.ResetValkey(t, rt)
+
+	dates.SetNowFunc(dates.NewFixedNow(time.Date(2025, 10, 13, 11, 20, 30, 0, time.UTC)))
+	defer dates.SetNowFunc(time.Now)
+
+	ch := testChannels[0]
+	testsuite.InsertChannel(t, rt, ch)
+
+	h := newHandler(rt, channels.NewRoutes())
+	assert.Equal(t, map[string]time.Duration{events.TypeTypingStarted: 5 * time.Second, events.TypeTypingStopped: 0}, h.SendableEvents(ch))
+
+	socket := models.ChatSocket(ch.UUID(), testChatID)
+	vc := rt.VK.Get()
+	_, err := vc.Do("SET", centrifugo.SubscriptionKey(socket), "1")
+	vc.Close()
+	require.NoError(t, err)
+
+	channelRef := assets.NewChannelReference(assets.ChannelUUID(ch.UUID()), "WebChat")
+	urn := urns.URN("webchat:" + testChatID)
+
+	send := func(e events.Event) error {
+		return h.SendEvent(ctx, ch, e, models.NewChannelLogForEventSend(ch, nil))
+	}
+
+	// typing by a user is attributed to them...
+	started := events.NewTypingStarted(events.DirectionOutgoing, channelRef, urn, "")
+	started.SetUser(assets.NewUserReference("c7c5c4a2-1b2c-4d3e-8f9a-0b1c2d3e4f5a", "Bob McBob"), "ui")
+	require.NoError(t, send(started))
+
+	// ...and anything else isn't
+	require.NoError(t, send(events.NewTypingStopped(events.DirectionOutgoing, channelRef, urn, "")))
+
+	sent := testsuite.CentrifugoHistory(t, rt, socket)
+	require.Len(t, sent, 2)
+	assert.JSONEq(t, `{"type": "typing_started", "created_on": "2025-10-13T11:20:30Z", "user": {"uuid": "c7c5c4a2-1b2c-4d3e-8f9a-0b1c2d3e4f5a", "name": "Bob McBob"}}`, string(sent[0]))
+	assert.JSONEq(t, `{"type": "typing_stopped", "created_on": "2025-10-13T11:20:30Z"}`, string(sent[1]))
+
+	// other event types aren't sendable
+	assert.EqualError(t, send(events.NewContactNameChanged("Bob")), "unsupported event type: contact_name_changed")
+
+	// and a publish failure is returned as an error
+	rt.Centrifugo.Client.(*centrifugo.MockClient).SetError(errors.New("boom"))
+	assert.EqualError(t, send(started), "error publishing typing event: boom")
 }
 
 func TestStartAtContactLimit(t *testing.T) {
