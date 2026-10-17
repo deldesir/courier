@@ -1,3 +1,16 @@
+## v26.3.61 (2026-10-14)
+ * Add webchat endpoint for clients to report messages as delivered or read
+ * Ignore status updates that don't change a message once it has 25 channel logs
+ * Update to latest goflow and gocommon
+
+## v26.3.60 (2026-10-13)
+ * Rate limit webchat using vkutil v0.29.0's RateLimiter
+
+## v26.3.59 (2026-10-06)
+ * Send typing indicators to webchat visitors
+ * Disable review progress tracking and bump the review model to Opus 5.5
+ * Drop .gitignore entries for the retired deploy tooling
+
 ## v26.3.58 (2026-09-29)
  * Update to latest phonenumbers
 

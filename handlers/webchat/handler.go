@@ -24,6 +24,9 @@ import (
 	"github.com/nyaruka/gocommon/random"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
+	"github.com/nyaruka/goflow/assets"
+	"github.com/nyaruka/goflow/core/events"
+	"github.com/nyaruka/vkutil"
 )
 
 const (
@@ -41,31 +44,47 @@ const (
 	// how many chats a single IP can start on a channel per window - generous for a real visitor (who starts
 	// one chat, ever) while capping how fast anyone can mint contacts
 	startLimit       = 10
-	startLimitWindow = 60 // seconds
+	startLimitWindow = time.Minute
 
 	// how many messages a history request returns, and how many requests a single chat can make per window -
 	// enough for a reconnecting client to catch up without letting anyone hammer the database
 	historyPageSize    = 25
 	historyLimit       = 10
-	historyLimitWindow = 60 // seconds
+	historyLimitWindow = time.Minute
+
+	// how many status reports a single chat can make per window - a client acks each batch of messages it's
+	// shown, so a handful covers reconnects and paging back through history
+	statusLimit       = 20
+	statusLimitWindow = time.Minute
 
 	// the most a visitor can upload in one file - matching what the platform accepts for media uploads
 	// elsewhere - and how many uploads a single chat can make per window
 	maxUploadBytes    = 25 * 1024 * 1024
 	uploadLimit       = 5
-	uploadLimitWindow = 60 // seconds
+	uploadLimitWindow = time.Minute
 
 	// how many uploads a single IP can make on a channel per window - a backstop above the per-chat limit
 	// (so visitors sharing a NAT aren't broken) that a caller can't reset by rotating chat IDs. It also
 	// bounds upload memory per source: the worst case is this many bodies buffered per IP per window.
 	uploadIPLimit       = 10
-	uploadIPLimitWindow = 60 // seconds
+	uploadIPLimitWindow = time.Minute
 
 	// slack on the request body cap for the multipart framing and fields around the file itself
 	uploadFormOverheadBytes = 64 * 1024
 )
 
+var (
+	startLimiter    = vkutil.NewRateLimiter("chat-starts", startLimit, startLimitWindow)
+	historyLimiter  = vkutil.NewRateLimiter("chat-history", historyLimit, historyLimitWindow)
+	statusLimiter   = vkutil.NewRateLimiter("chat-statuses", statusLimit, statusLimitWindow)
+	uploadLimiter   = vkutil.NewRateLimiter("chat-uploads", uploadLimit, uploadLimitWindow)
+	uploadIPLimiter = vkutil.NewRateLimiter("chat-uploads-ip", uploadIPLimit, uploadIPLimitWindow)
+)
+
 var chatIDChars = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+// errRateLimited is returned by receive functions to have the request answered as throttled rather than bad
+var errRateLimited = errors.New("rate limit exceeded")
 
 // the media types a visitor may upload - the same kinds of media the platform handles on other channels.
 // Entries ending in / allow a whole family of types.
@@ -99,6 +118,9 @@ func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
 	receive := channels.Receive(h, channels.ReceiveKindMsg, handlers.JSONPayload(h.receiveMessage))
 	r.Add(h, http.MethodPost, "receive", channels.ReceiveKindMsg.LogType(), withCORS(receive))
 
+	status := channels.Receive(h, channels.ReceiveKindStatus, handlers.JSONPayload(h.receiveStatus))
+	r.Add(h, http.MethodPost, "status", channels.ReceiveKindStatus.LogType(), withCORS(status))
+
 	r.Add(h, http.MethodGet, "history", models.ChannelLogTypeChatHistory, withCORS(h.history))
 
 	r.Add(h, http.MethodPost, "upload", models.ChannelLogTypeChatUpload, withCORS(h.upload))
@@ -106,6 +128,7 @@ func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
 	// the chat widget runs on arbitrary third-party websites, so all the endpoints need CORS preflight support
 	r.Add(h, http.MethodOptions, "start", models.ChannelLogTypeUnknown, h.preflight)
 	r.Add(h, http.MethodOptions, "receive", models.ChannelLogTypeUnknown, h.preflight)
+	r.Add(h, http.MethodOptions, "status", models.ChannelLogTypeUnknown, h.preflight)
 	r.Add(h, http.MethodOptions, "history", models.ChannelLogTypeUnknown, h.preflight)
 	r.Add(h, http.MethodOptions, "upload", models.ChannelLogTypeUnknown, h.preflight)
 	return h
@@ -118,6 +141,14 @@ func (h *handler) GetChannel(ctx context.Context, r *http.Request) (*models.Chan
 		return nil, nil
 	}
 	return h.BaseHandler.GetChannel(ctx, r)
+}
+
+// RespondError answers a throttled request with a 429 so the widget can tell it apart from a bad one
+func (h *handler) RespondError(ctx context.Context, w http.ResponseWriter, err error) error {
+	if errors.Is(err, errRateLimited) {
+		return channels.RespondError(w, http.StatusTooManyRequests, err)
+	}
+	return h.BaseHandler.RespondError(ctx, w, err)
 }
 
 // withCORS wraps a handler function to enforce the channel's allowed domains and set the CORS header that all
@@ -206,7 +237,7 @@ type startResponse struct {
 // relies on the edge overwriting client-supplied headers. Spoofed-header and distributed floods are left to
 // edge-level protection like any other unauthenticated endpoint.
 func (h *handler) start(ctx context.Context, channel *models.Channel, w http.ResponseWriter, r *http.Request, clog *models.ChannelLog) ([]channels.Event, error) {
-	if !h.allowStart(channel, r) {
+	if !h.allowStart(ctx, channel, r) {
 		channels.LogRequestError(r, channel, fmt.Errorf("rate limit exceeded"))
 		return nil, channels.RespondError(w, http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded"))
 	}
@@ -235,8 +266,8 @@ func (h *handler) start(ctx context.Context, channel *models.Channel, w http.Res
 }
 
 // allowStart checks the requesting IP against the channel's start rate limit
-func (h *handler) allowStart(channel *models.Channel, r *http.Request) bool {
-	return h.allow(fmt.Sprintf("chat-starts:%s|%s", channel.UUID(), requestIP(r)), startLimit, startLimitWindow)
+func (h *handler) allowStart(ctx context.Context, channel *models.Channel, r *http.Request) bool {
+	return h.allow(ctx, startLimiter, fmt.Sprintf("%s|%s", channel.UUID(), requestIP(r)))
 }
 
 // requestIP returns the requesting IP. The server's RealIP middleware has already resolved forwarded headers
@@ -249,10 +280,18 @@ func requestIP(r *http.Request) string {
 	return ip
 }
 
-// allow checks a rate limit on the given key, failing open so that a valkey problem doesn't stop visitors using
+// allow checks a rate limit for the given id, failing open so that a valkey problem doesn't stop visitors using
 // their chats
-func (h *handler) allow(key string, limit, window int) bool {
-	return channels.AllowRate(h.Runtime(), key, limit, window)
+func (h *handler) allow(ctx context.Context, limiter *vkutil.RateLimiter, id string) bool {
+	vc := h.Runtime().VK.Get()
+	defer vc.Close()
+
+	allowed, err := limiter.Allow(ctx, vc, id)
+	if err != nil {
+		slog.Error("error checking rate limit", "error", err, "id", id)
+		return true
+	}
+	return allowed
 }
 
 type receivePayload struct {
@@ -308,6 +347,49 @@ func (h *handler) receiveMessage(ctx context.Context, channel *models.Channel, r
 	return nil
 }
 
+// the statuses a chat client can report for the messages it's been sent - never failure, which is ours to decide
+var reportableStatuses = map[string]models.MsgStatus{
+	"delivered": models.MsgStatusDelivered,
+	"read":      models.MsgStatusRead,
+}
+
+type statusPayload struct {
+	ChatID string `json:"chat_id" validate:"required"`
+	Status string `json:"status"  validate:"required,oneof=delivered read"`
+	// a client reports in batches - e.g. everything a history fetch returned - capped at a page of history
+	MsgUUIDs []models.MsgUUID `json:"msg_uuids" validate:"required,min=1,max=25,unique,dive,uuid"`
+}
+
+// receiveStatus is our receive function for a chat client reporting that the visitor's browser has received or
+// displayed messages it was sent. Like receive, possession of the chat ID is what authenticates the caller.
+func (h *handler) receiveStatus(ctx context.Context, channel *models.Channel, r *http.Request, payload *statusPayload, in *channels.Received, clog *models.ChannelLog) error {
+	urn, err := urns.NewFromParts(urns.WebChat.Prefix, payload.ChatID, nil, "")
+	if err != nil {
+		return fmt.Errorf("invalid chat id: %s", payload.ChatID)
+	}
+
+	// throttled per chat like history, and after validating the chat ID for the same reason
+	if !h.allow(ctx, statusLimiter, fmt.Sprintf("%s|%s", channel.UUID(), payload.ChatID)) {
+		return errRateLimited
+	}
+
+	contact, err := models.GetContact(ctx, h.Runtime(), channel, urn, nil, "", false, clog)
+	if err != nil {
+		return fmt.Errorf("error looking up contact: %w", err)
+	}
+	if contact == nil {
+		return fmt.Errorf("unknown chat id: %s", payload.ChatID)
+	}
+
+	// UUIDs aren't checked against this chat's conversation: status writes only touch outgoing messages on the
+	// channel, and message UUIDs are unguessable, so like any status callback the exposure is a leaked UUID
+	status := reportableStatuses[payload.Status]
+	for _, msgUUID := range payload.MsgUUIDs {
+		in.Status(models.NewStatusUpdate(channel, msgUUID, status, clog))
+	}
+	return nil
+}
+
 type uploadResponse struct {
 	Attachment string `json:"attachment"`
 }
@@ -320,7 +402,7 @@ func (h *handler) upload(ctx context.Context, channel *models.Channel, w http.Re
 	// bodies freely by rotating chat IDs. This per-IP cap doesn't need the body, so it runs first and a
 	// throttled request is rejected before anything is buffered. Like start, distributed floods are left to
 	// edge protection.
-	if !h.allow(fmt.Sprintf("chat-uploads-ip:%s|%s", channel.UUID(), requestIP(r)), uploadIPLimit, uploadIPLimitWindow) {
+	if !h.allow(ctx, uploadIPLimiter, fmt.Sprintf("%s|%s", channel.UUID(), requestIP(r))) {
 		channels.LogRequestError(r, channel, fmt.Errorf("rate limit exceeded"))
 		return nil, channels.RespondError(w, http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded"))
 	}
@@ -350,7 +432,7 @@ func (h *handler) upload(ctx context.Context, channel *models.Channel, w http.Re
 
 	// throttled per chat rather than per IP - a visitor attaching files only needs a handful at a time, and
 	// like start, anything distributed is left to edge protection
-	if !h.allow(fmt.Sprintf("chat-uploads:%s|%s", channel.UUID(), chatID), uploadLimit, uploadLimitWindow) {
+	if !h.allow(ctx, uploadLimiter, fmt.Sprintf("%s|%s", channel.UUID(), chatID)) {
 		channels.LogRequestError(r, channel, fmt.Errorf("rate limit exceeded"))
 		return nil, channels.RespondError(w, http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded"))
 	}
@@ -435,7 +517,7 @@ func (h *handler) history(ctx context.Context, channel *models.Channel, w http.R
 
 	// throttled per chat rather than per IP - a real client only needs a small burst at reconnect, and like
 	// start, anything distributed is left to edge protection
-	if !h.allow(fmt.Sprintf("chat-history:%s|%s", channel.UUID(), chatID), historyLimit, historyLimitWindow) {
+	if !h.allow(ctx, historyLimiter, fmt.Sprintf("%s|%s", channel.UUID(), chatID)) {
 		channels.LogRequestError(r, channel, fmt.Errorf("rate limit exceeded"))
 		return nil, channels.RespondError(w, http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded"))
 	}
@@ -549,5 +631,51 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		return fmt.Errorf("error publishing message event: %w", err)
 	}
 
+	return nil
+}
+
+// typingEvent is how a chat client sees a user composing a reply. The client decays the indicator on its own,
+// so a lost typing_stopped only leaves it showing until then.
+type typingEvent struct {
+	Type      string    `json:"type"`
+	CreatedOn time.Time `json:"created_on"`
+
+	// who is typing - without an avatar since engine events only reference users by UUID and name, which a
+	// client can match against the senders of messages it has seen
+	User *msgUser `json:"user,omitempty"`
+}
+
+// publishing is cheap so typing_stopped is supported too, and typing_started is resent often enough to stay
+// ahead of a client decaying the indicator
+var sendableEvents = map[string]time.Duration{events.TypeTypingStarted: 5 * time.Second, events.TypeTypingStopped: 0}
+
+// SendableEvents declares support for typing indicators
+func (h *handler) SendableEvents(*models.Channel) map[string]time.Duration {
+	return sendableEvents
+}
+
+// SendEvent publishes a user's typing to the conversation's chat socket
+func (h *handler) SendEvent(ctx context.Context, ch *models.Channel, event events.Event, clog *models.ChannelLog) error {
+	var urn urns.URN
+	var user *assets.UserReference
+	switch typed := event.(type) {
+	case *events.TypingStarted:
+		urn, user = typed.URN, typed.User_
+	case *events.TypingStopped:
+		urn, user = typed.URN, typed.User_
+	default:
+		return fmt.Errorf("unsupported event type: %s", event.Type())
+	}
+
+	data := &typingEvent{Type: event.Type(), CreatedOn: dates.Now()}
+	if user != nil {
+		data.User = &msgUser{UUID: models.UserUUID(user.UUID), Name: user.Name}
+	}
+
+	// like message sends, dropped if the visitor doesn't have the chat open
+	pub := &centrifugo.Publication{Channel: models.ChatSocket(ch.UUID(), urn.Path()), Data: data}
+	if err := h.Runtime().Centrifugo.Publish(ctx, pub); err != nil {
+		return fmt.Errorf("error publishing typing event: %w", err)
+	}
 	return nil
 }
