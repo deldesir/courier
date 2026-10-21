@@ -1,3 +1,16 @@
+## v26.3.64 (2026-10-20)
+ * Check ownership of other URNs a request reports before asking mailroom to append them
+ * Remove leftover webchat code now that chip is its provider
+
+## v26.3.63 (2026-10-19)
+ * Rename the WebChat channel type's code to CHP
+ * Slim the WebChat handler to the webchat service contract
+
+## v26.3.62 (2026-10-19)
+ * Collect WhatsApp BSUIDs from Twilio delivery reports
+ * Keep handling a provider's request when it hangs up, rather than failing what it sent
+ * Update to latest gocommon
+
 ## v26.3.61 (2026-10-14)
  * Add webchat endpoint for clients to report messages as delivered or read
  * Ignore status updates that don't change a message once it has 25 channel logs

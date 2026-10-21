@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/nyaruka/courier/v26/runtime"
@@ -12,6 +13,7 @@ import (
 	"github.com/nyaruka/gocommon/dbutil"
 	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/syncx"
+	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
 	"github.com/nyaruka/goflow/core/events"
 	"github.com/nyaruka/null/v3"
@@ -25,6 +27,10 @@ type StatusUpdate struct {
 	ExternalIdentifier_ string       `json:"external_identifier,omitempty"   db:"external_identifier"`
 	Status_             MsgStatus    `json:"status"                          db:"status"`
 	LogUUID             svclogs.UUID `json:"log_uuid"                        db:"log_uuid"`
+
+	// URNs the provider reported for the message's recipient alongside the status, to be added to the contact if
+	// they don't already have them - e.g. a WhatsApp business-scoped user ID on a delivery report
+	OtherURNs_ []urns.URN `json:"other_urns,omitempty" db:"-"`
 }
 
 func (s *StatusUpdate) EventUUID() uuids.UUID    { return uuids.UUID(s.MsgUUID_) }
@@ -36,6 +42,15 @@ func (s *StatusUpdate) SetExternalIdentifier(id string) { s.ExternalIdentifier_ 
 
 func (s *StatusUpdate) Status() MsgStatus          { return s.Status_ }
 func (s *StatusUpdate) SetStatus(status MsgStatus) { s.Status_ = status }
+
+func (s *StatusUpdate) OtherURNs() []urns.URN { return s.OtherURNs_ }
+
+// WithOtherURN adds a URN the provider reported for the recipient, to be added to their contact when this status
+// is written
+func (s *StatusUpdate) WithOtherURN(urn urns.URN) *StatusUpdate {
+	s.OtherURNs_ = append(s.OtherURNs_, urn)
+	return s
+}
 
 // NewStatusUpdate creates a new status update for the given message UUID
 func NewStatusUpdate(channel *Channel, uuid MsgUUID, status MsgStatus, clog *ChannelLog) *StatusUpdate {
@@ -365,12 +380,13 @@ UPDATE msgs_msg SET
         msgs_msg old
     WHERE msgs_msg.uuid = s.msg_uuid AND msgs_msg.channel_id = s.channel_id AND msgs_msg.direction = 'O' AND c.id = msgs_msg.contact_id AND old.id = msgs_msg.id
       AND (COALESCE(cardinality(msgs_msg.log_uuids), 0) < %[3]d OR (%[1]s) != msgs_msg.status OR %[2]s)
-RETURNING msgs_msg.uuid AS msg_uuid, msgs_msg.status AS msg_status, msgs_msg.failed_reason, c.uuid AS contact_uuid, msgs_msg.org_id, msgs_msg.status IS DISTINCT FROM old.status AS changed`, sqlNewMsgStatus, sqlIsErrorAttempt, maxMsgLogUUIDs)
+RETURNING msgs_msg.uuid AS msg_uuid, msgs_msg.status AS msg_status, msgs_msg.failed_reason, c.id AS contact_id, c.uuid AS contact_uuid, msgs_msg.org_id, msgs_msg.status IS DISTINCT FROM old.status AS changed`, sqlNewMsgStatus, sqlIsErrorAttempt, maxMsgLogUUIDs)
 
 // WriteStatusUpdates writes the given status updates to the database and returns the resulting changes in message
 // status. Updates which don't change a message's status - because it's already moved past them - aren't returned.
 func WriteStatusUpdates(ctx context.Context, rt *runtime.Runtime, statuses []*StatusUpdate) ([]*StatusChange, error) {
 	changes := make([]*StatusChange, 0, len(statuses))
+	newURNs := make([]*contactNewURNs, 0)
 
 	// a single bulk update can only apply one update per message - postgres silently drops the others - so updates for
 	// the same message are written in successive rounds, each holding at most one per message, in the order queued
@@ -388,51 +404,129 @@ func WriteStatusUpdates(ctx context.Context, rt *runtime.Runtime, statuses []*St
 			}
 		}
 
-		roundChanges, err := writeStatusUpdateRound(ctx, rt, round)
+		roundChanges, roundNewURNs, err := writeStatusUpdateRound(ctx, rt, round)
 		if err != nil {
 			return nil, err
 		}
 
 		changes = append(changes, roundChanges...)
+		newURNs = append(newURNs, roundNewURNs...)
 		statuses = rest
+	}
+
+	// queued once all rounds are written so that a contact whose statuses span rounds - delivered and read for the
+	// same message arriving together - is only queued one task. Best-effort - the statuses themselves are written.
+	if len(newURNs) > 0 {
+		if err := queueStatusNewURNs(ctx, rt, newURNs); err != nil {
+			slog.Error("error queuing new URNs from status updates", "error", err)
+		}
 	}
 
 	return changes, nil
 }
 
-// writes a set of status updates, containing at most one per message, as a single bulk update
-func writeStatusUpdateRound(ctx context.Context, rt *runtime.Runtime, statuses []*StatusUpdate) ([]*StatusChange, error) {
+// writes a set of status updates, containing at most one per message, as a single bulk update. Returns the changes
+// in message status, and the URNs reported by statuses that were written, resolved to the messages' contacts.
+func writeStatusUpdateRound(ctx context.Context, rt *runtime.Runtime, statuses []*StatusUpdate) ([]*StatusChange, []*contactNewURNs, error) {
 	// rewrite query as a bulk operation
 	query, args, err := dbutil.BulkSQL(rt.DB, sqlUpdateMsgByUUID, statuses)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	rows, err := rt.DB.QueryxContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("error writing statuses in bulk: %w", err)
+		return nil, nil, fmt.Errorf("error writing statuses in bulk: %w", err)
 	}
 	defer rows.Close()
 
+	statusesByUUID := make(map[MsgUUID]*StatusUpdate, len(statuses))
+	for _, s := range statuses {
+		statusesByUUID[s.MsgUUID_] = s
+	}
+
 	changes := make([]*StatusChange, 0, len(statuses))
+	newURNs := make([]*contactNewURNs, 0)
 
 	for rows.Next() {
 		row := &struct {
 			StatusChange
-			Changed bool `db:"changed"`
+			ContactID ContactID `db:"contact_id"`
+			Changed   bool      `db:"changed"`
 		}{StatusChange: StatusChange{CreatedOn: time.Now()}}
 
 		if err := rows.StructScan(row); err != nil {
-			return nil, fmt.Errorf("error scanning status change: %w", err)
+			return nil, nil, fmt.Errorf("error scanning status change: %w", err)
 		}
 
 		if row.Changed {
 			sc := row.StatusChange
 			changes = append(changes, &sc)
 		}
+
+		// a status that reported URNs for the recipient is now resolved to a contact we can add them to
+		if s := statusesByUUID[row.MsgUUID]; s != nil && len(s.OtherURNs_) > 0 {
+			newURNs = append(newURNs, &contactNewURNs{Contact: &Contact{OrgID_: row.OrgID, ID_: row.ContactID, UUID_: row.ContactUUID}, ChannelID: s.ChannelID_, URNs: s.OtherURNs_})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("error reading status changes: %w", err)
 	}
 
-	return changes, nil
+	return changes, newURNs, nil
+}
+
+// contactNewURNs are URNs reported with a status update, resolved to the contact that received the message
+type contactNewURNs struct {
+	Contact   *Contact
+	ChannelID ChannelID
+	URNs      []urns.URN
+}
+
+// queueStatusNewURNs queues a contact_changed task to append the URNs reported by statuses to their contacts, where
+// mailroom will accept them (see appendableURNs).
+func queueStatusNewURNs(ctx context.Context, rt *runtime.Runtime, newURNs []*contactNewURNs) error {
+	// merge across the batch so a contact is only checked once, as a provider reports the same URNs on every status
+	byContact := make(map[ContactID]*contactNewURNs, len(newURNs))
+	order := make([]ContactID, 0, len(newURNs))
+	for _, n := range newURNs {
+		if existing := byContact[n.Contact.ID_]; existing != nil {
+			for _, u := range n.URNs {
+				if !slices.Contains(existing.URNs, u) {
+					existing.URNs = append(existing.URNs, u)
+				}
+			}
+		} else {
+			byContact[n.Contact.ID_] = n
+			order = append(order, n.Contact.ID_)
+		}
+	}
+
+	// look up the owners of all the URNs in the batch at once - the common case is that every one is already owned
+	// by its contact, as a provider reports the same URNs on every status, and then there's nothing to queue
+	keys := make([]urnKey, 0, len(newURNs))
+	for _, n := range byContact {
+		for _, u := range n.URNs {
+			keys = append(keys, urnKey{n.Contact.OrgID_, string(u.Identity())})
+		}
+	}
+	owners, err := lookupURNOwners(ctx, rt, keys)
+	if err != nil {
+		return err
+	}
+
+	rc := rt.VK.Get()
+	defer rc.Close()
+
+	for _, contactID := range order {
+		n := byContact[contactID]
+
+		toAppend := appendableURNs(rt, n.Contact, n.URNs, owners)
+		if err := queueContactNewURNs(ctx, rc, n.Contact.OrgID_, n.Contact.ID_, n.ChannelID, toAppend); err != nil {
+			return fmt.Errorf("error queuing contact_changed task: %w", err)
+		}
+	}
+	return nil
 }
 
 // StatusChange represents an actual change in status for a message

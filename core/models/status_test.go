@@ -9,11 +9,15 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/gomodule/redigo/redis"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/testsuite"
 	"github.com/nyaruka/gocommon/aws/dynamo"
 	"github.com/nyaruka/gocommon/dbutil/assertdb"
+	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/svclogs"
+	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/vkutil/assertvk"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -532,4 +536,84 @@ func TestWriteStatusUpdatesLogCap(t *testing.T) {
 	// after which nothing more is recorded
 	assert.Empty(t, write("W", "D", "E"))
 	assertMsg("F", 3, 29, false)
+}
+
+func TestWriteStatusUpdatesOtherURNs(t *testing.T) {
+	ctx, rt := testsuite.Runtime(t)
+
+	defer testsuite.ResetDB(t, rt)
+	defer testsuite.ResetValkey(t, rt)
+
+	rc := rt.VK.Get()
+	defer rc.Close()
+
+	newStatus := func(msgUUID models.MsgUUID, status models.MsgStatus, otherURN urns.URN) *models.StatusUpdate {
+		s := &models.StatusUpdate{
+			ChannelUUID_: "dbc126ed-66bc-4e28-b67b-81dc3327c95d",
+			ChannelID_:   10,
+			MsgUUID_:     msgUUID,
+			Status_:      status,
+			LogUUID:      "019a6e53-e1e8-7df7-a264-ce2372824e1d",
+		}
+		return s.WithOtherURN(otherURN)
+	}
+	assertQueuedNewURN := func(urn string) {
+		assertvk.LLen(t, rc, "c:1:100", 1)
+
+		data, err := redis.Bytes(rc.Do("LPOP", "c:1:100"))
+		assert.NoError(t, err)
+
+		var task map[string]any
+		jsonx.MustUnmarshal(data, &task)
+		assert.Equal(t, "contact_changed", task["type"])
+		assert.Equal(t, map[string]any{
+			"channel_id": float64(10),
+			"new_urn":    map[string]any{"value": urn, "action": "append"},
+		}, task["task"])
+	}
+
+	// statuses for two messages to the same contact reporting the same URN, which nobody has yet - including
+	// delivered and read for the same message, which are written in separate rounds
+	_, err := models.WriteStatusUpdates(ctx, rt, []*models.StatusUpdate{
+		newStatus("0199df0f-9f82-7689-b02d-f34105991321", models.MsgStatusDelivered, "whatsapp:US.1234"),
+		newStatus("0199df0f-9f82-7689-b02d-f34105991321", models.MsgStatusRead, "whatsapp:US.1234"),
+		newStatus("019bb29e-b2c6-7e5f-b980-ccb3e9e21fbc", models.MsgStatusDelivered, "whatsapp:US.1234"),
+		newStatus("019a6e61-a4ce-7e60-86d0-aca6405ddb90", models.MsgStatusDelivered, "whatsapp:US.5678"), // no such message
+	})
+	assert.NoError(t, err)
+
+	// a single task to add the URN to the contact
+	assertQueuedNewURN("whatsapp:US.1234")
+
+	// once the contact has the URN, further statuses reporting it don't queue anything
+	rt.DB.MustExec(`INSERT INTO contacts_contacturn("identity", "path", "scheme", "priority", "contact_id", "org_id") VALUES('whatsapp:US.1234', 'US.1234', 'whatsapp', 50, 100, 1)`)
+
+	_, err = models.WriteStatusUpdates(ctx, rt, []*models.StatusUpdate{
+		newStatus("0199df0f-9f82-7689-b02d-f34105991321", models.MsgStatusRead, "whatsapp:US.1234"),
+	})
+	assert.NoError(t, err)
+
+	assertvk.LLen(t, rc, "c:1:100", 0)
+
+	// a URN owned by a contact with no other URNs is queued, as mailroom will reassign it
+	rt.DB.MustExec(`INSERT INTO contacts_contact("id", "is_active", "status", "created_on", "modified_on", "uuid", "ticket_count", "created_by_id", "modified_by_id", "org_id") VALUES(101, TRUE, 'A', NOW(), NOW(), 'c7e8f5d2-6a3b-4e1f-9d2c-8b5a4f3e2d1c', 0, 1, 1, 1)`)
+	rt.DB.MustExec(`INSERT INTO contacts_contacturn("identity", "path", "scheme", "priority", "contact_id", "org_id") VALUES('whatsapp:US.2345', 'US.2345', 'whatsapp', 50, 101, 1)`)
+
+	_, err = models.WriteStatusUpdates(ctx, rt, []*models.StatusUpdate{
+		newStatus("0199df0f-9f82-7689-b02d-f34105991321", models.MsgStatusRead, "whatsapp:US.2345"),
+	})
+	assert.NoError(t, err)
+
+	assertQueuedNewURN("whatsapp:US.2345")
+
+	// a URN owned by a contact with other URNs isn't, as mailroom would refuse to append it
+	rt.DB.MustExec(`INSERT INTO contacts_contacturn("identity", "path", "scheme", "priority", "contact_id", "org_id") VALUES('tel:+12065550101', '+12065550101', 'tel', 40, 101, 1)`)
+
+	_, err = models.WriteStatusUpdates(ctx, rt, []*models.StatusUpdate{
+		newStatus("0199df0f-9f82-7689-b02d-f34105991321", models.MsgStatusRead, "whatsapp:US.2345"),
+	})
+	assert.NoError(t, err)
+
+	assertvk.LLen(t, rc, "c:1:100", 0)
+	assert.Equal(t, 1, rt.Stats.Extract().URNConflicts)
 }
