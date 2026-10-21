@@ -1,9 +1,12 @@
 package web_test
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,7 +15,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/core/sender"
-	_ "github.com/nyaruka/courier/v26/handlers/webchat" // for a channel type that doesn't store channel logs
+	_ "github.com/nyaruka/courier/v26/handlers/chip" // for a channel type that doesn't store channel logs
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/courier/v26/testsuite"
@@ -92,9 +95,90 @@ func TestIncoming(t *testing.T) {
 	assert.Equal(t, 2, stored)
 }
 
+func TestIncomingClientGone(t *testing.T) {
+	rt := serverRuntime(t)
+
+	s := web.NewServer(rt)
+
+	handled := make(chan struct{}, 1)
+	s.OnRequestHandled(func(ch *models.Channel, evts []channels.Event, clog *models.ChannelLog) { handled <- struct{}{} })
+
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	testsuite.InsertChannel(t, rt, test.NewMockChannel("e4bb1578-29da-4fa5-a214-9da19dd24230", "MCK", "2020", "US", []string{urns.Phone.Prefix}, map[string]any{}))
+
+	logs := &capturingHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logs))
+	defer slog.SetDefault(prev)
+
+	// hold up writing the message until the provider has given up waiting for a response
+	tx, err := rt.DB.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	_, err = tx.ExecContext(t.Context(), `LOCK TABLE msgs_msg IN ACCESS EXCLUSIVE MODE`)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", "http://localhost:8180/c/mck/e4bb1578-29da-4fa5-a214-9da19dd24230/receive?from=2065551212&text=hello", nil)
+	_, err = http.DefaultClient.Do(req)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// give the server time to notice the client has gone, which it does in the background
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, tx.Rollback())
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "request wasn't handled")
+	}
+
+	// the message was still written, with nothing to report
+	var count int
+	require.NoError(t, rt.DB.Get(&count, `SELECT count(*) FROM msgs_msg WHERE text = 'hello'`))
+	assert.Equal(t, 1, count)
+	assert.Empty(t, logs.messages(slog.LevelError))
+}
+
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *capturingHandler) messages(level slog.Level) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var msgs []string
+	for _, r := range h.records {
+		if r.Level == level {
+			msgs = append(msgs, r.Message)
+		}
+	}
+	return msgs
+}
+
 func TestOutgoing(t *testing.T) {
 	rt := serverRuntime(t)
 	dyntest.Truncate(t, rt.Dynamo.Main.Client(), rt.Dynamo.Main.Table())
+
+	rt.Config.ChipAuthToken = "sesame"
 
 	s := web.NewServer(rt)
 	rt.HTTP.Default.Transport = httpx.WithTraces(httpx.WithMocks(nil, map[string][]*httpx.MockResponse{
@@ -104,6 +188,10 @@ func TestOutgoing(t *testing.T) {
 			httpx.NewMockResponse(200, nil, []byte(`SENT`)),
 			httpx.NewMockResponse(429, nil, []byte(`too much!`)),
 			httpx.NewMockResponse(403, nil, []byte(`stop!`)),
+		},
+		// the webchat service, which the webchat channel's message below is posted to
+		"http://localhost:8071/wi/send": {
+			httpx.NewMockResponse(200, nil, []byte(`{}`)),
 		},
 	}))
 
@@ -233,24 +321,24 @@ func TestOutgoing(t *testing.T) {
 	assert.Equal(t, 1, numStopEvents)
 
 	// queue a message on a webchat channel - a type that doesn't store channel logs - it should still be
-	// sent (an internal publish) and marked as wired...
-	wchChannel := test.NewMockChannel("0665bf36-4d2e-4c3f-b8a1-9f8e6a5c2d71", "WCH", "", "", []string{urns.WebChat.Prefix}, nil)
-	testsuite.InsertChannel(t, rt, wchChannel)
+	// sent (a post to the webchat service) and marked as wired...
+	chpChannel := test.NewMockChannel("0665bf36-4d2e-4c3f-b8a1-9f8e6a5c2d71", "CHP", "", "", []string{urns.WebChat.Prefix}, nil)
+	testsuite.InsertChannel(t, rt, chpChannel)
 
 	wchMsg := &models.MsgOut{
 		OrgID_: 1, UUID_: "0199df05-a01b-7000-8f5e-2c3d4e5f6a7b", Contact_: &models.ContactReference{ID: 100, UUID: "a984069d-0008-4d8c-a772-b14a8a6acccc"},
-		Text_: "hi", HighPriority_: true, CreatedOn_: time.Now(), ChannelUUID_: wchChannel.UUID(), URN_: "webchat:65vbbDAQCdPdEWlEhDGy4utO", Origin_: models.MsgOriginChat,
+		Text_: "hi", HighPriority_: true, CreatedOn_: time.Now(), ChannelUUID_: chpChannel.UUID(), URN_: "webchat:65vbbDAQCdPdEWlEhDGy4utO", Origin_: models.MsgOriginChat,
 	}
-	insertMsg(wchMsg.UUID_, wchChannel)
+	insertMsg(wchMsg.UUID_, chpChannel)
 	rc = rt.VK.Get()
-	require.NoError(t, queue.PushOntoQueue(rc, "msgs", string(wchChannel.UUID()), 10, "["+string(jsonx.MustMarshal(wchMsg))+"]", queue.HighPriority))
+	require.NoError(t, queue.PushOntoQueue(rc, "msgs", string(chpChannel.UUID()), 10, "["+string(jsonx.MustMarshal(wchMsg))+"]", queue.HighPriority))
 	rc.Close()
 	assertStatus(wchMsg.UUID_, models.MsgStatusWired)
 
 	// ...but without a channel log being stored for it
 	rt.Dynamo.Main.Flush()
 	for _, item := range dyntest.ScanAll(t, rt.Dynamo.Main.Client(), rt.Dynamo.Main.Table()) {
-		assert.False(t, strings.HasPrefix(item.Key.PK, "cha#"+string(wchChannel.UUID())), "unexpected channel log stored for webchat channel")
+		assert.False(t, strings.HasPrefix(item.Key.PK, "cha#"+string(chpChannel.UUID())), "unexpected channel log stored for webchat channel")
 	}
 }
 
@@ -335,8 +423,8 @@ func TestFetchAttachment(t *testing.T) {
 	assert.JSONEq(t, `{"attachment": {"content_type": "unavailable", "url": "http://mock.com/media/hello.pdf", "size": 0}, "log_uuid": "0191e180-8530-7000-8920-17713634b9f5"}`, string(respBody))
 
 	// a fetch for a channel type that doesn't store channel logs still works
-	testsuite.InsertChannel(t, rt, test.NewMockChannel("0665bf36-4d2e-4c3f-b8a1-9f8e6a5c2d71", "WCH", "", "", []string{urns.WebChat.Prefix}, nil))
-	statusCode, respBody = submit(`{"channel_uuid": "0665bf36-4d2e-4c3f-b8a1-9f8e6a5c2d71", "channel_type": "WCH", "url": "http://mock.com/media/hello2.jpg"}`, "sesame")
+	testsuite.InsertChannel(t, rt, test.NewMockChannel("0665bf36-4d2e-4c3f-b8a1-9f8e6a5c2d71", "CHP", "", "", []string{urns.WebChat.Prefix}, nil))
+	statusCode, respBody = submit(`{"channel_uuid": "0665bf36-4d2e-4c3f-b8a1-9f8e6a5c2d71", "channel_type": "CHP", "url": "http://mock.com/media/hello2.jpg"}`, "sesame")
 	assert.Equal(t, 200, statusCode)
 	assert.Contains(t, string(respBody), `"image/jpeg"`)
 

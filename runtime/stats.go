@@ -42,7 +42,10 @@ type Stats struct {
 	OutgoingErrors   CountByType    // number of sends that errored
 	OutgoingDuration DurationByType // total time spent sending messages
 
-	ContactsCreated int
+	ContactsCreated           int
+	ContactsMatchedByOtherURN int // messages whose contact was found by another URN the sender reported, e.g. their BSUID
+	URNAppends                int // reported URNs found addable to their contact
+	URNConflicts              int // reported URNs left with another contact that owns them
 }
 
 func newStats() *Stats {
@@ -76,6 +79,9 @@ func (s *Stats) ToMetrics(advanced bool) []types.MetricDatum {
 		metrics = append(metrics, s.IncomingDuration.metrics("IncomingDuration", func(typ string) int { return s.IncomingRequests[typ] })...)
 		metrics = append(metrics, s.OutgoingDuration.metrics("OutgoingDuration", func(typ string) int { return s.OutgoingSends[typ] + s.OutgoingErrors[typ] })...)
 		metrics = append(metrics, cwatch.Datum("ContactsCreated", float64(s.ContactsCreated), types.StandardUnitCount))
+		metrics = append(metrics, cwatch.Datum("ContactsMatchedByOtherURN", float64(s.ContactsMatchedByOtherURN), types.StandardUnitCount))
+		metrics = append(metrics, cwatch.Datum("URNAppends", float64(s.URNAppends), types.StandardUnitCount))
+		metrics = append(metrics, cwatch.Datum("URNConflicts", float64(s.URNConflicts), types.StandardUnitCount))
 	}
 
 	return metrics
@@ -126,6 +132,25 @@ func (c *StatsCollector) RecordOutgoing(typ string, success bool, d time.Duratio
 func (c *StatsCollector) RecordContactCreated() {
 	c.mutex.Lock()
 	c.stats.ContactsCreated++
+	c.mutex.Unlock()
+}
+
+func (c *StatsCollector) RecordContactMatchedByOtherURN() {
+	c.mutex.Lock()
+	c.stats.ContactsMatchedByOtherURN++
+	c.mutex.Unlock()
+}
+
+// RecordURNOutcome records what became of a URN a provider reported for a contact which the contact didn't have:
+// addable, or left with another contact. Counted as decided, which is before any message is written or append
+// queued, so a duplicate message still counts.
+func (c *StatsCollector) RecordURNOutcome(appendable bool) {
+	c.mutex.Lock()
+	if appendable {
+		c.stats.URNAppends++
+	} else {
+		c.stats.URNConflicts++
+	}
 	c.mutex.Unlock()
 }
 
