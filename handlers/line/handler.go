@@ -1,3 +1,4 @@
+// API docs: https://developers.line.biz/en/reference/messaging-api/
 package line
 
 import (
@@ -211,7 +212,7 @@ func (h *handler) validateSignature(channel *models.Channel, r *http.Request) er
 	return nil
 }
 
-// see https://developers.line.me/en/docs/messaging-api/reference/#signature-validation
+// see https://developers.line.biz/en/reference/messaging-api/#signature-validation
 func calculateSignature(secret string, r *http.Request) ([]byte, error) {
 	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
@@ -415,6 +416,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 			}
 
 			resp, respBody, err := h.RequestHTTP(req, clog)
+			res.AddCost(1)
 
 			if err == nil && resp.StatusCode/100 == 2 {
 				batch = []string{}
@@ -443,21 +445,26 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 					return err
 				}
 
-				resp, respBody, _ := h.RequestHTTP(req, clog)
+				resp, respBody, err := h.RequestHTTP(req, clog)
+				res.AddCost(1)
 
+				if err != nil || resp.StatusCode/100 == 5 {
+					return channels.ErrConnectionFailed
+				}
 				if handlers.IsThrottled(resp) {
 					return channels.ErrConnectionThrottled
 				}
 
-				respPayload := &mtResponse{}
-				err = json.Unmarshal(respBody, respPayload)
-				if err != nil {
-					return channels.ErrResponseUnparseable
-				}
-
 				if resp.StatusCode/100 != 2 {
+					respPayload := &mtResponse{}
+					if err := json.Unmarshal(respBody, respPayload); err != nil {
+						return channels.ErrResponseUnparseable
+					}
 					return channels.ErrFailedWithReason(strconv.Itoa(resp.StatusCode), respPayload.Message)
 				}
+
+				batch = []string{}
+				batchCount = 0
 			} else {
 				return channels.ErrFailedWithReason(strconv.Itoa(resp.StatusCode), respPayload.Message)
 			}

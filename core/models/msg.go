@@ -18,10 +18,10 @@ import (
 	"github.com/lib/pq"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
-	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/dbutil"
 	"github.com/nyaruka/gocommon/i18n"
+	"github.com/nyaruka/gocommon/queues"
 	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
@@ -302,7 +302,32 @@ func writeMsgToDB(ctx context.Context, rt *runtime.Runtime, m *MsgIn, clog *Chan
 		return nil, fmt.Errorf("error inserting message: %w", err)
 	}
 
+	incrementMsgTallies(ctx, rt, m)
+
 	return contact, nil
+}
+
+// counts the given inserted message on its channel and workspace for its day, logging rather than failing on errors
+// since the message has already been written
+func incrementMsgTallies(ctx context.Context, rt *runtime.Runtime, m *MsgIn) {
+	vc := rt.VK.Get()
+	defer vc.Close()
+
+	orgID := m.Channel_.OrgID()
+	amounts := map[string]int64{
+		dailyChannelTally(m.Channel_.ID(), "text:in", m.CreatedOn_): 1,
+		dailyOrgTally(orgID, "msgs/text:in", m.CreatedOn_):          1,
+	}
+
+	if err := rt.Tallies.Increment(ctx, vc, amounts); err != nil {
+		slog.Error("error incrementing msg tallies", "error", err, "msg", m.UUID_)
+	}
+}
+
+// dailyOrgTally returns the tally field for the given org's total of scope on the UTC day of t, in the form the
+// tallies flusher in mailroom parses, e.g. O123|msgs/text:in@2025-05-04
+func dailyOrgTally(orgID OrgID, scope string, t time.Time) string {
+	return fmt.Sprintf("O%d|%s@%s", orgID, scope, t.UTC().Format(time.DateOnly))
 }
 
 // flushMsgs is the flush function for the msg spool - it retries writing spooled msgs to the database, returning
@@ -562,8 +587,9 @@ type MsgOut struct {
 	Session_              *Session          `json:"session"`
 
 	// set when popped from the queue rather than unmarshaled
-	Channel_     *Channel          `json:"-"`
-	WorkerToken_ queue.WorkerToken `json:"-"`
+	Channel_    *Channel       `json:"-"`
+	QueueOwner_ queues.OwnerID `json:"-"`
+	queued      []byte         // as popped, so it can be put back as it was
 }
 
 func (m *MsgOut) UUID() MsgUUID                { return m.UUID_ }
@@ -590,50 +616,45 @@ func PopNextOutgoingMsg(ctx context.Context, rt *runtime.Runtime) (*MsgOut, erro
 	vc := rt.VK.Get()
 	defer vc.Close()
 
-	markComplete := func(token queue.WorkerToken) {
-		if err := queue.MarkComplete(vc, MsgQueueName, token); err != nil {
+	markComplete := func(owner queues.OwnerID) {
+		// nothing was sent so nothing was used of the channel's throughput
+		if err := markQueueDone(ctx, vc, owner, 0); err != nil {
 			slog.Error("error marking queue task complete", "error", err)
 		}
 	}
 
 	// pop the next message off our queue
-	token, msgJSON, err := queue.PopFromQueue(vc, MsgQueueName)
+	owner, msgJSON, err := MsgQueue.Pop(ctx, vc)
 	if err != nil {
 		return nil, err
 	}
 
-	for token == queue.Retry {
-		token, msgJSON, err = queue.PopFromQueue(vc, MsgQueueName)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if msgJSON == "" {
+	if owner == "" {
 		return nil, nil
 	}
 
 	msg := &MsgOut{}
-	if err := json.Unmarshal([]byte(msgJSON), msg); err != nil {
-		markComplete(token)
+	if err := json.Unmarshal(msgJSON, msg); err != nil {
+		markComplete(owner)
 		return nil, fmt.Errorf("unable to unmarshal message: %s: %w", string(msgJSON), err)
 	}
 
 	if err := utils.Validate(msg); err != nil {
-		markComplete(token)
+		markComplete(owner)
 		return nil, fmt.Errorf("queued message failed validation: %s: %w", string(msgJSON), err)
 	}
 
 	// populate the channel on our msg object
 	channel, err := GetChannel(ctx, AnyChannelType, msg.ChannelUUID_)
 	if err != nil {
-		markComplete(token)
+		markComplete(owner)
 		return nil, err
 	}
 
 	// add some extra info to the popped message
 	msg.Channel_ = channel
-	msg.WorkerToken_ = token
+	msg.QueueOwner_ = owner
+	msg.queued = msgJSON
 
 	// clear out our seen incoming messages
 	clearMsgSeen(ctx, vc, msg)
@@ -659,15 +680,54 @@ func ClearMsgSent(ctx context.Context, rt *runtime.Runtime, uuid MsgUUID) error 
 	return sentMsgs.Rem(ctx, rc, string(uuid))
 }
 
-// OnSendComplete is called when the sender has finished trying to send a message, with any other URNs the provider
-// reported for the recipient
-func OnSendComplete(ctx context.Context, rt *runtime.Runtime, msg *MsgOut, status *StatusUpdate, otherURNs []urns.URN, clog *ChannelLog) {
+// markQueueDone gets its own context because the caller's may already be used up, and a Done that never happens
+// leaves the owner's in-flight count permanently one too high
+func markQueueDone(ctx context.Context, rc redis.Conn, owner queues.OwnerID, cost int) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	return MsgQueue.Done(ctx, rc, owner, cost)
+}
+
+// PauseSending stops messages being popped for the given msg's channel until the given time
+func PauseSending(ctx context.Context, rt *runtime.Runtime, msg *MsgOut, until time.Time) error {
+	rc := rt.VK.Get()
+	defer rc.Close()
+
+	rt.Stats.RecordOutgoingBackoff(string(msg.Channel().ChannelType()))
+
+	return MsgQueue.Pause(ctx, rc, msg.QueueOwner_, until)
+}
+
+// OnSendRequeued is called instead of OnSendComplete for a message the provider didn't take, putting it back in the
+// queue to be sent before anything else queued for its channel
+func OnSendRequeued(ctx context.Context, rt *runtime.Runtime, msg *MsgOut, clog *ChannelLog) error {
+	rc := rt.VK.Get()
+	defer rc.Close()
+
+	batch := make([]byte, 0, len(msg.queued)+2)
+	batch = append(append(append(batch, '['), msg.queued...), ']')
+
+	if err := MsgQueue.Requeue(ctx, rc, msg.QueueOwner_, batch); err != nil {
+		return err
+	}
+
+	rt.Stats.RecordOutgoingRequeue(string(msg.Channel().ChannelType()), clog.Elapsed)
+	return nil
+}
+
+// OnSendComplete is called when the sender has finished trying to send a message, with what the send cost of the
+// channel's throughput and any other URNs the provider reported for the recipient
+func OnSendComplete(
+	ctx context.Context, rt *runtime.Runtime, msg *MsgOut, status *StatusUpdate, cost int, otherURNs []urns.URN,
+	clog *ChannelLog,
+) {
 	log := slog.With("channel", msg.Channel().UUID(), "msg", msg.UUID(), "clog", clog.UUID, "status", status)
 
 	rc := rt.VK.Get()
 	defer rc.Close()
 
-	if err := queue.MarkComplete(rc, MsgQueueName, msg.WorkerToken_); err != nil {
+	if err := markQueueDone(ctx, rc, msg.QueueOwner_, cost); err != nil {
 		log.Error("unable to mark queue task complete", "error", err)
 	}
 

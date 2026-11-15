@@ -1,3 +1,4 @@
+// API docs: https://developer.vonage.com/en/api/sms
 package nexmo
 
 import (
@@ -222,6 +223,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 			resp, respBody, requestErr = h.RequestHTTP(req, clog)
+			res.AddCost(gsm7.Segments(part))
 			matched := throttledRE.FindAllStringSubmatch(string(respBody), -1)
 			if len(matched) > 0 && len(matched[0]) > 0 {
 				return channels.ErrConnectionThrottled

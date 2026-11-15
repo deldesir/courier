@@ -50,6 +50,7 @@
         "external_ids": [
             "58f86fab-85c5-4f7c-9b68-9c323248afc4:0"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -106,6 +107,7 @@
         "external_ids": [
             "58f86fab-85c5-4f7c-9b68-9c323248afc4:0"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -158,6 +160,7 @@
                 }
             }
         ],
+        "cost": 1,
         "error": {
             "message": "response status code",
             "log_error": {
@@ -217,6 +220,7 @@
                 }
             }
         ],
+        "cost": 1,
         "error": {
             "message": "channel rate limited",
             "retryable": true,
@@ -349,6 +353,7 @@
         "external_ids": [
             "f75fbe1e-a0c0-4923-96e8-5043aa617b2b:0"
         ],
+        "cost": 2,
         "log_errors": []
     },
     {
@@ -472,6 +477,88 @@
                 }
             }
         ],
+        "cost": 2,
+        "error": {
+            "message": "response status code",
+            "log_error": {
+                "code": "response_status",
+                "message": "Response has non-success status code."
+            }
+        },
+        "log_errors": []
+    },
+    {
+        "label": "Media Send Error On First Attachment",
+        "msg": {
+            "text": "Medias",
+            "urn": "whatsapp:14133881111",
+            "attachments": [
+                "image/jpg:https://foo.bar/image.jpg",
+                "image/png:https://foo.bar/video.wmv"
+            ]
+        },
+        "http_mocks": {
+            "https://api.kaleyra.io/v1/SID/messages": [
+                {
+                    "status": 400,
+                    "body": {
+                        "error": {
+                            "media": "invalid media type"
+                        }
+                    }
+                }
+            ],
+            "https://foo.bar/image.jpg": [
+                {
+                    "status": 200,
+                    "body": "image bytes"
+                }
+            ]
+        },
+        "requests": [
+            {
+                "method": "GET",
+                "url": "https://foo.bar/image.jpg"
+            },
+            {
+                "method": "POST",
+                "url": "https://api.kaleyra.io/v1/SID/messages",
+                "headers": {
+                    "Content-Type": "multipart/form-data"
+                },
+                "form": {
+                    "api-key": [
+                        "123456"
+                    ],
+                    "callback_url": [
+                        "https://localhost/c/kwa/8eb23e93-5ecb-45ba-b726-3b064e0c568c/status"
+                    ],
+                    "caption": [
+                        "Medias"
+                    ],
+                    "channel": [
+                        "WhatsApp"
+                    ],
+                    "from": [
+                        "250788383383"
+                    ],
+                    "to": [
+                        "14133881111"
+                    ],
+                    "type": [
+                        "media"
+                    ]
+                },
+                "files": {
+                    "media": {
+                        "filename": "image.jpg",
+                        "content_type": "application/octet-stream",
+                        "body": "image bytes"
+                    }
+                }
+            }
+        ],
+        "cost": 1,
         "error": {
             "message": "response status code",
             "log_error": {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/gomodule/redigo/redis"
 	"github.com/nyaruka/courier/v26/core/channels"
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/core/sender"
@@ -19,13 +20,13 @@ import (
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/courier/v26/testsuite"
-	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/courier/v26/web"
 	"github.com/nyaruka/gocommon/aws/dynamo"
 	"github.com/nyaruka/gocommon/aws/dynamo/dyntest"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/jsonx"
+	"github.com/nyaruka/gocommon/queues"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
 	"github.com/stretchr/testify/assert"
@@ -188,6 +189,9 @@ func TestOutgoing(t *testing.T) {
 			httpx.NewMockResponse(200, nil, []byte(`SENT`)),
 			httpx.NewMockResponse(429, nil, []byte(`too much!`)),
 			httpx.NewMockResponse(403, nil, []byte(`stop!`)),
+			httpx.NewMockResponse(503, nil, []byte(`full!`)),
+			httpx.NewMockResponse(507, nil, []byte(`not taken!`)),
+			httpx.NewMockResponse(200, nil, []byte(`SENT`)),
 		},
 		// the webchat service, which the webchat channel's message below is posted to
 		"http://localhost:8071/wi/send": {
@@ -233,7 +237,7 @@ func TestOutgoing(t *testing.T) {
 
 		rc := rt.VK.Get()
 		defer rc.Close()
-		require.NoError(t, queue.PushOntoQueue(rc, "msgs", string(ch.UUID()), 10, "["+string(jsonx.MustMarshal(m))+"]", queue.HighPriority))
+		require.NoError(t, models.MsgQueue.Push(t.Context(), rc, queues.OwnerID(ch.UUID()), 10, true, []byte("["+string(jsonx.MustMarshal(m))+"]")))
 	}
 
 	// waits for the msg to reach the given status in the database (status writes are batched), reporting the status
@@ -290,7 +294,7 @@ func TestOutgoing(t *testing.T) {
 		OrgID_: 1, UUID_: "0199df01-dacc-754b-a830-ab2bf0f511d3", Contact_: &models.ContactReference{ID: 100, UUID: "a984069d-0008-4d8c-a772-b14a8a6acccc"},
 		Text_: "test message 2", HighPriority_: true, CreatedOn_: time.Now(), ChannelUUID_: mockChannel.UUID(), URN_: "tel:+12067799192", Origin_: models.MsgOriginChat,
 	}
-	require.NoError(t, queue.PushOntoQueue(rc, "msgs", string(mockChannel.UUID()), 10, "["+string(jsonx.MustMarshal(m2))+"]", queue.HighPriority))
+	require.NoError(t, models.MsgQueue.Push(t.Context(), rc, queues.OwnerID(mockChannel.UUID()), 10, true, []byte("["+string(jsonx.MustMarshal(m2))+"]")))
 	rc.Close()
 
 	var numLogs int
@@ -320,6 +324,39 @@ func TestOutgoing(t *testing.T) {
 	require.NoError(t, rt.DB.Get(&numStopEvents, `SELECT count(*) FROM channels_channelevent WHERE event_type = 'stop_contact'`))
 	assert.Equal(t, 1, numStopEvents)
 
+	// send message which will have mocked backoff error.. should be marked as errored (retryable) and pause the channel
+	send("0199df05-1a2b-7c3d-8e4f-5a6b7c8d9e0f", mockChannel, "7")
+	assertStatus("0199df05-1a2b-7c3d-8e4f-5a6b7c8d9e0f", models.MsgStatusErrored)
+
+	rc = rt.VK.Get()
+	pausedUntil, err := redis.Float64(rc.Do("HGET", "{msgs}:ch:"+string(mockChannel.UUID()), "paused_until"))
+	rc.Close()
+	require.NoError(t, err)
+	assert.InDelta(t, float64(time.Now().Add(time.Minute).Unix()), pausedUntil, 5)
+
+	// so the channel's next message waits in the queue
+	send("0199df05-2b3c-7d4e-8f5a-6b7c8d9e0f1a", mockChannel, "8")
+	time.Sleep(500 * time.Millisecond)
+	assertStatus("0199df05-2b3c-7d4e-8f5a-6b7c8d9e0f1a", models.MsgStatusQueued)
+
+	rc = rt.VK.Get()
+	high, _, _, err := models.MsgQueue.Size(t.Context(), rc)
+	rc.Close()
+	require.NoError(t, err)
+	assert.Equal(t, 1, high)
+
+	// send a message on another channel which the provider doesn't take.. it should be put back without counting as an
+	// attempt, and sent once the channel's pause ends
+	notSentChannel := test.NewMockChannel("7a0e9d4c-3b1f-4e2a-9c8d-5f6e7a8b9c0d", "MCK", "2022", "US", []string{urns.Phone.Prefix}, map[string]any{})
+	testsuite.InsertChannel(t, rt, notSentChannel)
+
+	send("0199df05-3c4d-7e5f-8a6b-7c8d9e0f1a2b", notSentChannel, "9")
+	assertStatus("0199df05-3c4d-7e5f-8a6b-7c8d9e0f1a2b", models.MsgStatusWired)
+
+	var errorCount int
+	require.NoError(t, rt.DB.Get(&errorCount, `SELECT error_count FROM msgs_msg WHERE uuid = '0199df05-3c4d-7e5f-8a6b-7c8d9e0f1a2b'`))
+	assert.Zero(t, errorCount)
+
 	// queue a message on a webchat channel - a type that doesn't store channel logs - it should still be
 	// sent (a post to the webchat service) and marked as wired...
 	chpChannel := test.NewMockChannel("0665bf36-4d2e-4c3f-b8a1-9f8e6a5c2d71", "CHP", "", "", []string{urns.WebChat.Prefix}, nil)
@@ -331,7 +368,7 @@ func TestOutgoing(t *testing.T) {
 	}
 	insertMsg(wchMsg.UUID_, chpChannel)
 	rc = rt.VK.Get()
-	require.NoError(t, queue.PushOntoQueue(rc, "msgs", string(chpChannel.UUID()), 10, "["+string(jsonx.MustMarshal(wchMsg))+"]", queue.HighPriority))
+	require.NoError(t, models.MsgQueue.Push(t.Context(), rc, queues.OwnerID(chpChannel.UUID()), 10, true, []byte("["+string(jsonx.MustMarshal(wchMsg))+"]")))
 	rc.Close()
 	assertStatus(wchMsg.UUID_, models.MsgStatusWired)
 

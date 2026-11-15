@@ -1,3 +1,4 @@
+// API docs: https://developers.messagebird.com/api/sms-messaging/
 package messagebird
 
 /*
@@ -22,6 +23,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/gsm7"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
@@ -246,6 +248,11 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 	req.Header.Set("Authorization", bearer)
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
+	if len(msg.Attachments()) > 0 {
+		res.AddCost(1)
+	} else {
+		res.AddCost(gsm7.Segments(payload.Body))
+	}
 	if err := handlers.ErrorFromResponse(resp, err); err != nil {
 		return err
 	}

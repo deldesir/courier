@@ -22,6 +22,7 @@ type Runtime struct {
 	S3         *s3x.Service
 	CW         *cwatch.Service
 	Centrifugo *centrifugo.Service
+	Tallies    *vkutil.Tallies
 
 	HTTP  *HTTP
 	Stats *StatsCollector
@@ -69,6 +70,9 @@ func NewRuntime(cfg *Config) (*Runtime, error) {
 	}
 
 	rt.Centrifugo = centrifugo.NewService(centrifugo.NewClient(cfg.CentrifugoEndpoint, cfg.CentrifugoKey), rt.VK)
+
+	// key base is shared with mailroom which flushes these to the database
+	rt.Tallies = vkutil.NewTallies("tallies")
 
 	rt.HTTP = newHTTP(cfg)
 	rt.Stats = NewStatsCollector()

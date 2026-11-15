@@ -1,3 +1,4 @@
+// API docs: https://docs.360dialog.com/docs/guides/send-and-receive-messages
 package dialog360
 
 import (
@@ -270,6 +271,7 @@ func (h *handler) requestD3C(payload whatsapp.SendRequest, accessToken string, r
 	req.Header.Set("Accept", "application/json")
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
+	res.AddCost(1)
 	if err != nil || resp.StatusCode/100 == 5 {
 		return "", channels.ErrConnectionFailed
 	}

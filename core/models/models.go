@@ -10,15 +10,13 @@ import (
 
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/cache"
+	"github.com/nyaruka/gocommon/queues"
 	"github.com/nyaruka/gocommon/spools"
 	"github.com/nyaruka/gocommon/syncx"
 	"github.com/nyaruka/vkutil"
 )
 
 const (
-	// MsgQueueName is the name of the queue that outgoing messages are popped from
-	MsgQueueName = "msgs"
-
 	// our timeout for looking up channels and contacts
 	fetchTimeout = time.Second * 20
 
@@ -47,6 +45,9 @@ var (
 	statusWriter *StatusWriter
 	writerWG     *sync.WaitGroup
 )
+
+// MsgQueue is the queue of outgoing messages waiting to be sent
+var MsgQueue = queues.NewMsgsV2("msgs")
 
 // valkey backed trackers which hold no local state
 var (

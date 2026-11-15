@@ -1,3 +1,4 @@
+// API docs: https://developers.facebook.com/docs/messenger-platform/send-messages
 package facebook_legacy
 
 import (
@@ -500,6 +501,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		req.Header.Set("Accept", "application/json")
 
 		resp, respBody, err := h.RequestHTTP(req, clog)
+		res.AddCost(1)
 		if err := handlers.ErrorFromResponse(resp, err); err != nil {
 			return err
 		}

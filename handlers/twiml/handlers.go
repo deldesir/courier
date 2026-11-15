@@ -1,3 +1,4 @@
+// API docs: https://www.twilio.com/docs/messaging/api/message-resource
 package twiml
 
 /*
@@ -27,6 +28,7 @@ import (
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/courier/v26/utils"
+	"github.com/nyaruka/gocommon/gsm7"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
 	"github.com/nyaruka/gocommon/jsonx"
@@ -314,6 +316,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		req.Header.Set("Accept", "application/json")
 
 		resp, respBody, err := h.RequestHTTP(req, clog)
+		res.AddCost(1)
 		if err != nil || resp.StatusCode/100 == 5 {
 			return channels.ErrConnectionFailed
 		}
@@ -407,6 +410,11 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 			req.Header.Set("Accept", "application/json")
 
 			resp, respBody, err := h.RequestHTTP(req, clog)
+			if channel.IsScheme(urns.WhatsApp) || (i == 0 && len(attachments) > 0) {
+				res.AddCost(1)
+			} else {
+				res.AddCost(gsm7.Segments(part))
+			}
 			if err != nil || resp.StatusCode/100 == 5 {
 				return channels.ErrConnectionFailed
 			}

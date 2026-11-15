@@ -12,15 +12,15 @@ import (
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/core/sender"
 	"github.com/nyaruka/courier/v26/runtime"
-	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/courier/v26/web"
 )
 
-// shutdownTimeout is how long we allow for a graceful shutdown before exiting hard. The shutdown phases are
-// individually bounded (in-flight requests and the final status flush at 30s, in-flight sends at 35s) but run
-// partly in sequence, so a legitimate slow shutdown can approach ~60s. Past this budget something is genuinely
-// wedged, and it's better to exit with a record of why than be killed by the orchestrator. Orchestrator stop
-// timeouts should be set a bit above this so the watchdog fires first.
+// shutdownTimeout is how long we allow for a graceful shutdown before exiting hard. The shutdown phases - finishing
+// in-flight requests, a pop of the next message and the send that follows it, and the final status flush - each
+// have their own timeout but run partly in sequence: stopping the sender alone can take most of this budget if a pop
+// and the send that follows it both time out, and if the phases after it time out as well then the watchdog fires.
+// Past this budget something is genuinely wedged, and it's better to exit with a record of why than be killed by
+// the orchestrator. Orchestrator stop timeouts should be set a bit above this so the watchdog fires first.
 const shutdownTimeout = 90 * time.Second
 
 // Service starts the courier service, blocks until a termination signal is received, then stops it. The config
@@ -87,11 +87,6 @@ func startService(rt *runtime.Runtime) (*service, error) {
 	if err := models.Start(rt); err != nil {
 		rt.Stop()
 		return nil, err
-	}
-
-	// start our dethrottler if we are going to be doing some sending
-	if rt.Config.MaxWorkers > 0 {
-		queue.StartDethrottler(rt.VK, s.quit, s.waitFor, models.MsgQueueName)
 	}
 
 	startMetricsReporter(rt, time.Minute, s.quit, s.waitFor)
