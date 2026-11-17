@@ -1,3 +1,4 @@
+// API docs: https://whatsapp.turn.io/docs/api/messages
 package turn
 
 import (
@@ -680,6 +681,7 @@ func (h *handler) makeAPIRequest(payload any, accessToken string, res *channels.
 	req.Header.Set("Accept", "application/json")
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
+	res.AddCost(1)
 	if err != nil || resp.StatusCode/100 == 5 {
 		return channels.ErrConnectionFailed
 	}
@@ -687,7 +689,7 @@ func (h *handler) makeAPIRequest(payload any, accessToken string, res *channels.
 	// Retry-After / X-Ratelimit-* headers. Treat that as throttled so the message is
 	// retried via the errored queue rather than permanently failed.
 	if handlers.IsThrottled(resp) {
-		return channels.ErrConnectionThrottled
+		return handlers.ThrottledError(resp)
 	}
 
 	respPayload := &mtResponsePayload{}

@@ -21,7 +21,6 @@ import (
 	"github.com/nyaruka/courier/v26/test"
 	"github.com/nyaruka/courier/v26/testsuite"
 	"github.com/nyaruka/courier/v26/utils"
-	"github.com/nyaruka/courier/v26/utils/queue"
 	"github.com/nyaruka/gocommon/aws/dynamo"
 	"github.com/nyaruka/gocommon/aws/dynamo/dyntest"
 	"github.com/nyaruka/gocommon/centrifugo"
@@ -162,6 +161,35 @@ func (ts *ModelsTestSuite) TestContact() {
 
 	ts.Equal(null.String(longName[0:127]), contact3.Name_)
 
+}
+
+func (ts *ModelsTestSuite) TestGetContact() {
+	testsuite.ResetDB(ts.T(), ts.rt)
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, knChannel, nil, nil)
+	urn := urns.URN("tel:+12065551518")
+	ctx := context.Background()
+
+	// not allowed to create, so nothing to tell mailroom
+	contact, err := models.GetContact(ctx, ts.rt, knChannel, urn, nil, "", false, clog)
+	ts.NoError(err)
+	ts.Nil(contact)
+
+	// creating a contact queues it to mailroom as created
+	contact, err = models.GetContact(ctx, ts.rt, knChannel, urn, nil, "", true, clog)
+	ts.NoError(err)
+	ts.True(contact.IsNew_)
+	ts.assertQueuedContactTask(contact.ID_, "contact_created", map[string]any{"channel_id": float64(knChannel.ID())})
+
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	// fetching an existing one doesn't
+	contact2, err := models.GetContact(ctx, ts.rt, knChannel, urn, nil, "", true, clog)
+	ts.NoError(err)
+	ts.Equal(contact.ID_, contact2.ID_)
+	ts.assertNoQueuedContactTask(contact.ID_)
 }
 
 func (ts *ModelsTestSuite) TestContactRace() {
@@ -713,7 +741,7 @@ func (ts *ModelsTestSuite) TestCheckForDuplicate() {
 		"response_to_external_id": "external-id",
 		"is_resend": true
 	}]`
-	err = queue.PushOntoQueue(rc, models.MsgQueueName, "dbc126ed-66bc-4e28-b67b-81dc3327c95d", 10, string(msgJSON), queue.HighPriority)
+	err = models.MsgQueue.Push(ctx, rc, "dbc126ed-66bc-4e28-b67b-81dc3327c95d", 10, true, []byte(msgJSON))
 	ts.NoError(err)
 	_, err = models.PopNextOutgoingMsg(ctx, ts.rt)
 	ts.NoError(err)
@@ -757,7 +785,7 @@ func (ts *ModelsTestSuite) TestOutgoingQueue() {
 		"origin": "chat"
 	}]`
 
-	err := queue.PushOntoQueue(r, models.MsgQueueName, "dbc126ed-66bc-4e28-b67b-81dc3327c95d", 10, string(msgJSON), queue.HighPriority)
+	err := models.MsgQueue.Push(ctx, r, "dbc126ed-66bc-4e28-b67b-81dc3327c95d", 10, true, []byte(msgJSON))
 	ts.NoError(err)
 
 	// pop a message off our queue
@@ -775,7 +803,15 @@ func (ts *ModelsTestSuite) TestOutgoingQueue() {
 
 	// mark this message as dealt with, with the provider having reported the URN we sent to, one the contact already
 	// has, and a new one for the recipient
-	models.OnSendComplete(ctx, ts.rt, msg, models.NewStatusUpdate(msg.Channel(), msg.UUID(), models.MsgStatusWired, clog), []urns.URN{"tel:+12067799192", "whatsapp:US.9999", "whatsapp:US.4321"}, clog)
+	// and the send having cost 5 of the channel's 10 TPS
+	status := models.NewStatusUpdate(msg.Channel(), msg.UUID(), models.MsgStatusWired, clog)
+	otherURNs := []urns.URN{"tel:+12067799192", "whatsapp:US.9999", "whatsapp:US.4321"}
+	models.OnSendComplete(ctx, ts.rt, msg, status, 5, otherURNs, clog)
+
+	// which the queue charges as half a second of debt
+	debtUntil, err := redis.Float64(r.Do("HGET", "{msgs}:ch:dbc126ed-66bc-4e28-b67b-81dc3327c95d", "debt_until"))
+	ts.NoError(err)
+	ts.InDelta(float64(time.Now().UnixMicro())/1e6+0.5, debtUntil, 0.25)
 
 	// mailroom is asked to append only the new one
 	assertvk.LLen(ts.T(), r, "c:1:100", 1)
@@ -810,6 +846,45 @@ func (ts *ModelsTestSuite) TestOutgoingQueue() {
 	sent, err = models.WasMsgSent(ctx, ts.rt, msg.UUID())
 	ts.NoError(err)
 	ts.False(sent)
+}
+
+func (ts *ModelsTestSuite) TestOutgoingQueueDoneWithExpiredContext() {
+	testsuite.ResetValkey(ts.T(), ts.rt)
+
+	ctx := context.Background()
+	r := ts.rt.VK.Get()
+	defer r.Close()
+
+	msgJSON := `[{
+		"org_id": 1,
+		"id": 10000,
+		"uuid": "0199df0f-9f82-7689-b02d-f34105991321",
+		"high_priority": true,
+		"text": "test message",
+		"contact": {"id": 100, "uuid": "a984069d-0008-4d8c-a772-b14a8a6acccc"},
+		"created_on": "2025-10-14T20:16:03.821434Z",
+		"channel_uuid": "dbc126ed-66bc-4e28-b67b-81dc3327c95d",
+		"urn": "tel:+12067799192",
+		"origin": "chat"
+	}]`
+
+	ts.NoError(models.MsgQueue.Push(ctx, r, "dbc126ed-66bc-4e28-b67b-81dc3327c95d", 10, true, []byte(msgJSON)))
+
+	msg, err := models.PopNextOutgoingMsg(ctx, ts.rt)
+	ts.NoError(err)
+	ts.NotNil(msg)
+
+	// the sender's context may be used up by the time the send completes, but the queue should still be told
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+
+	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, msg.Channel(), nil, nil)
+	status := models.NewStatusUpdate(msg.Channel(), msg.UUID(), models.MsgStatusErrored, clog)
+	models.OnSendComplete(expired, ts.rt, msg, status, 5, nil, clog)
+
+	debtUntil, err := redis.Float64(r.Do("HGET", "{msgs}:ch:dbc126ed-66bc-4e28-b67b-81dc3327c95d", "debt_until"))
+	ts.NoError(err)
+	ts.InDelta(float64(time.Now().UnixMicro())/1e6+0.5, debtUntil, 0.25)
 }
 
 func (ts *ModelsTestSuite) TestChannel() {
@@ -1207,7 +1282,7 @@ func (ts *ModelsTestSuite) TestWriteMsg() {
 		"urn_id":          float64(contact.URNID_),
 		"text":            msg6.Text(),
 		"attachments":     nil,
-		"new_contact":     contact.IsNew_,
+		"contact_created": contact.IsNew_,
 	})
 
 	testsuite.ResetValkey(ts.T(), ts.rt)
@@ -1226,7 +1301,7 @@ func (ts *ModelsTestSuite) TestWriteMsg() {
 		"urn_id":          float64(contact.URNID_),
 		"text":            msg7.Text(),
 		"attachments":     nil,
-		"new_contact":     contact.IsNew_,
+		"contact_created": contact.IsNew_,
 		"new_urn":         map[string]any{"value": "tel:+12065559999", "action": "append"},
 	})
 
@@ -1246,7 +1321,7 @@ func (ts *ModelsTestSuite) TestWriteMsg() {
 		"urn_id":          float64(contact.URNID_),
 		"text":            msg8.Text(),
 		"attachments":     nil,
-		"new_contact":     contact.IsNew_,
+		"contact_created": contact.IsNew_,
 		"payload":         map[string]any{"first_name": "Bob", "age": float64(32)},
 	})
 }
@@ -1350,13 +1425,13 @@ func (ts *ModelsTestSuite) TestChannelEvent() {
 	ts.Equal(contact.URNID_, dbE.ContactURNID)
 
 	ts.assertQueuedContactTask(contact.ID_, "event_received", map[string]any{
-		"event_uuid":  string(event.UUID()),
-		"event_type":  "referral",
-		"channel_id":  float64(10),
-		"urn_id":      float64(contact.URNID_),
-		"extra":       map[string]any{"ref_id": "12345"},
-		"new_contact": true,
-		"occurred_on": event.OccurredOn().Format(time.RFC3339Nano),
+		"event_uuid":      string(event.UUID()),
+		"event_type":      "referral",
+		"channel_id":      float64(10),
+		"urn_id":          float64(contact.URNID_),
+		"extra":           map[string]any{"ref_id": "12345"},
+		"contact_created": true,
+		"occurred_on":     event.OccurredOn().Format(time.RFC3339Nano),
 	})
 }
 
@@ -1420,7 +1495,7 @@ func (ts *ModelsTestSuite) TestMailroomEvents() {
 	clog := models.NewChannelLog(models.ChannelLogTypeUnknown, channel, nil, nil)
 	urn := urns.URN("tel:+12065551616")
 
-	// ensure contact exists before event write so new_contact is false
+	// ensure contact exists before event write so contact_created is false
 	_, err := models.ContactForURN(ctx, ts.rt, channel.OrgID_, channel, urn, nil, "kermit frog", true, clog)
 	ts.NoError(err)
 
@@ -1443,13 +1518,13 @@ func (ts *ModelsTestSuite) TestMailroomEvents() {
 	ts.Equal(contact.URNID_, dbE.ContactURNID)
 
 	ts.assertQueuedContactTask(contact.ID_, "event_received", map[string]any{
-		"event_uuid":  string(event.UUID()),
-		"event_type":  "referral",
-		"channel_id":  float64(10),
-		"urn_id":      float64(contact.URNID_),
-		"extra":       map[string]any{"ref_id": "12345"},
-		"new_contact": false,
-		"occurred_on": event.OccurredOn().Format(time.RFC3339Nano),
+		"event_uuid":      string(event.UUID()),
+		"event_type":      "referral",
+		"channel_id":      float64(10),
+		"urn_id":          float64(contact.URNID_),
+		"extra":           map[string]any{"ref_id": "12345"},
+		"contact_created": false,
+		"occurred_on":     event.OccurredOn().Format(time.RFC3339Nano),
 	})
 }
 

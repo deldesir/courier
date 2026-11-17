@@ -38,6 +38,7 @@
         "external_ids": [
             "3EB0ABC123"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -86,6 +87,7 @@
         "external_ids": [
             "3EB0ABC123"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -158,6 +160,7 @@
         "external_ids": [
             "3EB0ABC123"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -225,6 +228,7 @@
         "external_ids": [
             "3EB0ABC123"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -324,6 +328,7 @@
         "external_ids": [
             "3EB0ABC123"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -369,6 +374,7 @@
         "external_ids": [
             "3EB0ABC123"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -382,20 +388,6 @@
             ]
         },
         "http_mocks": {
-            "http://bridge.example.com/chat/send/image": [
-                {
-                    "status": 200,
-                    "body": {
-                        "code": 200,
-                        "data": {
-                            "Details": "Sent",
-                            "Id": "3EB0FIRST",
-                            "Timestamp": 1758700000
-                        },
-                        "success": true
-                    }
-                }
-            ],
             "http://bridge.example.com/chat/send/document": [
                 {
                     "status": 200,
@@ -405,6 +397,20 @@
                             "Details": "Sent",
                             "Id": "3EB0SECOND",
                             "Timestamp": 1758700001
+                        },
+                        "success": true
+                    }
+                }
+            ],
+            "http://bridge.example.com/chat/send/image": [
+                {
+                    "status": 200,
+                    "body": {
+                        "code": 200,
+                        "data": {
+                            "Details": "Sent",
+                            "Id": "3EB0FIRST",
+                            "Timestamp": 1758700000
                         },
                         "success": true
                     }
@@ -443,6 +449,7 @@
             "3EB0FIRST",
             "3EB0SECOND"
         ],
+        "cost": 2,
         "log_errors": []
     },
     {
@@ -514,6 +521,7 @@
             "3EB0FIRST",
             "3EB0SECOND"
         ],
+        "cost": 2,
         "log_errors": []
     },
     {
@@ -557,6 +565,7 @@
         "external_ids": [
             "3EB0ABC123"
         ],
+        "cost": 1,
         "log_errors": []
     },
     {
@@ -591,6 +600,7 @@
                 }
             }
         ],
+        "cost": 1,
         "error": {
             "message": "channel rejected send with reason",
             "log_error": {
@@ -633,6 +643,7 @@
                 }
             }
         ],
+        "cost": 1,
         "error": {
             "message": "channel connection failed",
             "retryable": true,
@@ -671,6 +682,7 @@
                 }
             }
         ],
+        "cost": 1,
         "error": {
             "message": "channel connection failed",
             "retryable": true,
@@ -715,6 +727,7 @@
                 }
             }
         ],
+        "cost": 1,
         "error": {
             "message": "response not expected values",
             "loggable": true,
@@ -735,6 +748,7 @@
         "msg": {
             "urn": "whatsapp:12065551212"
         },
+        "cost": 0,
         "error": {
             "message": "message invalid",
             "loggable": true,

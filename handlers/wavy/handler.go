@@ -1,3 +1,4 @@
+// API docs: https://docs-latam.messaging.sinch.com/technical-documentation/api-and-integrations/sms-api
 package wavy
 
 import (
@@ -12,11 +13,12 @@ import (
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/gsm7"
 	"github.com/nyaruka/gocommon/jsonx"
 	"github.com/nyaruka/gocommon/urns"
 )
 
-const sendURL = "https://api-messaging.movile.com/v1/send-sms"
+const sendURL = "https://api-messaging.wavy.global/v1/send-sms"
 
 type handler struct {
 	handlers.BaseHandler
@@ -142,6 +144,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 	req.Header.Set("authenticationtoken", token)
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
+	res.AddCost(gsm7.Segments(payload.Message))
 	if err := handlers.ErrorFromResponse(resp, err); err != nil {
 		return err
 	}

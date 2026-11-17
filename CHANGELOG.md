@@ -1,3 +1,63 @@
+## v26.3.82 (2026-11-12)
+ * Queue a contact_created task for contacts created outside of incoming messages and events
+ * Send contact_created instead of new_contact on msg_received and event_received tasks
+ * Log org and channel when a contact_created task can't be queued, and note it's never retried
+ * Let a handler put back a message its provider didn't take rather than counting it as a failed attempt
+
+## v26.3.81 (2026-11-11)
+ * Write incoming message counts as channel tallies
+
+## v26.3.80 (2026-11-11)
+ * Update to gocommon v1.100.2
+ * Tally failed messages by channel
+ * Give queue Done calls their own context
+
+## v26.3.79 (2026-11-11)
+ * Update to gocommon v1.100.1 and report the requeued queue size
+
+## v26.3.78 (2026-11-11)
+ * Remove Mblox channel handler
+
+## v26.3.77 (2026-11-10)
+ * Stop contacts who can't be messaged on Facebook and Instagram
+ * Test that a rejected Facebook send records the error code it was given
+ * Remove SMS Central, Novo, Messangi, DMark and Hub9 channel handlers
+
+## v26.3.76 (2026-11-10)
+ * Send Slack attachments with the external upload flow
+ * Stop popping messages before stopping senders on shutdown
+ * Have handlers report the throughput cost of each send and charge the outgoing queue the throughput each send used, counting rejected requests
+ * Pause sending on a channel when a rate limited response says how long to wait, for handlers that opt in
+ * Fix LINE and Kaleyra send failures and check that message requests are charged
+ * Use Mtarget's documented send endpoint, report an unexpected Mtarget response as such and link each handler to its API docs
+ * Only fail over Yo sends when a gateway can't be reached, and fix two cost edge cases
+
+## v26.3.75 (2026-11-09)
+ * Prefix org tally fields with O
+
+## v26.3.74 (2026-11-05)
+ * Pause sending on a Kannel channel when Kannel can't take more messages
+
+## v26.3.73 (2026-11-05)
+ * Remove support for the legacy outgoing queue layout
+ * Use gocommon's queues.MsgsV2 for the outgoing message queue
+ * Stop the review workflow adding Claude Code attribution
+
+## v26.3.72 (2026-11-04)
+ * Add per-channel outgoing queue layout, read alongside the legacy one
+ * Forget a drained channel's sends in flight and pipeline queue size counts
+ * Try a recently empty queue layout second so pops don't pay for it
+ * Update to gocommon v1.98.4 and vkutil v0.31.0, using vkutil.Tallies for msg tallies
+
+## v26.3.71 (2026-11-04)
+ * Update to gocommon v1.98.3 and its single-hash tallies
+
+## v26.3.70 (2026-11-03)
+ * Update to gocommon v1.98.2 tallies API with per-scope retention
+
+## v26.3.69 (2026-11-03)
+ * Increment channel and workspace tallies for incoming messages
+
 ## v26.3.68 (2026-11-02)
  * Send WhatsApp messages outside the customer service window with Direct Send
 

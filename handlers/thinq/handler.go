@@ -1,3 +1,4 @@
+// API docs: https://apidocs.thinq.com/
 package thinq
 
 import (
@@ -14,6 +15,7 @@ import (
 	"github.com/nyaruka/courier/v26/core/models"
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/runtime"
+	"github.com/nyaruka/gocommon/gsm7"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
@@ -42,7 +44,7 @@ func newHandler(rt *runtime.Runtime, r *channels.Routes) channels.Handler {
 	return h
 }
 
-// see https://apidocs.thinq.com/#829c8863-8a47-4273-80fb-d962aa64c901
+// see https://apidocs.thinq.com/#9c5ae132-fc3c-44c6-85a0-cd08fa66f720
 // from: Source DID
 // to: Destination DID
 // type: sms|mms
@@ -147,6 +149,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		req.SetBasicAuth(tokenUser, token)
 
 		resp, respBody, err := h.RequestHTTP(req, clog)
+		res.AddCost(1)
 		if err := handlers.ErrorFromResponse(resp, err); err != nil {
 			return err
 		}
@@ -179,6 +182,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 			req.SetBasicAuth(tokenUser, token)
 
 			resp, respBody, err := h.RequestHTTP(req, clog)
+			res.AddCost(gsm7.Segments(part))
 			if err := handlers.ErrorFromResponse(resp, err); err != nil {
 				return err
 			}

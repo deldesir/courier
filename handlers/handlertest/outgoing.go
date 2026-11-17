@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,9 +86,11 @@ type OutgoingCase struct {
 	// the outcome, written by running with -update
 	Requests    []*CapturedRequest `json:"requests,omitempty"`
 	ExternalIDs []string           `json:"external_ids,omitempty"`
+	Cost        int                `json:"cost"` // what the send used of the channel's throughput
 	Error       *SendErrorInfo     `json:"error,omitempty"`
 	LogErrors   []*svclogs.Error   `json:"log_errors"`
 	OtherURNs   []urns.URN         `json:"other_urns,omitempty"` // URNs the provider reported for the recipient
+	Backoff     string             `json:"backoff,omitempty"`    // how long the channel asked for sending to stop
 }
 
 // OutgoingOptions are the options for running a file of outgoing cases
@@ -97,6 +100,10 @@ type OutgoingOptions struct {
 
 	// Setup is called with the runtime before any cases run
 	Setup func(*testing.T, *runtime.Runtime)
+
+	// FreeURLs are prefixes of URLs for requests that don't send a message, e.g. token fetches or media uploads, which
+	// cost nothing. Any other request a send makes must be reported as a cost, whether or not the send succeeded.
+	FreeURLs []string
 }
 
 // RunOutgoingTests runs the outgoing cases in the given file against the given channel
@@ -155,9 +162,13 @@ func RunOutgoingTests(t *testing.T, ch *models.Channel, newFn channels.NewHandle
 			actual := *tc
 			actual.Requests = nil
 			actual.ExternalIDs = res.ExternalIDs()
+			actual.Cost = res.Cost()
 			actual.Error = newSendErrorInfo(serr)
 			actual.LogErrors = clog.Errors
 			actual.OtherURNs = res.OtherURNs()
+			if backoff := channels.RequestedBackoff(res, serr); backoff > 0 {
+				actual.Backoff = backoff.String()
+			}
 
 			if mockHTTP != nil {
 				assert.False(t, mockHTTP.HasUnused(), "unused HTTP mocks")
@@ -165,6 +176,10 @@ func RunOutgoingTests(t *testing.T, ch *models.Channel, newFn channels.NewHandle
 				for _, r := range mockHTTP.Requests() {
 					actual.Requests = append(actual.Requests, captureRequest(r))
 				}
+			}
+
+			if madeChargedRequest(actual.Requests, opts.FreeURLs) {
+				assert.Positive(t, res.Cost(), "send made a message request but reported no cost")
 			}
 
 			AssertChannelLogRedaction(t, clog, opts.CheckRedacted)
@@ -178,4 +193,14 @@ func RunOutgoingTests(t *testing.T, ch *models.Channel, newFn channels.NewHandle
 	if test.UpdateSnapshots {
 		writeTestFile(t, path, actuals)
 	}
+}
+
+// madeChargedRequest returns whether any of the given requests isn't to one of the free URL prefixes
+func madeChargedRequest(requests []*CapturedRequest, freeURLs []string) bool {
+	for _, r := range requests {
+		if !slices.ContainsFunc(freeURLs, func(u string) bool { return strings.HasPrefix(r.URL, u) }) {
+			return true
+		}
+	}
+	return false
 }

@@ -83,6 +83,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		}
 
 		resp, _, err := h.RequestHTTP(req, clog)
+		res.AddCost(gsm7.Segments(part))
 		if err := handlers.ErrorFromResponse(resp, err); err != nil {
 			return err
 		}

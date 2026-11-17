@@ -1,3 +1,4 @@
+// API docs: https://developers.kaleyra.io/docs/send-a-text-message-through-whatsapp
 package kaleyra
 
 import (
@@ -178,6 +179,12 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 			req, _ = http.NewRequest(http.MethodPost, sendURL, body)
 			req.Header.Set("Content-Type", writer.FormDataContentType())
 			kwaResp, kwaRespBody, kwaErr = h.RequestHTTP(req, clog)
+			res.AddCost(1)
+
+			// don't send any more attachments once one has failed
+			if handlers.ErrorFromResponse(kwaResp, kwaErr) != nil {
+				break
+			}
 		}
 	} else {
 		form := url.Values{}
@@ -194,6 +201,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		req, _ := http.NewRequest(http.MethodPost, sendURL, strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		kwaResp, kwaRespBody, kwaErr = h.RequestHTTP(req, clog)
+		res.AddCost(1)
 	}
 
 	if err := handlers.ErrorFromResponse(kwaResp, kwaErr); err != nil {

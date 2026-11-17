@@ -51,8 +51,14 @@ func (h *mockHandler) Send(ctx context.Context, msg *models.MsgOut, res *channel
 	if trace != nil {
 		clog.HTTP(trace)
 	}
+	res.AddCost(1)
 
-	if err != nil || resp.StatusCode/100 == 5 {
+	if err == nil && resp.StatusCode == 503 {
+		res.SetBackoff(time.Minute)
+		return channels.ErrConnectionThrottled
+	} else if err == nil && resp.StatusCode == 507 {
+		return channels.ErrNotSent(channels.ErrConnectionThrottled, time.Second)
+	} else if err != nil || resp.StatusCode/100 == 5 {
 		return channels.ErrConnectionFailed
 	} else if resp.StatusCode == 403 {
 		return channels.ErrContactStopped

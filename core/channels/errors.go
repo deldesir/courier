@@ -1,8 +1,10 @@
 package channels
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/nyaruka/gocommon/svclogs"
 	"github.com/nyaruka/gocommon/urns"
@@ -59,6 +61,8 @@ func Reply(contentType string, body []byte) error {
 type SendResult struct {
 	externalIDs []string
 	otherURNs   []urns.URN
+	backoff     time.Duration
+	cost        int
 }
 
 func (r *SendResult) AddExternalID(id string) {
@@ -78,6 +82,38 @@ func (r *SendResult) OtherURNs() []urns.URN {
 	return r.otherURNs
 }
 
+// SetBackoff asks for all sending on the channel to stop for the given duration, e.g. because the provider can't take
+// any more for now. It applies whether or not this send succeeded, and unlike ErrConnectionThrottled, which may only
+// apply to this message or its recipient, it holds back every message on the channel.
+func (r *SendResult) SetBackoff(d time.Duration) {
+	r.backoff = d
+}
+
+func (r *SendResult) Backoff() time.Duration {
+	return r.backoff
+}
+
+// AddCost adds to what the send used of the channel's throughput, in the units the provider limits it by, e.g.
+// segments for an SMS aggregator or messages for a chat API. Handlers add it for every message request they make,
+// whether or not the provider accepts it, since providers often count rejected requests against the limit too. A
+// send costs nothing only when no message request was made.
+func (r *SendResult) AddCost(n int) {
+	r.cost += n
+}
+
+func (r *SendResult) Cost() int {
+	return r.cost
+}
+
+// RequestedBackoff returns how long a send asked for all sending on the channel to stop, through its result or its error
+func RequestedBackoff(res *SendResult, err error) time.Duration {
+	var serr *SendError
+	if errors.As(err, &serr) {
+		return max(res.Backoff(), serr.Backoff())
+	}
+	return res.Backoff()
+}
+
 type SendError struct {
 	msg       string
 	retryable bool
@@ -86,6 +122,9 @@ type SendError struct {
 	clogCode    string
 	clogMsg     string
 	clogExtCode string
+
+	backoff time.Duration
+	notSent bool
 }
 
 func (e *SendError) Error() string {
@@ -97,6 +136,13 @@ func (e *SendError) Retryable() bool { return e.retryable }
 
 // Loggable returns whether this failure indicates a problem on our side worth logging as an error
 func (e *SendError) Loggable() bool { return e.loggable }
+
+// Backoff returns how long all sending on the channel should stop after a send failed this way
+func (e *SendError) Backoff() time.Duration { return e.backoff }
+
+// NotSent returns whether the provider definitely didn't take the message, so it can be put back to be sent again
+// rather than counted as a failed attempt
+func (e *SendError) NotSent() bool { return e.notSent }
 
 // ClogError returns the user facing error to record on the channel log
 func (e *SendError) ClogError() *svclogs.Error {
@@ -137,6 +183,32 @@ var ErrConnectionThrottled error = &SendError{
 	loggable:  false,
 	clogCode:  "connection_throttled",
 	clogMsg:   "Connection to server has been rate limited.",
+}
+
+// ErrConnectionThrottledFor should be returned when channel tells us we're rate limited and for how long, which unlike
+// ErrConnectionThrottled holds back every message on the channel for that long
+func ErrConnectionThrottledFor(d time.Duration) *SendError {
+	err := *ErrConnectionThrottled.(*SendError)
+	err.backoff = d
+	return &err
+}
+
+// ErrNotSent wraps the given send error, e.g. ErrConnectionThrottled, to say that the provider definitely didn't take
+// the message and can't take any more for the given duration, e.g. because its queue is full. Rather than counting
+// as a failed attempt, the message is put back to be sent before anything else queued for the channel, once sending on
+// the channel has stopped for that long. Don't use it when the provider might have taken the message, e.g. after a
+// timeout, as it would then be sent twice.
+func ErrNotSent(err error, d time.Duration) *SendError {
+	var serr *SendError
+	if !errors.As(err, &serr) {
+		serr = ErrConnectionFailed.(*SendError)
+	}
+
+	wrapped := *serr
+	wrapped.retryable = true
+	wrapped.notSent = true
+	wrapped.backoff = max(d, time.Second) // putting it back without a pause would just pop it again straight away
+	return &wrapped
 }
 
 // ErrResponseStatus should be returned when the response from the channel has a non-success status code

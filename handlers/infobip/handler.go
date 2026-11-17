@@ -1,3 +1,4 @@
+// API docs: https://www.infobip.com/docs/api/channels/sms/outbound-sms/send-message/send-sms-messages
 package infobip
 
 import (
@@ -15,6 +16,7 @@ import (
 	"github.com/nyaruka/courier/v26/handlers"
 	"github.com/nyaruka/courier/v26/runtime"
 	"github.com/nyaruka/gocommon/dates"
+	"github.com/nyaruka/gocommon/gsm7"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/urns"
 )
@@ -249,6 +251,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 	var requestBody *bytes.Buffer
 	var req *http.Request
 	var err error
+	var cost int
 
 	if len(msg.Attachments()) > 0 {
 		// Handle MMS message
@@ -305,6 +308,8 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 			return err
 		}
 
+		cost = 1
+
 		mmsSendURL := fmt.Sprintf("%s/mms/2/messages", baseURL)
 		req, err = http.NewRequest(http.MethodPost, mmsSendURL, requestBody)
 		if err != nil {
@@ -315,6 +320,8 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 		// Handle SMS message
 
 		transliteration := msg.Channel().StringConfigForKey(configTransliteration, "")
+		text := handlers.GetTextAndAttachments(msg)
+		cost = gsm7.Segments(text)
 
 		smsPayload := v3OutboundPayload{
 			Messages: []v3OutboundMessage{
@@ -327,7 +334,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 						},
 					},
 					Content: v3OutboundContent{
-						Text:            handlers.GetTextAndAttachments(msg),
+						Text:            text,
 						Transliteration: transliteration,
 					},
 					Webhooks: &v3OutboundWebhooks{
@@ -364,6 +371,7 @@ func (h *handler) Send(ctx context.Context, msg *models.MsgOut, res *channels.Se
 	}
 
 	resp, respBody, err := h.RequestHTTP(req, clog)
+	res.AddCost(cost)
 	if err := handlers.ErrorFromResponse(resp, err); err != nil {
 		return err
 	}

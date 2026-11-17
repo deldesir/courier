@@ -749,6 +749,7 @@ func (h *handler) sendMedia(ctx context.Context, b *bridge, phone string, att *h
 // send posts a message to the bridge and records the ID WhatsApp gave it
 func (h *handler) send(ctx context.Context, b *bridge, endpoint string, payload any, res *channels.SendResult, clog *models.ChannelLog) error {
 	resp, body, err := h.post(ctx, b, "/chat/send/"+endpoint, payload, clog)
+	res.AddCost(1) // every request to the bridge counts, taken or not (v26.3.76: handlers report what each send used)
 	if err := sendError(resp, body, err); err != nil {
 		return err
 	}
